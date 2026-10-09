@@ -16,7 +16,9 @@ QQ ── NapCat(proot 内) ──┬── HTTP 上报 ──▶ QQOps Collecto
 | 模块 | 能力 |
 |---|---|
 | **Collector** | 接收 OneBot v11 HTTP 上报;正确处理 `chunked` 请求体;可选 HMAC 签名;按群/类型过滤;落库 + 采集指标 |
-| **Summarizer** | 按群/类型取消息 → 大模型总结(OpenAI 兼容)→ Markdown 报告;**统计块不依赖模型**;token/费用记账;推送默认只发私聊 |
+| **Summarizer** | 按群/类型取消息 → **结构化抽取(JSON)** → 事件/待办留存 → 报告(Markdown + HTML)与摘要推送;token/费用记账 |
+| **补料(enrich)** | **图片多模态识别**、**文档解析**(docx/xlsx/pptx/txt…, PDF 可选 pypdf)、**链接正文抓取**(带 SSRF 防护);全部有配额与缓存 |
+| **计划与记忆** | 事件/待办**去重合并**成长期列表(可勾完成/忽略/编辑)、每群**滚动记忆**让上下文跨天连续、**个人档案**判定"与我相关" |
 | **Scheduler** | 多个每日时间点、当天去重、配置热加载、保留策略清理、每日自动备份、心跳上报 |
 | **Web Console** | 概览 KPI + 趋势图、**消息全文检索(FTS5, 命中高亮)**、CSV 导出、群组开关(实时群列表)、任务历史、报告浏览、日志跟踪、配置编辑、服务与**旁路服务(NapCat/AstrBot)启停**、备份/索引重建/自检 |
 | **CLI** | `qqops start/stop/restart/status/url/logs/summary/backup/prune/doctor` + `qqops extras` / `qqops napcat{start,stop,restart}` / `qqops astrbot{start,stop,restart}` |
@@ -92,18 +94,47 @@ qqops astrbot stop                  # 停掉 AstrBot(存档旁路, QQOps 不受�
   查询侧用短语匹配(见 `core.fts_text` / `core.fts_query`);
 * 索引缺失或落后时启动自动重建; 也可在运维页点「重建全文索引」或 `POST /api/reindex`。
 
+### 计划与记忆(个人助理模式)
+
+```
+消息 ──▶ 补料(图片识别 / 文档解析 / 链接正文)
+      ──▶ 结构化抽取(JSON: 事件/待办/链接/事实/记忆)
+      ──▶ events 表(去重合并)◀── 控制台「计划」页: 勾完成 / 忽略 / 编辑 / 手工新增 / 导出
+      ──▶ memories 表(每群滚动记忆)──▶ 注入下次提示词(跨天连续)
+      ──▶ 报告: Markdown + 自包含 HTML(/r/<name>) + XLSX / DOCX 导出
+      ──▶ 私聊摘要: 只发"有截止的 / 重要的 / 待办"
+```
+
+* **个人档案** 在控制台「计划」页底部编辑(或直接改 `data/profile.md`)—— 写清"我关注什么、长期目标、
+  输出偏好", 抽取时会作为背景注入, 用来判断哪些事与我有关。
+* **记忆** 每群一段, 可手动修正; 它是"上次学到的东西", 会让每天的总结接得上。
+* **成本控制**: 图片按张计费但**按 URL 缓存**(同一张只识别一次), 配额在配置页
+  `enrich.vision.max_images` / `enrich.files.max_files` / `enrich.links.max_links`;
+  跑 `qqops summary --dry-run` 不产生任何模型费用。
+
+### 可选依赖
+
+核心**零第三方依赖**。唯一可选件是 PDF 解析:
+
+```bash
+pip install pypdf        # 可选; 不装则 .pdf 会明确提示"未安装 pypdf"
+```
+
+`tests/smoke.py` 里有一项测试专门断言"模块级不得出现第三方导入", 保证不装任何包也能跑。
+
 控制台页面:
 
 | 页面 | 用途 |
 |---|---|
 | 概览 | 消息总量/趋势、服务状态(可一键重启)、NapCat 在线状态、最近任务、立即总结 |
-| 消息 | 时间窗 + 群 + 类型 + 关键词筛选, 分页, 点行看详情, 导出 CSV |
+| **计划** | 事件/待办看板: 状态·类型·群·关键词·仅 7 天内筛选, 勾完成/忽略/编辑/删除, 手工新增, 导出 XLSX/DOCX; 下方是**群记忆**与**个人档案**编辑 |
+| 消息 | 时间窗 + 群 + 类型 + 关键词筛选(**FTS5 全文检索**), 分页, 点行看详情, 导出 CSV |
 | 群组 | **NapCat 实时群列表**(含从未发言的群)、搜索、单个/批量启用总结 |
 | 任务 | 每次运行的状态/耗时/token/费用, 手工触发 |
-| 报告 | 历史报告列表 + 渲染阅读 |
+| 报告 | 历史报告列表 + Markdown 阅读 + **报告页(HTML)** + XLSX/DOCX 导出 |
 | 日志 | collector / scheduler / web 三份日志在线 tail |
 | 配置 | 全部配置项表单(密钥显示为掩码), 保存即生效 |
-| 运维 | 服务启停、备份、CSV 导出、NapCat 信息与**发送测试**、采集指标 |
+| 运维 | 服务启停、**旁路服务(NapCat/AstrBot)启停**、备份、CSV 导出、NapCat 信息与**发送测试**、采集指标、重建全文索引 |
 
 ## 目录结构
 
