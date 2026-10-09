@@ -1,9 +1,11 @@
-"""QQOps Summarizer —— 取指定群/类型的消息, 交大模型总结, 输出报告并可只推给自己。
+"""QQOps Summarizer —— 消息 → 结构化整理 → 事件/待办留存 → 报告与推送。
 
-设计原则:
-  * 只发私聊或指定群, 默认绝不往被分析的群里发言;
-  * 统计块不依赖模型(永远可用), 模型段失败也不影响报告落盘;
-  * 记录 token 与费用, 便于运维界面展示。
+流水线:
+  1. 取指定群/类型的消息(带原始消息段, 供取媒体)
+  2. 补料(enrich): 图片走多模态识别、文件解析正文、文章类链接抓正文 —— 全部有缓存与配额
+  3. 结构化抽取: 模型返回 JSON(事件/待办/链接/事实/记忆更新), 逐字段归一
+  4. 留存: 事件与待办带**去重合并**写入 events 表; 链接入 links; 每群记忆滚动更新
+  5. 出报告: Markdown + 自包含 HTML 报告页; 推送只讲"与我有关"的摘要(默认只发私聊)
 """
 from __future__ import annotations
 
@@ -17,7 +19,7 @@ import time
 import urllib.error
 import urllib.request
 
-from . import core
+from . import core, extract, fileread, linkfetch, media, render
 
 CQ_LABELS = {"image": "[图片]", "face": "[表情]", "record": "[语音]", "video": "[视频]",
              "json": "[卡片]", "file": "[文件]", "forward": "[合并转发]", "music": "[音乐]",
@@ -35,7 +37,7 @@ PROMPT = """下面是 QQ 群「{gname}」({gid}) 最近 {hours} 小时的聊天�
 (20 字以内)
 
 ## 主要话题
-(最多 6 条, 每条一行, 概括讨论内容)
+(最多 6 条, 每条一行)
 
 ## 重要信息
 (时间、地点、决定、资源/链接、需要记住的事实; 没有就写"无")
@@ -50,6 +52,7 @@ PROMPT = """下面是 QQ 群「{gname}」({gid}) 最近 {hours} 小时的聊天�
 """
 
 
+# ---------------------------------------------------------------- 文本处理
 def clean(text: str) -> str:
     if not text:
         return ""
@@ -75,11 +78,12 @@ def stats_block(rows: list) -> str:
             if k:
                 kinds[k] += 1
     hours = Counter(time.strftime("%H", time.localtime(r["ts"])) for r in rows)
-    out = ["- 消息总数: **%d**" % len(rows),
-           "- 活跃成员 Top5: " + "、".join("%s(%d)" % (n, c) for n, c in posters.most_common(5)),
-           "- 类型分布: " + "、".join("%s %d" % (k, c) for k, c in kinds.most_common()),
-           "- 高峰时段: " + "、".join("%s时(%d)" % (h, c) for h, c in hours.most_common(3))]
-    return "\n".join(out) + "\n"
+    return "\n".join([
+        "- 消息总数: **%d**" % len(rows),
+        "- 活跃成员 Top5: " + "、".join("%s(%d)" % (n, c) for n, c in posters.most_common(5)),
+        "- 类型分布: " + "、".join("%s %d" % (k, c) for k, c in kinds.most_common()),
+        "- 高峰时段: " + "、".join("%s时(%d)" % (h, c) for h, c in hours.most_common(3)),
+    ]) + "\n"
 
 
 def transcript_of(rows: list, max_chars: int) -> str:
@@ -97,19 +101,16 @@ def transcript_of(rows: list, max_chars: int) -> str:
 
 
 def call_llm(sc: dict, prompt: str) -> tuple:
-    """返回 (正文, usage)。失败抛异常。"""
-    url = str(sc["base_url"]).rstrip("/") + "/chat/completions"
+    """散文回退路径(结构化关闭或失败时使用)。"""
     body = json.dumps({
-        "model": sc["model"],
-        "temperature": sc.get("temperature", 0.3),
+        "model": sc["model"], "temperature": sc.get("temperature", 0.3),
         "messages": [{"role": "system",
                       "content": "你是严谨的中文群聊分析助手, 只依据给定记录作答。"},
                      {"role": "user", "content": prompt}],
     }).encode("utf-8")
-    req = urllib.request.Request(url, data=body, headers={
-        "Content-Type": "application/json",
-        "Authorization": "Bearer " + str(sc.get("api_key", "")),
-    })
+    req = urllib.request.Request(str(sc["base_url"]).rstrip("/") + "/chat/completions", data=body,
+                                 headers={"Content-Type": "application/json",
+                                          "Authorization": "Bearer " + str(sc.get("api_key", ""))})
     last = None
     for attempt in range(3):
         try:
@@ -119,7 +120,7 @@ def call_llm(sc: dict, prompt: str) -> tuple:
         except Exception as e:
             last = e
             time.sleep(1.5 * (attempt + 1))
-    raise last if last else RuntimeError("unknown llm error")
+    raise last if last else RuntimeError("llm call failed")
 
 
 def cost_of(usage: dict, sc: dict) -> float:
@@ -129,20 +130,185 @@ def cost_of(usage: dict, sc: dict) -> float:
            (int(usage.get("completion_tokens") or 0) / 1e6) * pout
 
 
+# ---------------------------------------------------------------- 补料
+def enrich_group(cfg: core.Config, store: core.Store, sc: dict, nc, gid: int, gname: str,
+                 rows: list, dry_run: bool = False) -> dict:
+    """图片识别 / 文件解析 / 链接抓正文。全部有配额与缓存, dry-run 时只列清单。"""
+    en = cfg.data.get("enrich", {})
+    vcfg, fcfg, lcfg = en.get("vision", {}), en.get("files", {}), en.get("links", {})
+    out = {"images": [], "files": [], "links": [], "text": "", "usage": {"prompt_tokens": 0,
+                                                                        "completion_tokens": 0},
+           "cached": 0, "errors": []}
+    seg_rows = []
+    for r in rows:
+        try:
+            segs = json.loads(r.get("segments") or "[]")
+        except Exception:
+            segs = []
+        for s in (segs if isinstance(segs, list) else []):
+            info = media.from_segment(s)
+            if info.get("type") in ("image", "file", "record", "video"):
+                info.update({"ts": r["ts"], "nick": r["nickname"], "mid": r.get("id")})
+                seg_rows.append(info)
+    images = [s for s in seg_rows if s["type"] == "image"]
+    files = [s for s in seg_rows if s["type"] == "file"]
+    # QQ CDN 的下载 rkey 有时效, 老图链接会失效 → 优先处理**最新**的媒体
+    images = images[::-1]
+    files = files[::-1]
+    links = []
+    for r in rows:
+        for u in linkfetch.extract_urls(r.get("raw_message") or "", 20):
+            if linkfetch.interesting(u) and u not in [x["url"] for x in links]:
+                links.append({"url": u, "ts": r["ts"], "mid": r.get("id"),
+                              "title": "", "why": ""})
+    links = links[::-1]
+    merged = cfg.data["summarizer"]
+
+    # ---- 图片
+    vmax = int(vcfg.get("max_images", 8)) if vcfg.get("enable", True) else 0
+    vsc = dict(merged)
+    vsc["vision_model"] = vcfg.get("model") or ""
+    for img in images[:vmax]:
+        url = img.get("url") or ""
+        if not url and nc:
+            url = media.napcat_media_url(nc, img, gid)
+        if not url:
+            continue
+        key = media.key_of(url)
+        cached = store.media_get(key)
+        if cached and cached.get("caption"):
+            out["images"].append({"key": key, "ts": img["ts"], "nick": img["nick"],
+                                  "caption": cached["caption"], "cached": True})
+            out["cached"] += 1
+            continue
+        if dry_run:
+            out["images"].append({"key": key, "ts": img["ts"], "nick": img["nick"],
+                                  "caption": "(dry-run, 未下载)"})
+            continue
+        d = media.fetch_media(nc, dict(img, url=url), gid, int(vcfg.get("max_bytes", 3_000_000)), "image")
+        store.media_upsert(key, group_id=gid, message_id=img.get("mid") or 0, kind="image",
+                           name=img.get("name") or "", url=url, path=d.get("path") or "",
+                           size=d.get("size") or 0,
+                           status="downloaded" if d["ok"] else "failed", error=d.get("error") or "")
+        if not d["ok"]:
+            out["errors"].append("图片取用失败: %s" % d.get("error"))
+            continue
+        try:
+            with open(d["path"], "rb") as f:
+                data = f.read()
+            cap, usage = media.caption(vsc, data, d["mime"],
+                                       hint="来自群 %s 的消息" % (gname or gid))
+            out["usage"]["prompt_tokens"] += int(usage.get("prompt_tokens") or 0)
+            out["usage"]["completion_tokens"] += int(usage.get("completion_tokens") or 0)
+            if cap:
+                store.media_upsert(key, caption=cap, caption_at=core.now(), status="captioned")
+                out["images"].append({"key": key, "ts": img["ts"], "nick": img["nick"], "caption": cap})
+        except Exception as e:
+            out["errors"].append("图片识别失败: %s" % str(e)[:120])
+            core.log("summarizer", "WARN", "图片识别失败 %s: %s" % (key, e))
+
+    # ---- 文件
+    fmax = int(fcfg.get("max_files", 3)) if fcfg.get("enable", True) else 0
+    max_mb = float(fcfg.get("max_mb", 8))
+    for f in files[:fmax]:
+        url = f.get("url") or ""
+        if not url and nc:
+            url = media.napcat_media_url(nc, f, gid)
+        if not url:
+            out["files"].append({"name": f.get("name"), "text": "(取不到直链)", "error": True})
+            continue
+        if dry_run:
+            out["files"].append({"name": f.get("name"), "text": "(dry-run, 未下载)"})
+            continue
+        key = media.key_of(url)
+        rec = store.media_get(key)
+        if rec and rec.get("caption"):
+            out["files"].append({"name": f.get("name"), "text": rec["caption"], "cached": True})
+            out["cached"] += 1
+            continue
+        d = media.fetch_media(nc, dict(f, url=url), gid, int(max_mb * 1048576), "file")
+        if not d["ok"]:
+            store.media_upsert(key, group_id=gid, message_id=f.get("mid") or 0, kind="file",
+                               name=f.get("name") or "", url=url, status="failed",
+                               error=d.get("error") or "")
+            out["files"].append({"name": f.get("name"), "text": "(下载失败: %s)" % d.get("error"), "error": True})
+            continue
+        try:
+            with open(d["path"], "rb") as fh:
+                raw = fh.read()
+            res = fileread.read_bytes(raw, f.get("name") or "", int(fcfg.get("max_chars", 4000)))
+            txt = res.get("text") or ("(解析失败: %s)" % res.get("error"))
+            store.media_upsert(key, group_id=gid, message_id=f.get("mid") or 0, kind="file",
+                               name=f.get("name") or "", url=url, path=d["path"], size=d["size"],
+                               caption=txt[:4000], caption_at=core.now(),
+                               status="parsed" if res.get("text") else "failed",
+                               error=res.get("error") or "")
+            out["files"].append({"name": f.get("name"), "text": txt,
+                                 "error": not bool(res.get("text"))})
+        except Exception as e:
+            out["files"].append({"name": f.get("name"), "text": "(解析异常: %s)" % str(e)[:100], "error": True})
+
+    # ---- 链接
+    lmax = int(lcfg.get("max_links", 5)) if lcfg.get("enable", True) else 0
+    for l in links[:lmax]:
+        u = l["url"]
+        store.link_upsert(u, domain=linkfetch.domain_of(u), group_id=gid)
+        rec = [x for x in store.links(limit=200, group=str(gid)) if x["url"] == u]
+        rec = rec[0] if rec else {}
+        if rec.get("status") == "ok" and rec.get("excerpt"):
+            out["links"].append({"url": u, "title": rec.get("title") or "", "excerpt": rec["excerpt"],
+                                 "cached": True})
+            out["cached"] += 1
+            continue
+        if dry_run:
+            out["links"].append({"url": u, "title": "", "excerpt": "(dry-run, 未抓取)"})
+            continue
+        r = linkfetch.fetch(u, int(lcfg.get("timeout", 12)), int(lcfg.get("max_bytes", 512_000)),
+                            int(lcfg.get("max_redirects", 3)))
+        if r["ok"]:
+            store.link_update(u, status="ok", title=r["title"][:200], excerpt=r["text"][:4000],
+                              fetched_at=core.now(), error="")
+            out["links"].append({"url": u, "title": r["title"], "excerpt": r["text"][:1500]})
+        else:
+            store.link_update(u, status="failed", error=(r.get("error") or "")[:200],
+                              fetched_at=core.now())
+            out["links"].append({"url": u, "title": "", "excerpt": "", "error": r.get("error")})
+
+    # ---- 组装给模型的补料文本
+    blocks = []
+    if out["images"]:
+        blocks.append("【图片内容(多模态识别)】\n" + "\n".join(
+            "- (%s %s) %s" % (time.strftime("%m-%d %H:%M", time.localtime(i["ts"])), i["nick"],
+                              i.get("caption") or "(无描述)") for i in out["images"]))
+    if out["files"]:
+        blocks.append("【文件内容(已解析)】\n" + "\n".join(
+            "- %s: %s" % (f.get("name"), (f.get("text") or "")[:800]) for f in out["files"]))
+    if out["links"]:
+        blocks.append("【链接正文(已抓取)】\n" + "\n".join(
+            "- %s | %s | %s" % (l.get("title") or "(无标题)", l["url"],
+                                (l.get("excerpt") or l.get("error") or "")[:600]) for l in out["links"]))
+    out["text"] = "\n\n".join(blocks)
+    return out
+
+
+# ---------------------------------------------------------------- 主流程
 def run(hours: float | None = None, groups: list | None = None, dry_run: bool = False,
-        no_push: bool = False, job: str = "manual") -> dict:
+        no_push: bool = False, job: str = "manual", enrich: bool = True) -> dict:
     core.ensure_dirs()
     cfg = core.Config()
     store = core.Store()
     sc = cfg.data["summarizer"]
+    ex = cfg.data.get("extract", {})
+    push_cfg = cfg.data["push"]
     hours = float(hours if hours is not None else sc.get("window_hours", 24))
-    glist = groups if groups else (store.enabled_groups() or [sc_g for sc_g in (sc.get("groups") or [])])
+    glist = groups or store.enabled_groups() or list(sc.get("groups") or [])
     kinds = sc.get("kinds") or []
 
     run_id = store.run_start(job)
     started = core.now()
     result = {"run_id": run_id, "job": job, "hours": hours, "groups": [], "report": "",
-              "tokens_in": 0, "tokens_out": 0, "cost": 0.0, "pushed": 0, "errors": []}
+              "report_html": "", "tokens_in": 0, "tokens_out": 0, "cost": 0.0, "pushed": 0,
+              "new_events": 0, "new_todos": 0, "links": 0, "errors": []}
     try:
         rows = _fetch(store, glist, kinds, hours, int(sc.get("max_messages", 600)))
         core.log("summarizer", "INFO", "取到 %d 条消息 (%.1fh, groups=%s)" % (len(rows), hours, glist or "全部"))
@@ -155,67 +321,145 @@ def run(hours: float | None = None, groups: list | None = None, dry_run: bool = 
         for r in rows:
             by_group.setdefault(r["group_id"], []).append(r)
         names = {gid: (store.group_rows().get(gid, {}).get("name") or "") for gid in by_group}
-
+        profile = core.profile_read()
+        nc = None
+        try:
+            nc = core.napcat_from_config(cfg)
+        except Exception:
+            nc = None
         stamp = time.strftime("%Y-%m-%d_%H%M")
-        parts = []
+        sections = []
+
         for gid, grp in sorted(by_group.items(), key=lambda kv: -len(kv[1])):
             if len(grp) < int(sc.get("min_messages", 3)):
                 core.log("summarizer", "INFO", "跳过群 %s (仅 %d 条)" % (gid, len(grp)))
                 continue
             gname = names.get(gid) or str(gid)
-            prompt = PROMPT.format(gname=gname, gid=gid, hours=hours, n=len(grp),
-                                   transcript=transcript_of(grp, int(sc.get("max_chars_per_group", 12000))),
-                                   extra=("\n" + sc["prompt_extra"]) if sc.get("prompt_extra") else "")
-            head = ("# 群聊总结 · %s\n\n- 群: **%s** (`%s`)\n- 窗口: 最近 %s 小时\n- 生成: %s\n\n## 统计\n%s\n"
-                    % (stamp, gname, gid, hours, time.strftime("%Y-%m-%d %H:%M:%S"), stats_block(grp)))
-            body, note = "", ""
+            stats = stats_block(grp)
+            transcript = transcript_of(grp, int(sc.get("max_chars_per_group", 12000)))
+            mem = store.memory_get("group:%d" % gid, "digest")
+            sec = {"group_id": gid, "name": gname, "stats": stats, "overview": "", "topics": [],
+                   "events": [], "todos": [], "links": [], "facts": [], "memory": "",
+                   "error": "", "enrich": "", "prose": ""}
             if dry_run:
-                note = "> (dry-run: 未调用模型, 提示词 %d 字)\n" % len(prompt)
-            elif not sc.get("api_key"):
-                note = "> 未配置 API Key, 仅统计。\n"
-            else:
-                try:
-                    body, usage = call_llm(sc, prompt)
-                    result["tokens_in"] += int(usage.get("prompt_tokens") or 0)
-                    result["tokens_out"] += int(usage.get("completion_tokens") or 0)
-                    result["cost"] += cost_of(usage, sc)
-                except Exception as e:
-                    note = "> 模型调用失败: %s\n" % str(e)[:200]
-                    result["errors"].append("group %s: %s" % (gid, e))
-                    core.log("summarizer", "ERROR", "群 %s 模型调用失败: %s" % (gid, e))
-            parts.append(head + "\n" + note + body + "\n")
-            result["groups"].append({"group_id": gid, "name": gname, "messages": len(grp)})
+                sec["overview"] = "(dry-run: 未调用模型)"
+                sec["enrich"] = "补料预览: 图片 %d / 文件 %d / 链接 %d" % (0, 0, 0)
+                sections.append(sec)
+                continue
+            if not sc.get("api_key"):
+                sec["error"] = "未配置 API Key, 仅输出统计"
+                sections.append(sec)
+                continue
 
-        if not parts:
+            enr = {"text": "", "usage": {}, "images": [], "files": [], "links": [], "errors": []}
+            if enrich:
+                try:
+                    enr = enrich_group(cfg, store, sc, nc, gid, gname, grp, dry_run=False)
+                    sec["enrich"] = "补料: 图片 %d(缓存 %d) / 文件 %d / 链接 %d" % (
+                        len(enr["images"]), enr.get("cached", 0), len(enr["files"]), len(enr["links"]))
+                    result["tokens_in"] += int((enr.get("usage") or {}).get("prompt_tokens") or 0)
+                    result["tokens_out"] += int((enr.get("usage") or {}).get("completion_tokens") or 0)
+                    for e in (enr.get("errors") or [])[:3]:
+                        result["errors"].append("群 %s 补料: %s" % (gid, e))
+                except Exception as e:
+                    core.log("summarizer", "WARN", "群 %s 补料失败: %s" % (gid, e))
+                    sec["enrich"] = "补料失败: %s" % str(e)[:120]
+
+            data = None
+            body_txt = transcript
+            if enr.get("text"):
+                body_txt = enr["text"] + "\n\n" + transcript
+            if ex.get("structured", True):
+                try:
+                    obj, usage, raw = extract.extract(sc, gname, gid, hours, body_txt, stats,
+                                                      mem.get("content", ""), profile)
+                    data = extract.normalize(obj, ex, gid, [r["id"] for r in grp[-20:]])
+                    _acc_usage(result, usage, sc)
+                except Exception as e:
+                    sec["error"] = "结构化抽取失败: %s" % str(e)[:160]
+                    core.log("summarizer", "ERROR", "群 %s 抽取失败: %s" % (gid, e))
+            if data is None and not sec["error"]:
+                sec["error"] = "未获得结构化结果"
+            if data is None:
+                try:                                  # 回退: 散文
+                    body, usage = call_llm(sc, PROMPT.format(
+                        gname=gname, gid=gid, hours=hours, n=len(grp), transcript=body_txt,
+                        extra=("\n" + sc["prompt_extra"]) if sc.get("prompt_extra") else ""))
+                    sec["prose"] = body
+                    _acc_usage(result, usage, sc)
+                    sec["error"] = ""
+                except Exception as e:
+                    sec["error"] = (sec["error"] or "") + " | 散文回退也失败: %s" % str(e)[:100]
+            else:
+                sec.update({"overview": data["overview"], "topics": data["topics"],
+                            "facts": data["facts"], "memory": data["memory_update"]})
+                for ev in data["events"]:
+                    eid, created = store.event_upsert(ev)
+                    result["new_events"] += 1 if created else 0
+                    sec["events"].append(dict(ev, id=eid))
+                for td in data["todos"]:
+                    eid, created = store.event_upsert(td)
+                    result["new_todos"] += 1 if created else 0
+                    sec["todos"].append(dict(td, id=eid))
+                for l in data["links"]:
+                    store.link_upsert(l["url"], title=l["title"], group_id=gid,
+                                      domain=linkfetch.domain_of(l["url"]))
+                    sec["links"].append(l)
+                    result["links"] += 1
+                if data["memory_update"]:
+                    store.memory_set("group:%d" % gid, "digest", data["memory_update"])
+            sections.append(sec)
+
+        if not sections:
             store.run_finish(run_id, "empty", "所有群都低于 min_messages 阈值")
             result["detail"] = "所有群都低于阈值"
             return result
 
-        text = "\n\n---\n\n".join(parts)
-        path = os.path.join(core.REPORT_DIR, "summary_%s.md" % stamp)
-        core.atomic_write(path, text)
-        result["report"] = path
-        core.log("summarizer", "INFO", "报告已写入 %s (%d 字)" % (path, len(text)))
+        est = store.event_stats()
+        meta = {"stamp": stamp, "hours": hours, "generated": core.now(),
+                "n_events": result["new_events"], "n_todos": result["new_todos"],
+                "n_links": result["links"], "events_open": est["by_status"].get("open", 0),
+                "due_7d": est["due_7d"], "overdue": est["overdue"],
+                "due_list": store.events(status="open", soon_only=True, limit=12)}
+        md = render.report_md(meta, sections)
+        html_doc = render.report_html(meta, sections, profile)
+        md_path = os.path.join(core.REPORT_DIR, "summary_%s.md" % stamp)
+        html_path = os.path.join(core.REPORT_DIR, "summary_%s.html" % stamp)
+        core.atomic_write(md_path, md)
+        core.atomic_write(html_path, html_doc)
+        result["report"] = md_path
+        result["report_html"] = html_path
+        core.log("summarizer", "INFO", "报告已写入 %s (%d 字, 事件 %d/待办 %d)"
+                 % (md_path, len(md), result["new_events"], result["new_todos"]))
 
-        if not dry_run and not no_push and cfg.data["push"].get("enable"):
+        if push_cfg.get("enable") and not no_push:
             try:
-                nc = core.napcat_from_config(cfg)
-                p = cfg.data["push"]
-                sent = nc.send_text("【群聊总结 %s】\n\n" % stamp + text,
-                                    user_id=int(p.get("user_id") or 0),
-                                    group_id=int(p.get("group_id") or 0),
-                                    max_chars=int(p.get("max_chars", 1200)))
+                nc = nc or core.napcat_from_config(cfg)
+                text = render.digest_text(meta, sections, int(push_cfg.get("max_chars", 1200)))
+                if push_cfg.get("report_link", True):
+                    base = cfg.data["web"]
+                    text += "\n📄 完整报告: http://%s:%s/r/%s?token=%s" % (
+                        "127.0.0.1", base["port"], os.path.basename(html_path), base["token"])
+                sent = nc.send_text(text, user_id=int(push_cfg.get("user_id") or 0),
+                                    group_id=int(push_cfg.get("group_id") or 0),
+                                    max_chars=int(push_cfg.get("max_chars", 1200)))
                 result["pushed"] = sent
                 core.log("summarizer", "INFO", "已推送 %d 段" % sent)
             except Exception as e:
                 result["errors"].append("push: %s" % e)
                 core.log("summarizer", "ERROR", "推送失败: %s" % e)
 
-        status = "ok" if not result["errors"] else ("partial" if result["groups"] else "failed")
-        store.run_finish(run_id, status, "群数=%d 消息=%d 报告=%s" % (len(result["groups"]), len(rows), os.path.basename(path)),
-                         os.path.basename(path), result["tokens_in"], result["tokens_out"], result["cost"])
+        status = "ok" if not result["errors"] else "partial"
+        store.run_finish(run_id, status,
+                         "群=%d 消息=%d 新事件=%d 新待办=%d 报告=%s" % (
+                             len(sections), len(rows), result["new_events"], result["new_todos"],
+                             os.path.basename(md_path)),
+                         os.path.basename(md_path), result["tokens_in"], result["tokens_out"],
+                         result["cost"])
         result["status"] = status
-        result["detail"] = "群数=%d 消息=%d 耗时=%ds" % (len(result["groups"]), len(rows), core.now() - started)
+        result["detail"] = ("群=%d 消息=%d 事件+%d 待办+%d 链接%d 耗时%ds" % (
+            len(sections), len(rows), result["new_events"], result["new_todos"],
+            result["links"], core.now() - started))
         return result
     except Exception as e:
         store.run_finish(run_id, "failed", str(e)[:500])
@@ -226,12 +470,18 @@ def run(hours: float | None = None, groups: list | None = None, dry_run: bool = 
         return result
 
 
+def _acc_usage(result: dict, usage: dict, sc: dict) -> None:
+    result["tokens_in"] += int((usage or {}).get("prompt_tokens") or 0)
+    result["tokens_out"] += int((usage or {}).get("completion_tokens") or 0)
+    result["cost"] += cost_of(usage or {}, sc)
+
+
 def _fetch(store: core.Store, groups: list, kinds: list, hours: float, limit: int) -> list:
     since = core.now() - int(hours * 3600)
     con = store.conn()
     try:
-        sql = ("SELECT m.ts,m.group_id,m.nickname,m.raw_message,m.kinds FROM messages m "
-               "WHERE m.ts>=?")
+        sql = ("SELECT m.id,m.ts,m.group_id,m.nickname,m.raw_message,m.kinds,m.segments "
+               "FROM messages m WHERE m.ts>=?")
         args: list = [since]
         if groups:
             sql += " AND m.group_id IN (%s)" % ",".join("?" * len(groups))
@@ -254,20 +504,22 @@ def main(argv=None) -> int:
     ap.add_argument("--group", action="append", default=None)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--no-push", action="store_true")
+    ap.add_argument("--no-enrich", action="store_true", help="跳过图片/文件/链接补料")
     ap.add_argument("--json", action="store_true", help="输出 JSON 结果")
     args = ap.parse_args(argv)
     groups = [int(g) for g in args.group] if args.group else None
-    res = run(args.hours, groups, args.dry_run, args.no_push)
+    res = run(args.hours, groups, args.dry_run, args.no_push, enrich=not args.no_enrich)
     if args.json:
-        print(json.dumps({k: v for k, v in res.items() if k != "groups"} | {"groups": res["groups"]},
-                         ensure_ascii=False, indent=2))
+        print(json.dumps(res, ensure_ascii=False, indent=2, default=str))
     else:
         print("[summarizer] %s | %s" % (res.get("status", "?"), res.get("detail", "")))
         if res.get("report"):
             print("  报告: %s" % res["report"])
+        if res.get("report_html"):
+            print("  报告页: %s" % res["report_html"])
         if res.get("pushed"):
             print("  已推送 %d 段" % res["pushed"])
-        for e in res.get("errors", []):
+        for e in res.get("errors", [])[:5]:
             print("  ! %s" % e)
     return 0 if res.get("status") in ("ok", "partial", "empty", None) else 1
 
