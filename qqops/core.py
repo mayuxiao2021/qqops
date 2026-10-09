@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 import secrets
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 
 HOME = os.path.expanduser("~")
 BASE = os.environ.get("QQOPS_HOME") or os.path.join(HOME, "qqops")
@@ -150,6 +150,9 @@ class Config:
                 log("core", "ERROR", "配置解析失败(%s), 已备份到 %s" % (e, broken))
                 raw = {}
         self.data = deep_merge(DEFAULT_CONFIG, raw)
+        if self.data.get("version") != VERSION:
+            self.data["version"] = VERSION      # 让控制台显示的版本与实际一致
+            self.save()
         if not self.data["web"].get("token"):
             self.data["web"]["token"] = gen_token()
             self.save()

@@ -98,11 +98,12 @@ SHELL = """<!doctype html>
 """
 
 LOGIN = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>QQOps 登录</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>QQOps 控制台 · 登录</title>
 <link rel="stylesheet" href="/static/app.css?v=%(assets)s"></head><body class="login-body">
 <form class="login-card" method="post" action="/login">
   <div class="brand big"><span class="logo">🐧</span> QQOps 控制台</div>
-  <p class="muted">输入访问令牌(见 <code>config.json → web.token</code>)</p>
+  <p class="muted">请输入访问令牌(在服务器的 <code>data/config.json</code> 里, 键名 <code>web.token</code>;<br>
+  或者用安装完成时打印的带令牌网址直接打开)</p>
   %(err)s
   <input name="token" type="password" placeholder="访问令牌" autofocus autocomplete="current-password">
   <button class="primary" type="submit">进入控制台</button>

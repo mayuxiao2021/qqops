@@ -146,6 +146,19 @@ function dueTag(ts) {
   return `<span class="${cls}">${tag}</span>`;
 }
 const KIND_CN = {deadline: '截止', decision: '决定', resource: '资源', reminder: '提醒', event: '事件', todo: '待办'};
+/* ---------------- 中文映射层: 界面尽量全中文, 专有名词(QQ/NapCat/AstrBot)保留 ---------------- */
+const SVC_CN = {collector: '采集器', scheduler: '调度器', web: '控制台', napcat: 'NapCat', astrbot: 'AstrBot'};
+const MSGKIND_CN = {text: '文本', image: '图片', reply: '回复', at: '@某人', face: '表情',
+  json: '卡片', file: '文件', record: '语音', voice: '语音', video: '视频', forward: '转发',
+  mface: '表情', marketface: '表情', music: '音乐', node: '合并转发'};
+const RUN_CN = {ok: '成功', partial: '部分成功', failed: '失败', empty: '无数据', running: '进行中'};
+const STATUS_CN = {open: '进行中', done: '已完成', dropped: '已忽略'};
+const svcName = (n) => SVC_CN[n] || n;
+const kindName = (k) => MSGKIND_CN[k] || k;
+const kindsText = (s) => String(s || '').split(',').filter(Boolean).map(kindName).join('·') || '—';
+const runName = (s) => RUN_CN[s] || s || '';
+const jobName = (j) => ({manual: '手动'}[j]) || String(j || '').replace(/^schedule:/, '定时 ');
+const statusName = (s) => STATUS_CN[s] || s || '';
 function buildNav() {
   q(document, '#nav').innerHTML = NAV.map(([k, t, i]) =>
     `<a href="#/${k}" data-k="${k}"><span class="ico">${i}</span>${t}</a>`).join('');
@@ -197,8 +210,8 @@ VIEWS.overview = async (v) => {
         <div class="list">
           ${['collector', 'scheduler', 'web', 'napcat'].map(n => {
             const x = st[n] || {};
-            return `<div class="it"><b style="width:78px">${n}</b>${svcPill(x)}
-            <span class="muted">${x.pid ? 'PID ' + x.pid : ''}${x.rss ? ' · ' + humanBytes(x.rss) : ''}${x.etime ? ' · ' + x.etime : ''}${x.port ? ' · :' + x.port : ''}</span>
+            return `<div class="it"><b style="width:78px">${svcName(n)}</b>${svcPill(x)}
+            <span class="muted">${x.pid ? '进程号 ' + x.pid : ''}${x.rss ? ' · 内存 ' + humanBytes(x.rss) : ''}${x.etime ? ' · 已运行 ' + x.etime : ''}${x.port ? ' · 端口 ' + x.port : ''}</span>
             <span class="right row">
               <button data-svc="${n}" data-act="restart">重启</button>
               <button data-svc="${n}" data-act="stop" class="danger">停止</button>
@@ -226,13 +239,13 @@ VIEWS.overview = async (v) => {
         </tbody></table></div></div>
       <div class="card"><h3>最近任务</h3>
         <div class="list">${(d.runs || []).slice(0, 6).map(r => `<div class="it">
-          <span class="pill ${r.status === 'ok' ? 'ok' : (r.status === 'failed' ? 'bad' : 'warn')}">${esc(r.status)}</span>
-          <b>${esc(r.job)}</b><span class="muted">${fmtTs(r.started_at)}</span>
+          <span class="pill ${r.status === 'ok' ? 'ok' : (r.status === 'failed' ? 'bad' : 'warn')}">${esc(runName(r.status))}</span>
+          <b>${esc(jobName(r.job))}</b><span class="muted">${fmtTs(r.started_at)}</span>
           <span class="right muted">${dur(r.started_at, r.finished_at)} · ${esc((r.detail || '').slice(0, 40))}</span></div>`).join('') || '<div class="empty">还没有任务记录</div>'}
         </div>
         <div class="row" style="margin-top:10px">
           <button class="primary" id="run-now">立即总结</button>
-          <button id="run-dry">dry-run</button>
+          <button id="run-dry" title="只组装提示词, 不调用模型, 不花钱">试运行(不花钱)</button>
           <span class="muted" id="task-state">${d.task.running ? '任务进行中…' : ''}</span>
         </div>
       </div>
@@ -251,7 +264,7 @@ VIEWS.overview = async (v) => {
   });
   const start = async (dry) => {
     const r = await api('/api/summarize', {method: 'POST', body: JSON.stringify({dry_run: dry})});
-    if (r && r.ok) { toast(dry ? 'dry-run 已启动' : '总结任务已启动', 'ok'); pollTask(); }
+    if (r && r.ok) { toast(dry ? '试运行已启动(不调用模型)' : '总结任务已启动', 'ok'); pollTask(); }
   };
   q(v, '#run-now').onclick = () => start(false);
   q(v, '#run-dry').onclick = () => start(true);
@@ -291,8 +304,8 @@ VIEWS.plan = async (v) => {
       <input id="p-q" placeholder="搜索标题/详情" value="${esc(planState.q)}" style="flex:1;min-width:130px">
       <label class="toggle"><input type="checkbox" id="p-soon" ${planState.soon ? 'checked' : ''}><span>仅 7 天内</span></label>
       <button class="primary" id="p-go">筛选</button>
-      <a class="btn" href="/api/export.xlsx">导出 XLSX</a>
-      <a class="btn" href="/api/export.docx">导出 DOCX</a>
+      <a class="btn" href="/api/export.xlsx">导出表格(Excel)</a>
+      <a class="btn" href="/api/export.docx">导出文档(Word)</a>
     </div>
     <div class="row" style="margin-top:10px">
       <input id="n-title" placeholder="手工新增: 标题" style="flex:1;min-width:150px">
@@ -308,7 +321,7 @@ VIEWS.plan = async (v) => {
         <div style="flex:1;min-width:160px">
           <b>${esc(e.title)}</b>
           ${e.detail ? `<div class="muted" style="font-size:12.5px">${esc(e.detail)}</div>` : ''}
-          <div class="muted" style="font-size:12px">${esc(e.group_name || e.group_id || '')}${e.who ? ' · ' + esc(e.who) : ''} · 出现 ${esc(fmtTs(e.last_seen))}${e.status !== 'open' ? ' · ' + esc(e.status) : ''}</div>
+          <div class="muted" style="font-size:12px">${esc(e.group_name || e.group_id || '')}${e.who ? ' · ' + esc(e.who) : ''} · 最近出现 ${esc(fmtTs(e.last_seen))}${e.status !== 'open' ? ' · ' + esc(statusName(e.status)) : ''}</div>
         </div>
         <span class="row">
           ${e.status === 'open' ? `<button data-done="${e.id}">完成</button><button data-drop="${e.id}">忽略</button>`
@@ -398,17 +411,17 @@ VIEWS.messages = async (v) => {
     <div class="card"><div class="row">
       <select id="f-hours">${[1, 6, 24, 72, 168, 720].map(h => `<option value="${h}" ${h == msgState.hours ? 'selected' : ''}>近 ${h} 小时</option>`).join('')}</select>
       <select id="f-group" style="max-width:260px"><option value="">全部群</option>${gs.map(x => `<option value="${x.id}" ${String(x.id) === String(msgState.group) ? 'selected' : ''}>${esc(x.name || x.id)}</option>`).join('')}</select>
-      <select id="f-kind"><option value="">全部类型</option>${['text', 'image', 'reply', 'at', 'face', 'json', 'file'].map(k => `<option ${k === msgState.kind ? 'selected' : ''}>${k}</option>`).join('')}</select>
+      <select id="f-kind"><option value="">全部类型</option>${['text', 'image', 'reply', 'at', 'face', 'json', 'file', 'record', 'forward'].map(k => `<option value="${k}" ${k === msgState.kind ? 'selected' : ''}>${kindName(k)}</option>`).join('')}</select>
       <input id="f-q" placeholder="全文检索: 关键词(中文按字匹配)" value="${esc(msgState.q)}" style="flex:1;min-width:140px">
       <button class="primary" id="f-go">筛选</button>
-      <a class="btn" href="/api/export.csv?hours=${msgState.hours}&group=${msgState.group}">导出 CSV</a>
+      <a class="btn" href="/api/export.csv?hours=${msgState.hours}&group=${msgState.group}">导出表格</a>
       <span class="pill right">共 ${res.total} 条 · 第 ${res.page}/${res.pages} 页</span>
-      <span class="pill ${res.mode === 'fts' ? 'ok' : ''}" title="检索方式">${res.mode === 'fts' ? '全文索引 FTS5' : (res.mode === 'like' ? '模糊匹配 LIKE' : '按时间')}</span>
+      <span class="pill ${res.mode === 'fts' ? 'ok' : ''}" title="检索方式">${res.mode === 'fts' ? '全文索引' : (res.mode === 'like' ? '模糊匹配' : '按时间')}</span>
     </div></div>
     <div class="card"><div class="table-wrap"><table><thead><tr><th style="width:96px">时间</th><th>群</th><th>昵称</th><th style="width:110px">类型</th><th>内容</th></tr></thead>
       <tbody>${(res.rows || []).map(r => `<tr data-id="${r.id}"><td class="muted">${fmtTs(r.ts, 'time')}</td>
         <td>${esc(r.group_name || r.group_id)}</td><td>${hl(r.nickname, msgState.q)}</td>
-        <td><span class="pill">${esc(r.kinds)}</span></td><td>${hl(r.raw_message, msgState.q)}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">没有匹配的消息</td></tr>'}</tbody>
+        <td><span class="pill">${esc(kindsText(r.kinds))}</span></td><td>${hl(r.raw_message, msgState.q)}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">没有匹配的消息</td></tr>'}</tbody>
     </table></div>
     <div class="row" style="margin-top:10px">
       <button id="p-prev" ${res.page <= 1 ? 'disabled' : ''}>← 上一页</button>
@@ -478,15 +491,16 @@ VIEWS.groups = async (v) => {
 VIEWS.tasks = async (v) => {
   const d = await api('/api/runs?limit=80'); if (!d) return;
   v.innerHTML = `<div class="card"><div class="row">
-      <button class="primary" id="t-run">立即总结</button><button id="t-dry">dry-run</button>
-      <span class="muted">定时: 见配置页 schedule.times</span></div></div>
-    <div class="card"><div class="table-wrap"><table><thead><tr><th>#</th><th>任务</th><th>开始</th><th>耗时</th><th>状态</th><th>详情</th><th>token</th><th>费用</th></tr></thead><tbody>
-    ${(d.runs || []).map(r => `<tr><td class="muted">${r.id}</td><td>${esc(r.job)}</td><td>${fmtTs(r.started_at)}</td>
+      <button class="primary" id="t-run">立即总结</button><button id="t-dry" title="只组装提示词, 不调用模型">试运行(不花钱)</button>
+      <span class="muted">定时时间在「配置」页的“定时”一节里设置</span></div></div>
+    <div class="card"><div class="table-wrap"><table><thead><tr><th>序号</th><th>任务</th><th>开始</th><th>耗时</th><th>状态</th><th>详情</th><th>用量(输入/输出)</th><th>费用</th></tr></thead><tbody>
+    ${(d.runs || []).map(r => `<tr><td class="muted">${r.id}</td><td>${esc(jobName(r.job))}</td><td>${fmtTs(r.started_at)}</td>
       <td>${dur(r.started_at, r.finished_at)}</td>
-      <td><span class="pill ${r.status === 'ok' ? 'ok' : (r.status === 'failed' ? 'bad' : 'warn')}">${esc(r.status)}</span></td>
+      <td><span class="pill ${r.status === 'ok' ? 'ok' : (r.status === 'failed' ? 'bad' : 'warn')}">${esc(runName(r.status))}</span></td>
       <td class="muted">${esc(r.detail || '')}</td><td class="muted">${r.tokens_in || 0}/${r.tokens_out || 0}</td>
-      <td class="muted">${r.cost ? r.cost.toFixed(4) : '-'}</td></tr>`).join('') || '<tr><td colspan="8" class="empty">还没有任务记录</td></tr>'}
-    </tbody></table></div></div>`;
+      <td class="muted">${r.cost ? r.cost.toFixed(4) : '—'}</td></tr>`).join('') || '<tr><td colspan="8" class="empty">还没有任务记录</td></tr>'}
+    </tbody></table></div>
+    <div class="muted" style="margin-top:8px">「用量」= 送入模型的字数与模型输出的字数(单位: 词元); 「费用」按配置里的单价计算, 未填单价则为 —</div></div>`;
   const run = async (dry) => { const r = await api('/api/summarize', {method: 'POST', body: JSON.stringify({dry_run: dry})});
     if (r && r.ok) { toast('任务已启动', 'ok'); setTimeout(render, 4000); } };
   q(v, '#t-run').onclick = () => run(false);
@@ -498,15 +512,15 @@ VIEWS.reports = async (v) => {
   const d = await api('/api/reports'); if (!d) return;
   v.innerHTML = `<div class="card"><div class="row">
       <b>报告格式</b>
-      <a class="btn" href="/api/export.xlsx">事件与链接 XLSX</a>
-      <a class="btn" href="/api/export.docx">最新报告 DOCX</a>
-      <span class="muted">报告页可直接在浏览器打开(自包含 HTML, 含事件卡片与记忆)</span></div></div>
+      <a class="btn" href="/api/export.xlsx">导出表格(Excel)</a>
+      <a class="btn" href="/api/export.docx">导出文档(Word)</a>
+      <span class="muted">报告页可直接在浏览器打开(自包含网页, 含事件卡片与记忆)</span></div></div>
     <div class="card"><div class="table-wrap"><table><thead><tr><th>报告</th><th>大小</th><th>生成时间</th><th></th></tr></thead><tbody>
     ${(d.reports || []).map(r => `<tr><td>${esc(r.name)}</td><td class="muted">${humanBytes(r.size)}</td>
       <td class="muted">${fmtTs(r.mtime)}</td><td class="row">
       <button data-open="${esc(r.name)}">阅读</button>
-      ${r.name.endsWith('.html') ? `<a class="btn" href="/r/${esc(r.name)}" target="_blank">报告页</a>` : ''}
-      ${r.name.endsWith('.md') ? `<a class="btn" href="/api/report.docx?name=${encodeURIComponent(r.name)}">DOCX</a>` : ''}
+      ${r.name.endsWith('.html') ? `<a class="btn" href="/r/${esc(r.name)}" target="_blank">网页版</a>` : ''}
+      ${r.name.endsWith('.md') ? `<a class="btn" href="/api/report.docx?name=${encodeURIComponent(r.name)}">导出 Word</a>` : ''}
       </td></tr>`).join('')
       || '<tr><td colspan="4" class="empty">还没有报告, 去「任务」页点一次「立即总结」</td></tr>'}
   </tbody></table></div></div>`;
@@ -519,54 +533,144 @@ VIEWS.reports = async (v) => {
 };
 
 /* ------------------------------------------------------------------ 日志 */
-let logName = 'collector';
+const LOG_CN = {collector: '采集器', scheduler: '调度器', web: '控制台', webapp: '控制台',
+  summarizer: '总结器', client: '浏览器上报', core: '核心', extras: '旁路服务', '': ''};
+const logName = (n) => LOG_CN[n] || n;
+let logName_ = 'collector';
 VIEWS.logs = async (v) => {
-  const d = await api('/api/logs?name=' + encodeURIComponent(logName) + '&lines=300'); if (!d) return;
+  const d = await api('/api/logs?name=' + encodeURIComponent(logName_) + '&lines=300'); if (!d) return;
   v.innerHTML = `<div class="card"><div class="row">
-      ${(d.available || ['collector']).map(n => `<button class="${n === d.name ? 'primary' : ''}" data-log="${n}">${n}</button>`).join('')}
+      ${(d.available || ['collector']).map(n => `<button class="${n === d.name ? 'primary' : ''}" data-log="${n}">${logName(n)}</button>`).join('')}
+      <span class="muted">当前: ${logName(d.name)}（文件 ${esc(d.name)}.log）</span>
       <label class="toggle right"><input type="checkbox" id="l-follow" checked><span>自动刷新</span></label>
     </div></div>
     <div class="card"><pre id="log-box">${esc(d.text || '(空)')}</pre></div>`;
-  v.querySelectorAll('[data-log]').forEach(b => b.onclick = () => { logName = b.dataset.log; render(); });
+  v.querySelectorAll('[data-log]').forEach(b => b.onclick = () => { logName_ = b.dataset.log; render(); });
   const box = q(v, '#log-box'); box.scrollTop = box.scrollHeight;
 };
 
 /* ------------------------------------------------------------------ 配置 */
+const CFG_SEC = {web: '控制台', collector: '采集器', summarizer: '总结器', push: '推送',
+  schedule: '定时', retention: '数据保留', extract: '整理规则', enrich: '补料(图片/文件/链接)'};
+/* [中文名, 说明] */
+const CFG_CN = {
+  web: {host: ['监听地址', '默认 127.0.0.1 只允许本机访问, 更安全'],
+        port: ['端口', '浏览器访问用的端口'], token: ['访问令牌', '留空表示不修改'],
+        session_hours: ['登录有效期(小时)', '过期后需重新用令牌进入'],
+        auto_refresh: ['页面自动刷新(秒)', '0 或关闭自动刷新开关即可不刷新']},
+  collector: {host: ['监听地址', '保持 127.0.0.1'], port: ['端口', 'NapCat 的消息上报地址'],
+              secret: ['签名密钥', '可选; 与 NapCat 上报配置一致'],
+              require_signature: ['强制校验签名', '开启后没有正确签名的上报一律拒绝'],
+              groups: ['只收这些群', '填群号, 逗号分隔; 留空=全部都收'],
+              kinds: ['只收这些类型', '如 text,image; 留空=全部都收'],
+              store_private: ['也保存私聊消息', '默认只存群消息'],
+              debug: ['记录每条消息到日志', '排错用, 平时建议关闭']},
+  summarizer: {base_url: ['模型接口地址', 'OpenAI 兼容接口, 例如 https://api.deepseek.com/v1'],
+               api_key: ['模型密钥', '留空表示不修改'], model: ['模型名', '例如 deepseek-chat'],
+               temperature: ['随机性', '0 最稳定, 1 最发散; 建议 0.2~0.4'],
+               timeout: ['单次调用超时(秒)', ''], groups: ['默认总结的群', '控制台「群组」页的勾选优先于这里'],
+               kinds: ['分析哪些类型', '如 text,image,reply,at,json'],
+               window_hours: ['时间窗(小时)', '每次总结回看多久的消息'],
+               min_messages: ['少于此条数不总结', '避免对冷清群产生无意义报告'],
+               max_messages: ['每次最多取多少条', '越大越贵, 建议 300~800'],
+               max_chars_per_group: ['单群记录上限(字符)', '超出会截断较早内容'],
+               prompt_extra: ['附加要求', '会追加到提示词里, 用来固定输出偏好'],
+               input_price_per_mtok: ['输入单价(元/百万词元)', '填了才会算费用'],
+               output_price_per_mtok: ['输出单价(元/百万词元)', '']},
+  push: {enable: ['启用推送', '通过 NapCat 发到你的 QQ'],
+         user_id: ['推送到我的 QQ 号', ''], group_id: ['推送到群号', '留 0 = 只发私聊, 不在群里发言'],
+         napcat_api_port: ['NapCat 接口端口', '默认 3000'],
+         token: ['NapCat 接口令牌', '留空表示不修改'],
+         max_chars: ['单条消息上限(字符)', '超长会分段发送'],
+         report_link: ['附带报告页链接', '推送末尾附上本机报告页地址']},
+  schedule: {enabled: ['启用定时总结', ''], times: ['每日时间点', '如 22:00; 可写多个'],
+             hours: ['每次的时间窗(小时)', ''], _note: ''},
+  retention: {message_days: ['消息保留天数', '0 = 永久保留'],
+              log_max_mb: ['单个日志上限(MB)', '超出自动轮转'],
+              backup_keep: ['备份保留份数', '每天自动备份, 超出删旧']},
+  extract: {structured: ['结构化抽取', '关闭则退回散文式总结(不产生事件列表)'],
+            max_events: ['每群最多事件数', ''], max_todos: ['每群最多待办数', ''],
+            max_links: ['每群最多链接数', ''],
+            memory_chars: ['记忆长度上限(字符)', '每群保留的"上次记忆"长度'],
+            low_confidence_drop: ['丢弃低置信事件', '低于该值(0~1)的事件不入库']},
+  enrich: {vision: ['图片识别', '把群里图片交给多模态模型描述'],
+           files: ['文件解析', '文档内容读进总结'],
+           links: ['链接抓取', '抓取文章类链接的正文']},
+};
+const CFG_SUB = {enable: '启用', model: '专用模型(空=用上面的模型)', max_images: '每群最多识别几张',
+                 max_bytes: '单张最大字节', detail: '描述详略', max_mb: '单个文件上限(MB)',
+                 max_files: '每群最多几个文件', max_chars: '正文截取上限(字符)',
+                 max_links: '每个群最多抓几条', timeout: '超时(秒)', max_redirects: '最多跳转次数',
+                 allow_all: '允许访问内网(危险, 不建议)'};
+
 VIEWS.config = async (v) => {
   const d = await api('/api/config'); if (!d) return;
   const cfg = d.config;
-  const secName = {web: '控制台', collector: '采集器', summarizer: '总结器', push: '推送', schedule: '定时', retention: '数据保留'};
-  const isSecret = (s, k) => ['token', 'secret', 'api_key'].includes(k);
-  const field = (s, k, val) => {
-    const id = `c_${s}_${k}`;
-    if (typeof val === 'boolean') return `<label class="toggle"><input type="checkbox" id="${id}" ${val ? 'checked' : ''}><span>${k}</span></label>`;
-    if (Array.isArray(val)) return `<label style="flex:1"><span class="muted">${k}</span><input id="${id}" style="width:100%" value="${esc(val.join(', '))}" placeholder="逗号分隔"></label>`;
-    if (typeof val === 'number') return `<label><span class="muted">${k}</span><input id="${id}" type="number" value="${val}" style="width:110px"></label>`;
-    return `<label style="flex:1;min-width:220px"><span class="muted">${k}${isSecret(s, k) ? '(留空=不改)' : ''}</span>
-      <input id="${id}" style="width:100%" ${isSecret(s, k) ? 'type="password" placeholder="' + esc(val) + '"' : 'value="' + esc(val) + '"'}></label>`;
+  const isSecret = (k) => ['token', 'secret', 'api_key'].includes(k);
+  const label = (s, k) => (CFG_CN[s] || {})[k] || null;
+  const lab = (s, k) => { const v = label(s, k); return [ (v && v[0]) || k, (v && v[1]) || '' ]; };
+  const input = (id, val, lp) => {
+    const nm = esc(lp[0]), hint = esc(lp[1] || '');
+    if (typeof val === 'boolean') {
+      return `<label class="toggle" title="${hint}"><input type="checkbox" id="${id}" ${val ? 'checked' : ''}><span>${nm}</span></label>`;
+    }
+    if (Array.isArray(val)) {
+      return `<label style="flex:1;min-width:200px" title="${hint}">
+        <span class="muted">${nm}</span>
+        <input id="${id}" style="width:100%" value="${esc(val.join(', '))}" placeholder="逗号分隔"></label>`;
+    }
+    if (typeof val === 'number') {
+      return `<label title="${hint}"><span class="muted">${nm}</span>
+        <input id="${id}" type="number" value="${val}" style="width:120px"></label>`;
+    }
+    const sec = id.endsWith('_token') || id.endsWith('_secret') || id.endsWith('_api_key');
+    return `<label style="flex:1;min-width:220px" title="${hint}">
+      <span class="muted">${nm}${sec ? '(留空=不改)' : ''}</span>
+      <input id="${id}" style="width:100%" ${sec ? 'type="password" placeholder="' + esc(val) + '"' : 'value="' + esc(val) + '"'}></label>`;
   };
-  v.innerHTML = `${(d.errors || []).length ? `<div class="card"><b class="err">配置校验有问题</b><ul>${d.errors.map(e => `<li>${esc(e)}</li>`).join('')}</ul></div>` : ''}
-    ${Object.entries(cfg).filter(([s]) => secName[s]).map(([s, sec]) => `<div class="card"><h3>${secName[s]} <span class="muted mono">${s}</span></h3>
-      <div class="row">${Object.entries(sec).map(([k, val]) => field(s, k, val)).join('')}</div></div>`).join('')}
-    <div class="card"><h3>其它</h3><pre>${esc(JSON.stringify({version: cfg.version, paths: d.paths}, null, 2))}</pre>
+  const subBlock = (s, k, obj) => `<div style="flex:1;min-width:260px;border:1px dashed var(--line);border-radius:10px;padding:8px 10px">
+      <div class="muted" style="font-size:12px;margin-bottom:6px">${esc(lab(s, k)[0])} · ${esc(lab(s, k)[1])}</div>
+      <div class="row">${Object.entries(obj).map(([k2, v2]) =>
+        input(`c_${s}_${k}_${k2}`, v2, [CFG_SUB[k2] || k2, ''])).join('')}</div></div>`;
+  const secHtml = (s, sec) => `<div class="card"><h3>${CFG_SEC[s]} <span class="muted mono" style="font-size:12px">${s}</span></h3>
+    <div class="row">${Object.entries(sec).map(([k, val]) =>
+      (val && typeof val === 'object' && !Array.isArray(val)) ? subBlock(s, k, val) : input(`c_${s}_${k}`, val, lab(s, k))
+    ).join('')}</div></div>`;
+  v.innerHTML = `${(d.errors || []).length ? `<div class="card"><b class="err">配置有问题</b><ul>${d.errors.map(e => `<li>${esc(e)}</li>`).join('')}</ul></div>` : ''}
+    ${Object.entries(cfg).filter(([s]) => CFG_SEC[s]).map(([s, sec]) => secHtml(s, sec)).join('')}
+    <div class="card"><h3>其它</h3>
+      <pre>${esc(JSON.stringify({version: cfg.version, paths: d.paths}, null, 2))}</pre>
       <div class="row" style="margin-top:10px"><button class="primary" id="cfg-save">保存配置</button>
-      <span class="muted">改配置后采集器/调度器会在 15 秒内自动生效</span></div></div>`;
+      <span class="muted">保存后采集器/调度器 15 秒内自动生效; 鼠标悬停在选项名上可看说明</span></div></div>`;
   q(v, '#cfg-save').onclick = async () => {
     const patch = {};
+    const put = (s, obj, k, v2) => { patch[s] = patch[s] || {}; patch[s][k] = v2; };
     for (const [s, sec] of Object.entries(cfg)) {
-      if (!secName[s]) continue;
-      patch[s] = {};
+      if (!CFG_SEC[s]) continue;
+      patch[s] = patch[s] || {};
       for (const [k, val] of Object.entries(sec)) {
+        if (val && typeof val === 'object' && !Array.isArray(val)) {
+          const sub = {};
+          for (const k2 of Object.keys(val)) {
+            const el = q(v, `#c_${s}_${k}_${k2}`); if (!el || el.tagName === undefined) continue;
+            if (el.type === 'checkbox') sub[k2] = el.checked;
+            else if (typeof val[k2] === 'number') sub[k2] = Number(el.value);
+            else if (typeof val[k2] === 'boolean') sub[k2] = !!el.checked;
+            else if (el.value !== '') sub[k2] = el.value;
+          }
+          Object.assign(patch[s][k] = patch[s][k] || {}, sub);
+          continue;
+        }
         const el = q(v, `#c_${s}_${k}`); if (!el) continue;
-        if (el.type === 'checkbox') patch[s][k] = el.checked;
-        else if (typeof val === 'number') patch[s][k] = Number(el.value);
-        else if (Array.isArray(val)) patch[s][k] = el.value.split(',').map(x => x.trim()).filter(Boolean)
-          .map(x => /^\d+$/.test(x) ? Number(x) : x);
-        else if (!isSecret(s, k) || el.value) patch[s][k] = el.value;
+        if (el.type === 'checkbox') put(s, null, k, el.checked);
+        else if (typeof val === 'number') put(s, null, k, Number(el.value));
+        else if (Array.isArray(val)) put(s, null, k, el.value.split(',').map(x => x.trim()).filter(Boolean)
+          .map(x => /^\d+$/.test(x) ? Number(x) : x));
+        else if (!isSecret(k) || el.value) put(s, null, k, el.value);
       }
     }
     const r = await api('/api/config', {method: 'POST', body: JSON.stringify({config: patch})});
-    if (r && r.ok) { toast('已保存', 'ok'); render(); }
+    if (r && r.ok) { toast('配置已保存', 'ok'); render(); }
   };
 };
 
@@ -575,9 +679,9 @@ VIEWS.ops = async (v) => {
   const d = await api('/api/overview?hours=1'); if (!d) return;
   v.innerHTML = `
     <div class="grid k2">
-      <div class="card"><h3>进程与端口 <span class="muted">PID / 内存 / 运行时长</span></h3>
-        <div class="list">${Object.entries(d.services).map(([n, s]) => `<div class="it"><b style="width:78px">${n}</b>${svcPill(s)}
-          <span class="muted">${s.pid ? 'PID ' + s.pid : ''}${s.rss ? ' · ' + humanBytes(s.rss) : ''}${s.etime ? ' · ' + s.etime : ''}${s.port ? ' · :' + s.port : ''}</span>
+      <div class="card"><h3>进程与端口 <span class="muted">进程号 / 内存 / 运行时长</span></h3>
+        <div class="list">${Object.entries(d.services).map(([n, s]) => `<div class="it"><b style="width:78px">${svcName(n)}</b>${svcPill(s)}
+          <span class="muted">${s.pid ? '进程号 ' + s.pid : ''}${s.rss ? ' · 内存 ' + humanBytes(s.rss) : ''}${s.etime ? ' · 已运行 ' + s.etime : ''}${s.port ? ' · 端口 ' + s.port : ''}</span>
           <span class="right row">
           <button data-act="start" data-svc="${n}">启动</button>
           <button data-act="restart" data-svc="${n}">重启</button>
@@ -595,7 +699,7 @@ VIEWS.ops = async (v) => {
       <div class="card"><h3>数据与备份</h3>
         <div class="list">
           <div class="it"><b>数据库</b><span class="muted right">${humanBytes(d.db_size)} · ${core_count(d)}</span></div>
-          <div class="it"><b>全文索引</b><span class="muted right">${d.fts && d.fts.available ? 'FTS5 · ' + d.fts.rows + ' 条' : '不可用(退化为 LIKE)'}</span></div>
+          <div class="it"><b>全文索引</b><span class="muted right">${d.fts && d.fts.available ? '已建立 · ' + d.fts.rows + ' 条' : '不可用(退化为模糊匹配)'}</span></div>
           <div class="it"><b>数据目录</b><span class="muted right">${humanBytes(d.data_size)}</span></div>
           <div class="it"><b>磁盘</b><span class="muted right">剩余 ${humanBytes(d.disk.free)} / 共 ${humanBytes(d.disk.total)}</span></div>
         </div>
@@ -605,8 +709,8 @@ VIEWS.ops = async (v) => {
           <a class="btn" href="/api/export.csv?hours=168">导出近 7 天 CSV</a>
           <span class="muted">备份目录 data/backups</span></div></div>
       <div class="card"><h3>旁路服务 <span class="muted">可选组件, QQOps 不依赖</span></h3>
-        <div class="list">${Object.entries(d.extras || {}).map(([n, x]) => `<div class="it"><b style="width:74px">${n}</b>${svcPill(x)}
-          <span class="muted">${x.pid ? 'PID ' + x.pid : ''}${x.rss ? ' · ' + humanBytes(x.rss) : ''}</span>
+        <div class="list">${Object.entries(d.extras || {}).map(([n, x]) => `<div class="it"><b style="width:74px">${svcName(n)}</b>${svcPill(x)}
+          <span class="muted">${x.pid ? '进程号 ' + x.pid : ''}${x.rss ? ' · 内存 ' + humanBytes(x.rss) : ''}</span>
           <span class="right row">
             <button data-xact="start" data-xsvc="${n}">启动</button>
             <button data-xact="restart" data-xsvc="${n}">重启</button>
@@ -625,8 +729,14 @@ VIEWS.ops = async (v) => {
         <div class="row" style="margin-top:10px"><b>发送测试</b><input id="send-text" placeholder="要发送的内容" style="flex:1;min-width:160px">
           <input id="send-uid" type="number" placeholder="目标QQ" style="width:120px"><button class="primary" id="send-go">发送</button></div>
         <div class="muted" style="margin-top:6px">留空 QQ 则按配置的 push 目标发送</div></div>
-      <div class="card"><h3>采集指标</h3><pre>${esc(JSON.stringify(d.counters || {}, null, 2))}</pre>
-        <div class="muted">收下=入库成功; 跳过=被群/类型过滤; 拒绝=签名不符; 错误=解析或落库失败</div></div>
+      <div class="card"><h3>采集指标</h3>
+        <div class="list">
+          <div class="it"><b>收下(入库成功)</b><span class="right">${(d.counters || {}).ingested || 0} 条</span></div>
+          <div class="it"><b>跳过(被群/类型过滤)</b><span class="right">${(d.counters || {}).skipped || 0} 条</span></div>
+          <div class="it"><b>拒绝(签名不符)</b><span class="right">${(d.counters || {}).rejected || 0} 条</span></div>
+          <div class="it"><b>错误(解析或落库失败)</b><span class="right">${(d.counters || {}).errors || 0} 条</span></div>
+        </div>
+        <div class="muted" style="margin-top:8px">采集器自启动以来的累计计数; 重启服务后归零重新计。</div></div>
     </div>`;
   v.querySelectorAll('[data-act]').forEach(b => b.onclick = async () => {
     const svc = b.dataset.svc, act = b.dataset.act;
@@ -678,7 +788,7 @@ async function pollStatus() {
       ];
       strip.innerHTML = items.map(([n, ok]) =>
         `<span class="mini ${ok ? '' : 'bad'}"><i class="dot ${ok ? 'ok' : 'bad'}"></i>${n}</span>`).join('')
-        + `<span class="mini">近24h ${st.messages.window}</span>`
+        + `<span class="mini">近 24 小时 ${st.messages.window}</span>`
         + `<span class="mini">启用群 ${st.enabled_groups}</span>`
         + (st.scheduler.next && st.scheduler.next.ts
           ? `<span class="mini">下次 ${fmtTs(st.scheduler.next.ts, 'time')}</span>` : '');
