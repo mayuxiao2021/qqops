@@ -1,0 +1,29 @@
+# 运行时数据(绝不入库)
+data/
+.testdata/
+dist/
+*.tar.gz
+
+# 本地调试脚手架
+_probe/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 编辑器/系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# 备份/临时
+*.bak
+*.bak-*
+*.broken-*
+*.tmp
