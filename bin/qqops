@@ -1,0 +1,93 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# QQOps 控制脚本 —— 服务生命周期 / 状态 / 日志 / 自检
+# 用法: qqops {start|stop|restart|status|logs|url|backup|doctor|summary|prune|shell}
+# 说明: 进程管理全部交给 `python3 -m qqops.svc`(见该模块注释, 避免 shell 后台化残留进程)。
+set -uo pipefail
+
+BASE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/.." && pwd)"
+PY="$(command -v python3 || echo /data/data/com.termux/files/usr/bin/python3)"
+C_OK=$'\033[32m'; C_BAD=$'\033[31m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+mkdir -p "$BASE/data/logs" "$BASE/data/run" 2>/dev/null
+
+svc() { ( cd "$BASE" && exec "$PY" -m qqops.svc "$@" ); }
+
+cmd="${1:-status}"; shift || true
+
+case "$cmd" in
+  start)
+    echo "启动 QQOps 服务…"
+    svc start
+    "$0" url ;;
+  stop)
+    echo "停止 QQOps 服务…"
+    svc stop ;;
+  restart)
+    echo "重启 QQOps 服务…"
+    svc restart ;;
+  status)
+    echo "QQOps 状态"
+    svc status
+    echo "  ${C_DIM}旁路服务:${C_OFF}"
+    svc extras | sed 's/^/  /'
+    ( cd "$BASE" && "$PY" - <<'PY'
+import sys
+from qqops import core
+cfg, store = core.Config(), core.Store()
+st = store.stats(24)
+print("  端口    : web=%s collector=%s napcat=%s" % (
+    cfg.data['web']['port'], cfg.data['collector']['port'], cfg.data['push'].get('napcat_api_port', 3000)))
+print("  消息    : 总计 %d 条, 近24h %d 条" % (st['total'], st['window']))
+print("  关注群  : %s" % (store.enabled_groups() or '未选择(空=不总结)'))
+print("  定时    : %s %s" % (
+    " / ".join(cfg.data['schedule'].get('times') or []) or '未设定',
+    "(已启用)" if cfg.data['schedule'].get('enabled', True) else "(已停用)"))
+print("  全文索引: %s" % ("可用 · %d 条" % store.fts_count() if store.fts_ok else "不可用(退化为 LIKE)"))
+PY
+    ) ;;
+  extras)  svc extras ;;
+  napcat|astrbot)
+    sub="${1:-status}"
+    case "$sub" in
+      start|stop|restart) svc --extra "$sub" "$cmd" ;;
+      *) svc extras ;;
+    esac ;;
+  logs)
+    name="${1:-collector}"
+    case "$name" in
+      collector|scheduler|web|summarizer) tail -n 200 -f "$BASE/data/logs/$name.log" ;;
+      *) echo "可选: collector | scheduler | web | summarizer" ;;
+    esac ;;
+  url)
+    ( cd "$BASE" && "$PY" - <<'PY'
+from qqops import core
+w = core.Config().data['web']
+print("  控制台: http://%s:%s/?token=%s" % (w['host'], w['port'], w['token']))
+PY
+    ) ;;
+  backup)   ( cd "$BASE" && exec "$PY" -m qqops.tools backup ) ;;
+  doctor)   ( cd "$BASE" && exec "$PY" -m qqops.tools doctor ) ;;
+  prune)    ( cd "$BASE" && exec "$PY" -m qqops.tools prune "$@" ) ;;
+  summary)  ( cd "$BASE" && exec "$PY" -m qqops.summarizer "$@" ) ;;
+  shell)    exec bash -i ;;
+  *)
+    cat <<EOF
+QQOps 控制脚本 v$(cat "$BASE/VERSION" 2>/dev/null || echo '?')
+
+  qqops start            启动 采集器/调度器/控制台
+  qqops stop             停止全部
+  qqops restart          重启全部
+  qqops status           状态(进程/端口/消息量/关注群/定时/全文索引)
+  qqops url              打印控制台地址(含令牌)
+  qqops logs [name]      跟踪日志: collector|scheduler|web|summarizer
+  qqops summary [--dry-run] [--hours 24]   手动总结
+  qqops backup           立即备份数据库与配置
+  qqops prune --days N   清理 N 天前的消息
+  qqops doctor           环境与链路自检
+
+  旁路服务(可选组件):
+  qqops extras                  查看 NapCat / AstrBot 状态
+  qqops napcat {start|stop|restart}    NapCat(QQ 接入, 停掉就收发全断)
+  qqops astrbot {start|stop|restart}   AstrBot(存档旁路, QQOps 不依赖)
+EOF
+    ;;
+esac
