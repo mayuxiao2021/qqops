@@ -131,10 +131,21 @@ function svcPill(s) { return `<span class="pill ${s.running ? 'ok' : 'bad'}"><sp
 
 /* ------------------------------------------------------------------ 路由 */
 const NAV = [
-  ['overview', '概览', '◎'], ['messages', '消息', '☰'], ['groups', '群组', '☷'],
-  ['tasks', '任务', '⏱'], ['reports', '报告', '📄'], ['logs', '日志', '⌨'],
-  ['config', '配置', '⚙'], ['ops', '运维', '🛠'],
+  ['overview', '概览', '◎'], ['plan', '计划', '📋'], ['messages', '消息', '☰'],
+  ['groups', '群组', '☷'], ['tasks', '任务', '⏱'], ['reports', '报告', '📄'],
+  ['logs', '日志', '⌨'], ['config', '配置', '⚙'], ['ops', '运维', '🛠'],
 ];
+function dueTag(ts) {
+  if (!ts) return '';
+  const left = ts - Date.now() / 1000;
+  let cls = 'pill', tag = fmtTs(ts, 'time');
+  if (left < 0) { cls = 'pill bad'; tag += ' 已过期'; }
+  else if (left < 86400) { cls = 'pill warn'; tag += ' 今天'; }
+  else if (left < 2 * 86400) { cls = 'pill warn'; tag += ' 明天'; }
+  else if (left < 7 * 86400) { cls = 'pill warn'; tag += ' ' + Math.floor(left / 86400) + '天后'; }
+  return `<span class="${cls}">${tag}</span>`;
+}
+const KIND_CN = {deadline: '截止', decision: '决定', resource: '资源', reminder: '提醒', event: '事件', todo: '待办'};
 function buildNav() {
   q(document, '#nav').innerHTML = NAV.map(([k, t, i]) =>
     `<a href="#/${k}" data-k="${k}"><span class="ico">${i}</span>${t}</a>`).join('');
@@ -255,6 +266,129 @@ async function pollTask() {
   }
 }
 
+/* ------------------------------------------------------------------ 计划(事件/待办/记忆) */
+let planState = {status: 'open', kind: '', group: '', q: '', soon: false};
+
+VIEWS.plan = async (v) => {
+  const qs = new URLSearchParams({status: planState.status, kind: planState.kind,
+    group: planState.group, q: planState.q, soon: planState.soon ? '1' : '0', limit: '300'});
+  const [d, mem] = await Promise.all([api('/api/events?' + qs), api('/api/memory')]);
+  if (!d) return;
+  const st = d.stats || {by_status: {}, by_kind: {}, due_7d: 0, overdue: 0};
+  const gs = [...new Map((d.events || []).map(e => [e.group_id, e.group_name || e.group_id])).entries()];
+  const kpi = (l, val, sub) => `<div class="card kpi"><div class="l">${l}</div><div class="v">${val}</div><div class="sub">${sub || ''}</div></div>`;
+  v.innerHTML = `
+    <div class="grid k4">
+      ${kpi('进行中', st.by_status.open || 0, `共 ${(d.events || []).length} 条匹配`)}
+      ${kpi('7 天内到期', st.due_7d || 0, '含今天')}
+      ${kpi('已过期', st.overdue || 0, st.overdue ? '需要尽快处理' : '没有积压')}
+      ${kpi('已完成', st.by_status.done || 0, `已忽略 ${st.by_status.dropped || 0}`)}
+    </div>
+    <div class="card"><div class="row">
+      <select id="p-status">${[['open', '进行中'], ['done', '已完成'], ['dropped', '已忽略'], ['all', '全部']].map(([k, t]) => `<option value="${k}" ${k === planState.status ? 'selected' : ''}>${t}</option>`).join('')}</select>
+      <select id="p-kind"><option value="">全部类型</option>${Object.entries(KIND_CN).map(([k, t]) => `<option value="${k}" ${k === planState.kind ? 'selected' : ''}>${t}</option>`).join('')}</select>
+      <select id="p-group"><option value="">全部群</option>${gs.map(([id, n]) => `<option value="${id}" ${String(id) === String(planState.group) ? 'selected' : ''}>${esc(n)}</option>`).join('')}</select>
+      <input id="p-q" placeholder="搜索标题/详情" value="${esc(planState.q)}" style="flex:1;min-width:130px">
+      <label class="toggle"><input type="checkbox" id="p-soon" ${planState.soon ? 'checked' : ''}><span>仅 7 天内</span></label>
+      <button class="primary" id="p-go">筛选</button>
+      <a class="btn" href="/api/export.xlsx">导出 XLSX</a>
+      <a class="btn" href="/api/export.docx">导出 DOCX</a>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <input id="n-title" placeholder="手工新增: 标题" style="flex:1;min-width:150px">
+      <input id="n-due" placeholder="截止(如 明天 / 2026-10-20)" style="width:180px">
+      <select id="n-kind">${Object.entries(KIND_CN).map(([k, t]) => `<option value="${k}">${t}</option>`).join('')}</select>
+      <select id="n-group"><option value="">(不指定群)</option>${gs.map(([id, n]) => `<option value="${id}">${esc(n)}</option>`).join('')}</select>
+      <button id="n-add">添加</button>
+    </div></div>
+    <div class="card"><h3>事件与待办 <span class="muted">勾选完成 / 忽略 / 编辑 / 删除</span></h3>
+      <div class="list">${(d.events || []).map(e => `<div class="it" style="align-items:flex-start">
+        <span class="pill">${esc(KIND_CN[e.kind] || e.kind)}</span>
+        ${dueTag(e.due_at)}
+        <div style="flex:1;min-width:160px">
+          <b>${esc(e.title)}</b>
+          ${e.detail ? `<div class="muted" style="font-size:12.5px">${esc(e.detail)}</div>` : ''}
+          <div class="muted" style="font-size:12px">${esc(e.group_name || e.group_id || '')}${e.who ? ' · ' + esc(e.who) : ''} · 出现 ${esc(fmtTs(e.last_seen))}${e.status !== 'open' ? ' · ' + esc(e.status) : ''}</div>
+        </div>
+        <span class="row">
+          ${e.status === 'open' ? `<button data-done="${e.id}">完成</button><button data-drop="${e.id}">忽略</button>`
+            : `<button data-reopen="${e.id}">恢复</button>`}
+          <button data-edit="${e.id}">编辑</button>
+          <button class="danger" data-del="${e.id}">删除</button>
+        </span></div>`).join('') || '<div class="empty">还没有事件。跑一次总结后, 重要事件会自动出现在这里; 也可以在上面手工添加。</div>'}
+      </div></div>
+    <div class="grid k2">
+      <div class="card"><h3>群记忆 <span class="muted">每次总结会带上, 让上下文连续</span></h3>
+        <div class="list">${(mem.memories || []).filter(m => m.scope.startsWith('group:')).map(m => `<div class="it" style="align-items:flex-start">
+          <b style="min-width:110px">群 ${esc(m.scope.replace('group:', ''))}</b>
+          <div style="flex:1;min-width:160px" class="muted">${esc((m.content || '').slice(0, 200))}${(m.content || '').length > 200 ? '…' : ''}</div>
+          <button data-mem="${esc(m.scope)}">编辑</button></div>`).join('') || '<div class="empty">暂无记忆</div>'}
+        </div></div>
+      <div class="card"><h3>个人档案 <span class="muted">判断"与我相关"的依据</span></h3>
+        <textarea id="profile" style="width:100%;height:190px">${esc(mem.profile || '')}</textarea>
+        <div class="row" style="margin-top:8px"><button class="primary" id="p-save">保存档案</button>
+        <span class="muted">目标 / 关注点 / 输出偏好, 越具体越准</span></div></div>
+    </div>`;
+  const apply = () => { planState.status = q(v, '#p-status').value; planState.kind = q(v, '#p-kind').value;
+    planState.group = q(v, '#p-group').value; planState.q = q(v, '#p-q').value;
+    planState.soon = q(v, '#p-soon').checked; render(); };
+  q(v, '#p-go').onclick = apply;
+  q(v, '#p-q').onkeydown = e => { if (e.key === 'Enter') apply(); };
+  const act = async (id, body) => { await api('/api/events', {method: 'POST', body: JSON.stringify(Object.assign({id}, body))}); render(); };
+  v.querySelectorAll('[data-done]').forEach(b => b.onclick = () => act(+b.dataset.done, {status: 'done'}));
+  v.querySelectorAll('[data-drop]').forEach(b => b.onclick = () => act(+b.dataset.drop, {status: 'dropped'}));
+  v.querySelectorAll('[data-reopen]').forEach(b => b.onclick = () => act(+b.dataset.reopen, {status: 'open'}));
+  v.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
+    if (!confirm('删除这条事件?')) return;
+    await api('/api/events', {method: 'POST', body: JSON.stringify({id: +b.dataset.del, action: 'delete'})});
+    render();
+  });
+  v.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => {
+    const e = (d.events || []).find(x => x.id == b.dataset.edit) || {};
+    modal('编辑事件 #' + e.id, `<div class="list">
+      <input id="e-title" value="${esc(e.title || '')}" placeholder="标题">
+      <input id="e-detail" value="${esc(e.detail || '')}" placeholder="详情">
+      <input id="e-due" value="${e.due_at ? new Date(e.due_at * 1000).toISOString().slice(0, 10) : ''}" placeholder="截止 YYYY-MM-DD">
+      <select id="e-pri">${[1, 2, 3].map(p => `<option value="${p}" ${p == e.priority ? 'selected' : ''}>优先级 ${p}</option>`).join('')}</select>
+      <input id="e-notes" value="${esc(e.notes || '')}" placeholder="备注">
+      <button class="primary" id="e-save">保存</button></div>`);
+    q(document, '#e-save').onclick = async () => {
+      await api('/api/events', {method: 'POST', body: JSON.stringify({
+        id: e.id, title: q(document, '#e-title').value, detail: q(document, '#e-detail').value,
+        due: q(document, '#e-due').value, priority: +q(document, '#e-pri').value,
+        notes: q(document, '#e-notes').value})});
+      closeModal(); toast('已保存', 'ok'); render();
+    };
+  });
+  v.querySelectorAll('[data-mem]').forEach(b => b.onclick = () => {
+    const scope = b.dataset.mem;
+    const cur = (mem.memories || []).find(m => m.scope === scope) || {};
+    modal('编辑记忆 · ' + scope, `<textarea id="m-c" style="width:100%;height:220px">${esc(cur.content || '')}</textarea>
+      <div class="row" style="margin-top:8px"><button class="primary" id="m-save">保存</button>
+      <button class="danger" id="m-del">删除该记忆</button></div>`);
+    q(document, '#m-save').onclick = async () => {
+      await api('/api/memory', {method: 'POST', body: JSON.stringify({scope, content: q(document, '#m-c').value})});
+      closeModal(); toast('已保存', 'ok'); render();
+    };
+    q(document, '#m-del').onclick = async () => {
+      await api('/api/memory/delete', {method: 'POST', body: JSON.stringify({scope})});
+      closeModal(); toast('已删除', 'ok'); render();
+    };
+  });
+  q(v, '#p-save').onclick = async () => {
+    const r = await api('/api/memory', {method: 'POST', body: JSON.stringify({profile: q(v, '#profile').value})});
+    if (r && r.ok) toast('档案已保存(下次总结生效)', 'ok');
+  };
+  q(v, '#n-add').onclick = async () => {
+    const title = q(v, '#n-title').value;
+    if (!title) return toast('请填标题', 'warn');
+    await api('/api/events/new', {method: 'POST', body: JSON.stringify({
+      title, due: q(v, '#n-due').value, kind: q(v, '#n-kind').value,
+      group_id: +q(v, '#n-group').value || 0})});
+    toast('已添加', 'ok'); render();
+  };
+};
+
 /* ------------------------------------------------------------------ 消息 */
 let msgState = {hours: 24, group: '', kind: '', q: '', page: 1, size: 50};
 VIEWS.messages = async (v) => {
@@ -362,13 +496,24 @@ VIEWS.tasks = async (v) => {
 /* ------------------------------------------------------------------ 报告 */
 VIEWS.reports = async (v) => {
   const d = await api('/api/reports'); if (!d) return;
-  v.innerHTML = `<div class="card"><div class="table-wrap"><table><thead><tr><th>报告</th><th>大小</th><th>生成时间</th><th></th></tr></thead><tbody>
+  v.innerHTML = `<div class="card"><div class="row">
+      <b>报告格式</b>
+      <a class="btn" href="/api/export.xlsx">事件与链接 XLSX</a>
+      <a class="btn" href="/api/export.docx">最新报告 DOCX</a>
+      <span class="muted">报告页可直接在浏览器打开(自包含 HTML, 含事件卡片与记忆)</span></div></div>
+    <div class="card"><div class="table-wrap"><table><thead><tr><th>报告</th><th>大小</th><th>生成时间</th><th></th></tr></thead><tbody>
     ${(d.reports || []).map(r => `<tr><td>${esc(r.name)}</td><td class="muted">${humanBytes(r.size)}</td>
-      <td class="muted">${fmtTs(r.mtime)}</td><td><button data-open="${esc(r.name)}">查看</button></td></tr>`).join('')
+      <td class="muted">${fmtTs(r.mtime)}</td><td class="row">
+      <button data-open="${esc(r.name)}">阅读</button>
+      ${r.name.endsWith('.html') ? `<a class="btn" href="/r/${esc(r.name)}" target="_blank">报告页</a>` : ''}
+      ${r.name.endsWith('.md') ? `<a class="btn" href="/api/report.docx?name=${encodeURIComponent(r.name)}">DOCX</a>` : ''}
+      </td></tr>`).join('')
       || '<tr><td colspan="4" class="empty">还没有报告, 去「任务」页点一次「立即总结」</td></tr>'}
   </tbody></table></div></div>`;
   v.querySelectorAll('[data-open]').forEach(b => b.onclick = async () => {
-    const r = await api('/api/report?name=' + encodeURIComponent(b.dataset.open));
+    const n = b.dataset.open;
+    if (n.endsWith('.html')) { window.open('/r/' + encodeURIComponent(n), '_blank'); return; }
+    const r = await api('/api/report?name=' + encodeURIComponent(n));
     if (r && r.content) modal(r.name, `<div class="md">${md(r.content)}</div>`);
   });
 };

@@ -18,7 +18,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import core, summarizer
+from . import core, extract, fileread, linkfetch, media, render, summarizer
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
@@ -162,6 +162,21 @@ class Handler(BaseHTTPRequestHandler):
     def html(self, text: str, code: int = 200, extra: dict | None = None) -> None:
         self._send(code, text.encode("utf-8"), "text/html; charset=utf-8", extra)
 
+    def download(self, data: bytes, filename: str, ctype: str) -> None:
+        self._send(200, data, ctype,
+                   {"Content-Disposition": 'attachment; filename="%s"' % filename.replace('"', "")})
+
+    def _latest_report_md(self, store) -> str:
+        try:
+            files = sorted([f for f in os.listdir(core.REPORT_DIR) if f.endswith(".md")], reverse=True)
+            if files:
+                with open(os.path.join(core.REPORT_DIR, files[0]), encoding="utf-8", errors="replace") as f:
+                    return f.read()
+        except Exception:
+            pass
+        events = store.events(status="all", limit=500)
+        return "# QQOps 导出\n\n" + "\n".join("- [%s] %s" % (e.get("status"), e.get("title")) for e in events)
+
     def body_json(self) -> dict:
         n = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(n) if n else b"{}"
@@ -218,6 +233,20 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/", "/index.html"):
             return self.html(SHELL % {"ver": core.VERSION, "assets": ASSET_VER,
                                       "refresh": self._cfg().data["web"]["auto_refresh"]})
+        if path.startswith("/r/"):
+            name = os.path.basename(path[3:])
+            f = os.path.join(core.REPORT_DIR, name)
+            if not (name.endswith(".html") and os.path.isfile(f)):
+                return self.html("<h1>报告不存在</h1><p><a href='/'>回到控制台</a></p>", 404)
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                return self.html(fh.read())
+        if path == "/api/media/raw":
+            rec = core.Store().media_get(qs.get("key", [""])[0])
+            p = (rec or {}).get("path") or ""
+            if not p or not os.path.isfile(p):
+                return self._send(404, b"not found", "text/plain")
+            with open(p, "rb") as fh:
+                return self._send(200, fh.read(), media.guess_mime(os.path.basename(p)), cache="private, max-age=3600")
         try:
             return self.api_get(path, qs)
         except Exception as e:
@@ -251,6 +280,53 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(snap)
         if path == "/api/status":
             return self.json(core.status_snapshot(cfg))
+        # ---- 计划: 事件 / 待办 / 记忆 / 链接 / 媒体 ----
+        if path == "/api/events":
+            st = qs.get("status", ["open"])[0]
+            return self.json({"events": store.events(
+                status=st, kind=qs.get("kind", [""])[0], group=qs.get("group", [""])[0],
+                q=qs.get("q", [""])[0], limit=int(qs.get("limit", ["300"])[0]),
+                soon_only=qs.get("soon", ["0"])[0] == "1"), "stats": store.event_stats()})
+        if path == "/api/memory":
+            return self.json({"memories": store.memory_all(qs.get("prefix", [""])[0]),
+                              "profile": core.profile_read()})
+        if path == "/api/links":
+            return self.json({"links": store.links(status=qs.get("status", [""])[0],
+                                                   group=qs.get("group", [""])[0],
+                                                   limit=int(qs.get("limit", ["100"])[0]))})
+        if path == "/api/media":
+            return self.json({"media": store.media_list(int(qs.get("limit", ["60"])[0]),
+                                                        qs.get("kind", [""])[0])})
+        if path == "/api/export.xlsx":
+            return self.download(
+                render.xlsx_multi({"事件待办": render.events_rows(store.events(status="all", limit=2000)),
+                                   "链接": render.links_rows(store.links(limit=1000))}, "QQOps"),
+                "qqops-events.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        if path == "/api/export.docx":
+            md = self._latest_report_md(store)
+            return self.download(render.docx_bytes(render.md_to_docx_blocks(md), "QQOps 整理"),
+                                 "qqops-report.docx",
+                                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        if path == "/api/report.docx":
+            name = os.path.basename(qs.get("name", [""])[0])
+            p = os.path.join(core.REPORT_DIR, name if name.endswith(".md") else name + ".md")
+            if not os.path.isfile(p):
+                return self.json({"error": "报告不存在"}, 404)
+            with open(p, encoding="utf-8", errors="replace") as f:
+                md = f.read()
+            return self.download(render.docx_bytes(render.md_to_docx_blocks(md), name),
+                                 name.replace(".md", "") + ".docx",
+                                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        if path == "/api/report.xlsx":
+            name = os.path.basename(qs.get("name", [""])[0])
+            base = name.rsplit(".", 1)[0]
+            return self.download(
+                render.xlsx_multi({"事件待办": render.events_rows(store.events(status="all", limit=2000)),
+                                   "链接": render.links_rows(store.links(limit=1000))},
+                                  base[:28] or "QQOps"),
+                base + ".xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         if path == "/api/messages":
             return self.json(store.messages(
                 group=qs.get("group", [""])[0], kind=qs.get("kind", [""])[0],
@@ -384,6 +460,63 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/backup":
             p = store.backup(core.BACKUP_DIR)
             return self.json({"ok": True, "file": os.path.basename(p)})
+        if path == "/api/events":
+            eid = int(body.get("id") or 0)
+            if body.get("action") == "delete" and eid:
+                store.event_delete(eid)
+                return self.json({"ok": True, "deleted": eid})
+            if not eid:
+                return self.json({"error": "缺少 id"}, 400)
+            fields = {}
+            for k in ("status", "priority", "notes", "title", "detail", "kind"):
+                if body.get(k) is not None:
+                    fields[k] = body[k]
+            if body.get("due"):
+                fields["due_at"] = core.parse_due(body["due"])
+            if not store.event_update(eid, **fields):
+                return self.json({"error": "没有可更新字段"}, 400)
+            return self.json({"ok": True, "events": store.events(status=body.get("back_status") or "open")})
+        if path == "/api/events/new":
+            ev = {"kind": body.get("kind") or "event", "title": body.get("title") or "",
+                  "detail": body.get("detail") or "", "who": body.get("who") or "",
+                  "group_id": int(body.get("group_id") or 0),
+                  "due_at": core.parse_due(body.get("due") or ""),
+                  "priority": int(body.get("priority") or 2), "confidence": 1.0, "origin": "manual"}
+            if not ev["title"]:
+                return self.json({"error": "缺少标题"}, 400)
+            eid, created = store.event_upsert(ev)
+            return self.json({"ok": True, "id": eid, "created": created})
+        if path == "/api/memory":
+            scope = str(body.get("scope") or "").strip()
+            if body.get("profile") is not None:
+                core.profile_write(str(body["profile"]))
+                return self.json({"ok": True, "profile": core.profile_read()})
+            if not scope:
+                return self.json({"error": "缺少 scope"}, 400)
+            store.memory_set(scope, str(body.get("key") or "digest"), str(body.get("content") or ""))
+            return self.json({"ok": True, "memory": store.memory_get(scope, str(body.get("key") or "digest"))})
+        if path == "/api/memory/delete":
+            scope = str(body.get("scope") or "")
+            if not scope:
+                return self.json({"error": "缺少 scope"}, 400)
+            con = store.conn()
+            try:
+                con.execute("DELETE FROM memories WHERE scope=? AND key=?",
+                            (scope, str(body.get("key") or "digest")))
+                con.commit()
+            finally:
+                con.close()
+            return self.json({"ok": True})
+        if path == "/api/link":
+            url = str(body.get("url") or "")
+            if not url:
+                return self.json({"error": "缺少 url"}, 400)
+            r = linkfetch.fetch(url, 12, 512_000, 3)
+            store.link_update(url, status="ok" if r["ok"] else "failed",
+                              title=(r.get("title") or "")[:200], excerpt=(r.get("text") or "")[:4000],
+                              error=(r.get("error") or "")[:200], fetched_at=core.now())
+            return self.json({"ok": r["ok"], "title": r.get("title"), "text": (r.get("text") or "")[:4000],
+                              "error": r.get("error")})
         if path == "/api/reindex":
             n = store.rebuild_fts()
             return self.json({"ok": True, "rows": n, "fts": {"available": store.fts_ok, "rows": store.fts_count()}})
