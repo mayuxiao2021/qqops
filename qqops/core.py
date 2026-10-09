@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import os
@@ -22,7 +23,7 @@ import urllib.error
 import urllib.request
 import secrets
 
-VERSION = "1.1.0"
+VERSION = "2.0.0"
 
 HOME = os.path.expanduser("~")
 BASE = os.environ.get("QQOPS_HOME") or os.path.join(HOME, "qqops")
@@ -55,13 +56,45 @@ DEFAULT_CONFIG = {
         "input_price_per_mtok": 0.0, "output_price_per_mtok": 0.0,
     },
     "push": {"enable": False, "user_id": 0, "group_id": 0, "napcat_api_port": 3000,
-             "token": "", "max_chars": 1200},
+             "token": "", "max_chars": 1200, "report_link": True},
     "schedule": {"enabled": True, "times": ["22:00"], "hours": 24},
     "retention": {"message_days": 0, "log_max_mb": 4, "backup_keep": 7},
+    "extract": {
+        "structured": True,          # LLM 输出结构化 JSON(事件/待办/链接/事实/记忆)
+        "max_events": 8, "max_todos": 8, "max_links": 6, "memory_chars": 600,
+        "low_confidence_drop": 0.35,  # 低于此置信度的事件不入库
+    },
+    "enrich": {
+        "vision": {"enable": True, "model": "", "max_images": 8, "max_bytes": 3_000_000, "detail": "简要"},
+        "files": {"enable": True, "max_mb": 8, "max_files": 3, "max_chars": 4000},
+        "links": {"enable": True, "max_links": 5, "max_bytes": 512_000, "timeout": 12,
+                  "max_redirects": 3, "allow_all": False},
+    },
     "extras": {},   # 按设备覆盖 NapCat/AstrBot 的启动命令(见 core.EXTRAS)
 }
 SECRET_KEYS = {("web", "token"), ("collector", "secret"),
                ("summarizer", "api_key"), ("push", "token")}
+# 个人档案: 由用户维护, 每次总结都会作为背景注入(目标/偏好/长期计划)
+PROFILE_PATH = os.path.join(DATA, "profile.md")
+PROFILE_DEFAULT = """# 个人档案(每次总结都会带上, 请按自己的情况修改)
+
+## 我是谁 / 在做什么
+- (例: 大二学生, 主要关注社团活动、课程作业、比赛)
+
+## 我关心的群
+- (例: 九重天迎新群 = 社团头像与模板事务; 班级群 = 通知与截止日)
+
+## 长期目标
+- (例: 6 月前完成社团招新视觉方案)
+
+## 输出偏好
+- 我只要"与我有关的"信息, 与我无关的闲聊可以略过
+- 有截止日的务必列出日期
+"""
+# 链接抓取黑名单(SSRF 防护): 命中即拒绝, 不解析、不请求
+LINK_BLOCK = ("localhost", "127.", "0.0.0.0", "10.", "192.168.", "172.16.", "172.17.",
+              "172.18.", "172.19.", "172.2", "172.30.", "172.31.", "169.254.", "[::1]",
+              "file://", "ftp://", "gopher://", "data:")
 
 
 def ensure_dirs() -> None:
@@ -215,6 +248,28 @@ SCHEMA = [
         tokens_out INTEGER DEFAULT 0, cost REAL DEFAULT 0)""",
     "CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at)",
     "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)",
+    # ---- 结构化产出: 事件 / 待办 / 链接 / 媒体 ----
+    """CREATE TABLE IF NOT EXISTS events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        dedup TEXT UNIQUE, kind TEXT, title TEXT NOT NULL, detail TEXT,
+        who TEXT, group_id INTEGER, due_at INTEGER, status TEXT DEFAULT 'open',
+        priority INTEGER DEFAULT 2, confidence REAL DEFAULT 0,
+        source_ids TEXT, origin TEXT DEFAULT 'auto',
+        first_seen INTEGER, last_seen INTEGER, notes TEXT)""",
+    "CREATE INDEX IF NOT EXISTS idx_events_status ON events(status, due_at)",
+    "CREATE INDEX IF NOT EXISTS idx_events_group ON events(group_id)",
+    """CREATE TABLE IF NOT EXISTS memories(
+        scope TEXT, key TEXT, content TEXT, updated_at INTEGER, hits INTEGER DEFAULT 0,
+        PRIMARY KEY(scope, key))""",
+    """CREATE TABLE IF NOT EXISTS links(
+        url TEXT PRIMARY KEY, title TEXT, domain TEXT, group_id INTEGER,
+        first_seen INTEGER, last_seen INTEGER, status TEXT DEFAULT 'new',
+        fetched_at INTEGER, excerpt TEXT, error TEXT)""",
+    """CREATE TABLE IF NOT EXISTS media(
+        key TEXT PRIMARY KEY, group_id INTEGER, message_id INTEGER, kind TEXT,
+        name TEXT, url TEXT, path TEXT, size INTEGER DEFAULT 0,
+        caption TEXT, caption_at INTEGER, status TEXT DEFAULT 'new', error TEXT,
+        first_seen INTEGER)""",
 ]
 
 # 独立(非 external-content)的 FTS5 表: 便于把群名一并索引; 数据由 Python 侧同步
@@ -478,6 +533,255 @@ class Store:
         try:
             return [dict(r) for r in con.execute(
                 "SELECT * FROM runs ORDER BY id DESC LIMIT ?", (int(limit),))]
+        finally:
+            con.close()
+
+    # -- 事件 / 待办: 结构化产出的长期留存(带去重合并)
+    @staticmethod
+    def event_dedup(kind: str, title: str, gid: int) -> str:
+        norm = re.sub(r"[\s\W_]+", "", (title or "").lower())[:60]
+        return hashlib.sha1(("%s|%s|%s" % (kind or "", norm, int(gid or 0))).encode()).hexdigest()[:16]
+
+    def event_upsert(self, ev: dict) -> tuple:
+        """写入事件; 已存在(同 kind+标题+群)则合并并返回 (id, False)。"""
+        kind = (ev.get("kind") or "event").strip()[:20]
+        title = (ev.get("title") or "").strip()[:200]
+        if not title:
+            return (0, False)
+        gid = int(ev.get("group_id") or 0)
+        dedup = self.event_dedup(kind, title, gid)
+        ts_now = now()                      # 注意别用 now 作局部名, 会遮蔽模块函数
+        due = int(ev.get("due_at") or 0)
+        src = json.dumps(ev.get("source_ids") or [], ensure_ascii=False)
+        con = self.conn()
+        try:
+            cur = con.execute("SELECT id, detail, due_at, priority, confidence, source_ids FROM events "
+                              "WHERE dedup=?", (dedup,)).fetchone()
+            if cur:
+                old_src = []
+                try:
+                    old_src = json.loads(cur["source_ids"] or "[]")
+                except Exception:
+                    pass
+                new_src = []
+                try:
+                    new_src = json.loads(src)
+                except Exception:
+                    pass
+                merged = json.dumps(sorted(set(old_src) | set(new_src))[-20:], ensure_ascii=False)
+                con.execute("""UPDATE events SET last_seen=?, detail=?, due_at=?, priority=?,
+                               confidence=?, source_ids=? WHERE id=?""",
+                            (ts_now,
+                             ev.get("detail") if len(str(ev.get("detail") or "")) > len(str(cur["detail"] or "")) else cur["detail"],
+                             due or cur["due_at"],
+                             min(int(ev.get("priority") or 3), int(cur["priority"] or 3)),   # 1=最重要 → 取更重要的
+                             max(float(ev.get("confidence") or 0), float(cur["confidence"] or 0)),
+                             merged, cur["id"]))
+                con.commit()
+                return (int(cur["id"]), False)
+            cur = con.execute("""INSERT INTO events(dedup,kind,title,detail,who,group_id,due_at,status,
+                                 priority,confidence,source_ids,origin,first_seen,last_seen)
+                                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                              (dedup, kind, title, str(ev.get("detail") or "")[:2000], str(ev.get("who") or "")[:40],
+                               gid, due, ev.get("status") or "open", int(ev.get("priority") or 2),
+                               float(ev.get("confidence") or 0), src, ev.get("origin") or "auto", ts_now, ts_now))
+            con.commit()
+            return (int(cur.lastrowid), True)
+        finally:
+            con.close()
+
+    def events(self, status: str = "open", kind: str = "", group: str = "", q: str = "",
+               limit: int = 200, soon_only: bool = False) -> list:
+        where, args = [], []
+        if status and status != "all":
+            where.append("e.status=?")
+            args.append(status)
+        if kind:
+            where.append("e.kind=?")
+            args.append(kind)
+        if group:
+            where.append("e.group_id=?")
+            args.append(int(group))
+        if q:
+            where.append("(e.title LIKE ? OR e.detail LIKE ?)")
+            args += ["%" + q + "%", "%" + q + "%"]
+        if soon_only:
+            where.append("e.due_at>0 AND e.due_at<=?")
+            args.append(now() + 7 * 86400)
+        w = (" WHERE " + " AND ".join(where)) if where else ""
+        con = self.conn()
+        try:
+            return [dict(r) for r in con.execute(
+                """SELECT e.*, COALESCE(g.name,'') group_name FROM events e
+                   LEFT JOIN groups g ON g.id=e.group_id%s
+                   ORDER BY (e.due_at=0), e.due_at ASC, e.priority ASC, e.last_seen DESC
+                   LIMIT ?""" % w, args + [int(limit)])]
+        finally:
+            con.close()
+
+    def event_update(self, eid: int, **fields) -> bool:
+        allow = {k: v for k, v in fields.items()
+                 if k in ("status", "due_at", "priority", "notes", "title", "detail", "kind")}
+        if not allow:
+            return False
+        sets = ", ".join("%s=?" % k for k in allow)
+        con = self.conn()
+        try:
+            con.execute("UPDATE events SET %s, last_seen=? WHERE id=?" % sets,
+                        list(allow.values()) + [now(), int(eid)])
+            con.commit()
+            return True
+        finally:
+            con.close()
+
+    def event_delete(self, eid: int) -> bool:
+        con = self.conn()
+        try:
+            con.execute("DELETE FROM events WHERE id=?", (int(eid),))
+            con.commit()
+            return True
+        finally:
+            con.close()
+
+    def event_stats(self) -> dict:
+        con = self.conn()
+        try:
+            by = {r["status"]: r["c"] for r in con.execute(
+                "SELECT status, COUNT(*) c FROM events GROUP BY status")}
+            kinds = {r["kind"]: r["c"] for r in con.execute(
+                "SELECT kind, COUNT(*) c FROM events WHERE status='open' GROUP BY kind")}
+            soon = con.execute("SELECT COUNT(*) c FROM events WHERE status='open' AND due_at>0 "
+                               "AND due_at<=?", (now() + 7 * 86400,)).fetchone()["c"]
+            overdue = con.execute("SELECT COUNT(*) c FROM events WHERE status='open' AND due_at>0 "
+                                  "AND due_at<?", (now(),)).fetchone()["c"]
+            return {"by_status": by, "by_kind": kinds, "due_7d": soon, "overdue": overdue}
+        finally:
+            con.close()
+
+    # -- 记忆(跨天上下文)
+    def memory_get(self, scope: str, key: str = "digest") -> dict:
+        con = self.conn()
+        try:
+            r = con.execute("SELECT * FROM memories WHERE scope=? AND key=?", (scope, key)).fetchone()
+            return dict(r) if r else {}
+        finally:
+            con.close()
+
+    def memory_set(self, scope: str, key: str, content: str, bump_hits: bool = False) -> None:
+        con = self.conn()
+        try:
+            con.execute("""INSERT INTO memories(scope,key,content,updated_at,hits) VALUES(?,?,?,?,?)
+                           ON CONFLICT(scope,key) DO UPDATE SET content=excluded.content,
+                           updated_at=excluded.updated_at, hits=hits+?""",
+                        (scope, key, str(content)[:4000], now(), 1 if bump_hits else 0,
+                         1 if bump_hits else 0))
+            con.commit()
+        finally:
+            con.close()
+
+    def memory_all(self, prefix: str = "") -> list:
+        con = self.conn()
+        try:
+            if prefix:
+                rows = con.execute("SELECT * FROM memories WHERE scope LIKE ? ORDER BY updated_at DESC",
+                                   (prefix + "%",))
+            else:
+                rows = con.execute("SELECT * FROM memories ORDER BY updated_at DESC")
+            return [dict(r) for r in rows]
+        finally:
+            con.close()
+
+    # -- 链接与媒体
+    def link_upsert(self, url: str, **fields) -> bool:
+        if not url:
+            return False
+        con = self.conn()
+        try:
+            cur = con.execute("SELECT url FROM links WHERE url=?", (url,)).fetchone()
+            if cur:
+                con.execute("UPDATE links SET last_seen=? WHERE url=?", (now(), url))
+            else:
+                con.execute("""INSERT INTO links(url,title,domain,group_id,first_seen,last_seen,status,excerpt)
+                               VALUES(?,?,?,?,?,?,?,?)""",
+                            (url, str(fields.get("title") or "")[:200], str(fields.get("domain") or "")[:80],
+                             int(fields.get("group_id") or 0), now(), now(),
+                             fields.get("status") or "new", str(fields.get("excerpt") or "")[:4000]))
+            con.commit()
+            return True
+        finally:
+            con.close()
+
+    def link_update(self, url: str, **fields) -> bool:
+        allow = {k: v for k, v in fields.items()
+                 if k in ("title", "status", "excerpt", "error", "fetched_at")}
+        if not allow:
+            return False
+        sets = ", ".join("%s=?" % k for k in allow)
+        con = self.conn()
+        try:
+            con.execute("UPDATE links SET %s WHERE url=?" % sets, list(allow.values()) + [url])
+            con.commit()
+            return True
+        finally:
+            con.close()
+
+    def links(self, status: str = "", limit: int = 100, group: str = "") -> list:
+        where, args = [], []
+        if status:
+            where.append("status=?")
+            args.append(status)
+        if group:
+            where.append("group_id=?")
+            args.append(int(group))
+        w = (" WHERE " + " AND ".join(where)) if where else ""
+        con = self.conn()
+        try:
+            return [dict(r) for r in con.execute(
+                "SELECT * FROM links%s ORDER BY last_seen DESC LIMIT ?" % w, args + [int(limit)])]
+        finally:
+            con.close()
+
+    def media_upsert(self, key: str, **fields) -> bool:
+        if not key:
+            return False
+        cols = {k: v for k, v in fields.items()
+                if k in ("group_id", "message_id", "kind", "name", "url", "path", "size",
+                         "caption", "caption_at", "status", "error")}
+        con = self.conn()
+        try:
+            cur = con.execute("SELECT key FROM media WHERE key=?", (key,)).fetchone()
+            if cur:
+                if cols:
+                    sets = ", ".join("%s=?" % k for k in cols)
+                    con.execute("UPDATE media SET %s WHERE key=?" % sets, list(cols.values()) + [key])
+            else:
+                cols["key"] = key
+                cols.setdefault("first_seen", now())
+                names = ", ".join(cols)
+                con.execute("INSERT INTO media(%s) VALUES(%s)" % (names, ",".join("?" * len(cols))),
+                            list(cols.values()))
+            con.commit()
+            return True
+        finally:
+            con.close()
+
+    def media_get(self, key: str) -> dict:
+        con = self.conn()
+        try:
+            r = con.execute("SELECT * FROM media WHERE key=?", (key,)).fetchone()
+            return dict(r) if r else {}
+        finally:
+            con.close()
+
+    def media_list(self, limit: int = 60, kind: str = "") -> list:
+        con = self.conn()
+        try:
+            if kind:
+                rows = con.execute("SELECT * FROM media WHERE kind=? ORDER BY first_seen DESC LIMIT ?",
+                                   (kind, int(limit)))
+            else:
+                rows = con.execute("SELECT * FROM media ORDER BY first_seen DESC LIMIT ?", (int(limit),))
+            return [dict(r) for r in rows]
         finally:
             con.close()
 
@@ -996,6 +1300,89 @@ def count_files(path: str, suffix: str = "") -> int:
         return len([f for f in os.listdir(path) if f.endswith(suffix)])
     except Exception:
         return 0
+
+
+WEEKDAYS = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6,
+            "1": 0, "2": 1, "3": 2, "4": 3, "5": 4, "6": 5, "7": 6}
+
+
+def parse_due(text: str, base_ts: int | None = None) -> int:
+    """把模型给的截止时间归一成时间戳(日期类默认取**当天 23:59**, 即"那天结束前")。
+
+    支持: 2026-10-15 / 2026/10/15 / 10-15 / 2026-10-15 20:30 / 今天 / 明天 / 后天 /
+          X天后 / 本周五 / 下周三 / 周天 / 月底。识别不了返回 0(表示无截止)。
+
+    注意: 中文日期的字符替换(年→-)只用于数字日期解析, 关键词判断一律用原始串 ——
+    否则 "月底" 会先被替换成 "-底" 而永远匹配不上。
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return 0
+    s = raw.replace("年", "-").replace("月", "-").replace("日", "").replace("号", "")
+    now_ts = base_ts or now()
+    lt = time.localtime(now_ts)
+
+    def at(y, mo, d, hh=23, mm=59):
+        try:
+            return int(time.mktime((y, mo, d, hh, mm, 0, 0, 0, -1)))
+        except Exception:
+            return 0
+
+    def day_of(ts):
+        l2 = time.localtime(ts)
+        return at(l2.tm_year, l2.tm_mon, l2.tm_mday)
+
+    m = re.search(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:[ T](\d{1,2}):(\d{2}))?", s)
+    if m:
+        if m.group(4):
+            return at(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                      int(m.group(4)), int(m.group(5)))
+        return at(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    m = re.search(r"(?<!\d)(\d{1,2})[-/.](\d{1,2})(?!\d)", s)
+    if m:
+        mo, d = int(m.group(1)), int(m.group(2))
+        ts = at(lt.tm_year, mo, d)
+        if ts and ts < now_ts - 86400:            # 已过去 → 视为明年
+            ts = at(lt.tm_year + 1, mo, d)
+        return ts
+    if any(k in raw for k in ("今天", "今日", "今晚")):
+        return day_of(now_ts)
+    for kw, off in (("大后天", 3), ("后天", 2), ("明天", 1), ("明日", 1), ("次日", 1)):
+        if kw in raw:
+            return day_of(now_ts + off * 86400)
+    m = re.search(r"(\d{1,3})\s*天[后内以]*", raw)
+    if m:
+        return day_of(now_ts + int(m.group(1)) * 86400)
+    if "月底" in raw or "月末" in raw:
+        nm = lt.tm_mon % 12 + 1
+        ny = lt.tm_year + (1 if lt.tm_mon == 12 else 0)
+        return day_of(int(time.mktime((ny, nm, 1, 0, 0, 0, 0, 0, -1))) - 86400)
+    m = re.search(r"(下{0,1})\s*(?:周|星期|礼拜)\s*([一二三四五六日天1-7])", raw)
+    if m:
+        next_week = bool(m.group(1))
+        wd = WEEKDAYS.get(m.group(2), 0)
+        delta = (wd - lt.tm_wday) % 7
+        if next_week:
+            delta = delta + 7 if delta < 7 else delta       # "下周X" 必是未来
+        return day_of(now_ts + delta * 86400)
+    return 0
+
+
+# ---------------------------------------------------------------- 个人档案
+def profile_read() -> str:
+    try:
+        with open(PROFILE_PATH, encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        try:
+            atomic_write(PROFILE_PATH, PROFILE_DEFAULT)
+        except Exception:
+            pass
+        return PROFILE_DEFAULT
+
+
+def profile_write(text: str) -> None:
+    atomic_write(PROFILE_PATH, str(text)[:20000])
 
 
 ECOSYSTEM = [("NapCat WebUI", 6099), ("NapCat 反向WS", 6199),
