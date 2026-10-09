@@ -1,0 +1,55 @@
+{
+  "_说明": "这是配置样例; 实际配置在 data/config.json, 由安装器自动生成(含随机令牌)。",
+  "version": "1.0.0",
+  "web": {
+    "host": "127.0.0.1",
+    "port": 8091,
+    "token": "<安装时自动生成>",
+    "session_hours": 12,
+    "auto_refresh": 15
+  },
+  "collector": {
+    "host": "127.0.0.1",
+    "port": 8080,
+    "secret": "",
+    "require_signature": false,
+    "groups": [],
+    "kinds": [],
+    "store_private": false,
+    "debug": false
+  },
+  "summarizer": {
+    "base_url": "https://api.deepseek.com/v1",
+    "api_key": "sk-...",
+    "model": "deepseek-chat",
+    "temperature": 0.3,
+    "timeout": 180,
+    "groups": [],
+    "kinds": ["text", "image", "reply", "at", "json"],
+    "window_hours": 24,
+    "min_messages": 3,
+    "max_messages": 600,
+    "max_chars_per_group": 12000,
+    "prompt_extra": "",
+    "input_price_per_mtok": 0,
+    "output_price_per_mtok": 0
+  },
+  "push": {
+    "enable": true,
+    "user_id": 0,
+    "group_id": 0,
+    "napcat_api_port": 3000,
+    "token": "<与 NapCat httpServers.token 一致>",
+    "max_chars": 1200
+  },
+  "schedule": {
+    "enabled": true,
+    "times": ["22:00"],
+    "hours": 24
+  },
+  "retention": {
+    "message_days": 0,
+    "log_max_mb": 4,
+    "backup_keep": 7
+  }
+}
