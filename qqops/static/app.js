@@ -489,10 +489,40 @@ VIEWS.groups = async (v) => {
 
 /* ------------------------------------------------------------------ 任务 */
 VIEWS.tasks = async (v) => {
-  const d = await api('/api/runs?limit=80'); if (!d) return;
-  v.innerHTML = `<div class="card"><div class="row">
+  const [d, s] = await Promise.all([api('/api/runs?limit=80'), api('/api/schedule')]);
+  if (!d) return;
+  const sc = (s && s.schedule) || {};
+  const nx = (s && s.next) || {};
+  const mins = nx.ts ? Math.max(0, Math.round((nx.ts - Date.now() / 1000) / 60)) : null;
+  const leftText = mins === null ? '' : (mins < 60 ? mins + ' 分钟后' : Math.floor(mins / 60) + ' 小时 ' + (mins % 60) + ' 分后');
+  const wdName = ['一', '二', '三', '四', '五', '六', '日'];
+  const wd = sc.weekdays || [1, 2, 3, 4, 5];
+  const hide = (cond) => cond ? '' : 'hidden';
+  v.innerHTML = `<div class="card"><h3>定时设置 <span class="muted">总结时间可以随便调, 不必按天</span></h3>
+    <div class="row">
+      <label class="toggle"><input type="checkbox" id="s-on" ${sc.enabled !== false ? 'checked' : ''}><span>启用定时</span></label>
+      <select id="s-mode">
+        <option value="daily" ${(sc.mode || 'daily') === 'daily' ? 'selected' : ''}>每天定点</option>
+        <option value="interval" ${sc.mode === 'interval' ? 'selected' : ''}>每隔一段时间</option>
+        <option value="weekly" ${sc.mode === 'weekly' ? 'selected' : ''}>每周几天</option>
+      </select>
+      <span id="s-box-daily" class="row ${hide((sc.mode || 'daily') === 'daily')}">时间点
+        <input id="s-times" value="${esc((sc.times || ['22:00']).join(', '))}" placeholder="22:00, 09:30" style="width:170px" title="可填多个, 逗号分隔"></span>
+      <span id="s-box-interval" class="row ${hide(sc.mode === 'interval')}">每隔
+        <input id="s-every" type="number" min="1" max="10080" value="${sc.every_minutes || 360}" style="width:90px"> 分钟</span>
+      <span id="s-box-weekly" class="row ${hide(sc.mode === 'weekly')}">
+        ${wdName.map((n, i) => `<label class="toggle"><input type="checkbox" class="s-wd" value="${i + 1}" ${wd.includes(i + 1) ? 'checked' : ''}><span>周${n}</span></label>`).join('')}
+        <input id="s-wtime" value="${esc(sc.weekly_time || '22:00')}" style="width:76px"></span>
+      <label class="toggle" title="自上次总结以来消息太少就不跑, 避免空报告与浪费"><input type="checkbox" id="s-skip" ${sc.skip_if_no_new !== false ? 'checked' : ''}><span>无新消息就跳过</span></label>
+      <input id="s-min" type="number" min="0" value="${sc.min_new_messages != null ? sc.min_new_messages : 5}" style="width:70px" title="至少多少条新消息才值得跑">
+      <button class="primary" id="s-save">保存定时</button>
+    </div>
+    <div class="muted" style="margin-top:8px">当前: <b>${esc(nx.label || '未启用')}</b>${nx.ts ? ` · 下次 <b>${fmtTs(nx.ts)}</b>（${leftText}）` : ''}${s.last_run ? ` · 上次运行 ${fmtTs(s.last_run)}` : ''}${s.new_since_last != null ? ` · 距上次新增 ${s.new_since_last} 条消息` : ''}</div>
+    <div class="muted">三种模式: <b>每天定点</b>(可填多个时间) / <b>每隔一段</b>(如 360 分钟 = 6 小时) / <b>每周几天</b>(周一~周日任选 + 时刻) · 时间窗(回看多久)在「配置」页“总结器”里改</div>
+  </div>
+    <div class="card"><div class="row">
       <button class="primary" id="t-run">立即总结</button><button id="t-dry" title="只组装提示词, 不调用模型">试运行(不花钱)</button>
-      <span class="muted">定时时间在「配置」页的“定时”一节里设置</span></div></div>
+      <span class="muted">想马上看结果就点左边; 定时到点后会自动跑并把摘要私聊发给你</span></div></div>
     <div class="card"><div class="table-wrap"><table><thead><tr><th>序号</th><th>任务</th><th>开始</th><th>耗时</th><th>状态</th><th>详情</th><th>用量(输入/输出)</th><th>费用</th></tr></thead><tbody>
     ${(d.runs || []).map(r => `<tr><td class="muted">${r.id}</td><td>${esc(jobName(r.job))}</td><td>${fmtTs(r.started_at)}</td>
       <td>${dur(r.started_at, r.finished_at)}</td>
@@ -500,9 +530,28 @@ VIEWS.tasks = async (v) => {
       <td class="muted">${esc(r.detail || '')}</td><td class="muted">${r.tokens_in || 0}/${r.tokens_out || 0}</td>
       <td class="muted">${r.cost ? r.cost.toFixed(4) : '—'}</td></tr>`).join('') || '<tr><td colspan="8" class="empty">还没有任务记录</td></tr>'}
     </tbody></table></div>
-    <div class="muted" style="margin-top:8px">「用量」= 送入模型的字数与模型输出的字数(单位: 词元); 「费用」按配置里的单价计算, 未填单价则为 —</div></div>`;
+    <div class="muted" style="margin-top:8px">「用量」= 送入模型与模型输出的词元数; 「费用」按配置里的单价计算, 未填单价则为 —</div></div>`;
+  const mode = q(v, '#s-mode');
+  const syncMode = () => {
+    const m = mode.value;
+    q(v, '#s-box-daily').classList.toggle('hidden', m !== 'daily');
+    q(v, '#s-box-interval').classList.toggle('hidden', m !== 'interval');
+    q(v, '#s-box-weekly').classList.toggle('hidden', m !== 'weekly');
+  };
+  mode.onchange = syncMode;
+  syncMode();
+  q(v, '#s-save').onclick = async () => {
+    const body = {enabled: q(v, '#s-on').checked, mode: mode.value,
+      times: q(v, '#s-times').value, every_minutes: +q(v, '#s-every').value,
+      weekdays: [...v.querySelectorAll('.s-wd:checked')].map(x => +x.value),
+      weekly_time: q(v, '#s-wtime').value,
+      skip_if_no_new: q(v, '#s-skip').checked, min_new_messages: +q(v, '#s-min').value};
+    const r = await api('/api/schedule', {method: 'POST', body: JSON.stringify(body)});
+    if (r && r.ok) { toast('定时已保存: ' + ((r.next || {}).label || ''), 'ok'); render(); }
+    else if (r && r.errors && r.errors.length) toast(r.errors.join('; '), 'bad');
+  };
   const run = async (dry) => { const r = await api('/api/summarize', {method: 'POST', body: JSON.stringify({dry_run: dry})});
-    if (r && r.ok) { toast('任务已启动', 'ok'); setTimeout(render, 4000); } };
+    if (r && r.ok) { toast(dry ? '试运行已启动(不调用模型)' : '总结任务已启动', 'ok'); setTimeout(render, 4000); } };
   q(v, '#t-run').onclick = () => run(false);
   q(v, '#t-dry').onclick = () => run(true);
 };
@@ -561,16 +610,16 @@ const CFG_CN = {
   collector: {host: ['监听地址', '保持 127.0.0.1'], port: ['端口', 'NapCat 的消息上报地址'],
               secret: ['签名密钥', '可选; 与 NapCat 上报配置一致'],
               require_signature: ['强制校验签名', '开启后没有正确签名的上报一律拒绝'],
-              groups: ['只收这些群', '填群号, 逗号分隔; 留空=全部都收'],
-              kinds: ['只收这些类型', '如 text,image; 留空=全部都收'],
+              groups: ['采集过滤: 只收这些群', '填群号, 逗号分隔; 留空=全部都收(总结哪些群在「群组」页勾选)'],
+              kinds: ['采集过滤: 只收这些类型', '如 text,image; 留空=全部都收'],
               store_private: ['也保存私聊消息', '默认只存群消息'],
               debug: ['记录每条消息到日志', '排错用, 平时建议关闭']},
   summarizer: {base_url: ['模型接口地址', 'OpenAI 兼容接口, 例如 https://api.deepseek.com/v1'],
                api_key: ['模型密钥', '留空表示不修改'], model: ['模型名', '例如 deepseek-chat'],
                temperature: ['随机性', '0 最稳定, 1 最发散; 建议 0.2~0.4'],
-               timeout: ['单次调用超时(秒)', ''], groups: ['默认总结的群', '控制台「群组」页的勾选优先于这里'],
-               kinds: ['分析哪些类型', '如 text,image,reply,at,json'],
-               window_hours: ['时间窗(小时)', '每次总结回看多久的消息'],
+               timeout: ['单次调用超时(秒)', ''], groups: ['(已合并到群组页)', '控制台「群组」页的勾选优先于这里'],
+               kinds: ['总结时分析哪些类型', '如 text,image,reply,at,json'],
+               window_hours: ['时间窗(小时)', '每次总结回看多久的消息(定时模式与时间在「任务」页)'],
                min_messages: ['少于此条数不总结', '避免对冷清群产生无意义报告'],
                max_messages: ['每次最多取多少条', '越大越贵, 建议 300~800'],
                max_chars_per_group: ['单群记录上限(字符)', '超出会截断较早内容'],
@@ -583,25 +632,44 @@ const CFG_CN = {
          token: ['NapCat 接口令牌', '留空表示不修改'],
          max_chars: ['单条消息上限(字符)', '超长会分段发送'],
          report_link: ['附带报告页链接', '推送末尾附上本机报告页地址']},
-  schedule: {enabled: ['启用定时总结', ''], times: ['每日时间点', '如 22:00; 可写多个'],
-             hours: ['每次的时间窗(小时)', ''], _note: ''},
+  schedule: {enabled: ['启用定时总结', '定时的模式与时间在「任务」页里改'],
+             mode: ['调度模式', '每天定点 / 每隔一段 / 每周几天'],
+             times: ['每天的时间点', '如 22:00; 可写多个'],
+             every_minutes: ['间隔(分钟)', '每隔模式使用, 360 = 6 小时'],
+             weekdays: ['每周哪几天', '1=周一 … 7=周日'],
+             weekly_time: ['每周的时刻', '如 22:00'],
+             skip_if_no_new: ['无新消息就跳过', '避免空报告与浪费'],
+             min_new_messages: ['最少新消息数', '低于此数不跑']},
   retention: {message_days: ['消息保留天数', '0 = 永久保留'],
               log_max_mb: ['单个日志上限(MB)', '超出自动轮转'],
               backup_keep: ['备份保留份数', '每天自动备份, 超出删旧']},
   extract: {structured: ['结构化抽取', '关闭则退回散文式总结(不产生事件列表)'],
             max_events: ['每群最多事件数', ''], max_todos: ['每群最多待办数', ''],
-            max_links: ['每群最多链接数', ''],
+            max_links: ['报告里最多保留几条链接', '与「补料」里"每群最多抓几条正文"不同: 这里限制报告条数'],
             memory_chars: ['记忆长度上限(字符)', '每群保留的"上次记忆"长度'],
             low_confidence_drop: ['丢弃低置信事件', '低于该值(0~1)的事件不入库']},
   enrich: {vision: ['图片识别', '把群里图片交给多模态模型描述'],
            files: ['文件解析', '文档内容读进总结'],
            links: ['链接抓取', '抓取文章类链接的正文']},
 };
-const CFG_SUB = {enable: '启用', model: '专用模型(空=用上面的模型)', max_images: '每群最多识别几张',
-                 max_bytes: '单张最大字节', detail: '描述详略', max_mb: '单个文件上限(MB)',
-                 max_files: '每群最多几个文件', max_chars: '正文截取上限(字符)',
-                 max_links: '每个群最多抓几条', timeout: '超时(秒)', max_redirects: '最多跳转次数',
-                 allow_all: '允许访问内网(危险, 不建议)'};
+const CFG_SUB = {
+  vision: {enable: '启用', model: '专用模型(空=用上面的模型)', max_images: '每群最多识别几张',
+           max_bytes: '单张图片最大字节', detail: '描述详略'},
+  files: {enable: '启用', max_mb: '单个文件上限(MB)', max_files: '每群最多几个文件',
+          max_chars: '正文截取上限(字符)'},
+  links: {enable: '启用', max_links: '每群最多抓几条正文', max_bytes: '单个网页最大字节',
+          timeout: '抓取超时(秒)', max_redirects: '最多跳转次数', allow_all: '允许访问内网(危险, 不建议)'},
+};
+/* 与其它位置重复的项: 隐藏, 只在唯一入口维护(避免两处能改、互相打架) */
+const CFG_HIDE = {
+  summarizer: ['groups'],
+  schedule: ['mode', 'times', 'every_minutes', 'weekdays', 'weekly_time', 'skip_if_no_new', 'min_new_messages'],
+};
+const CFG_NOTE = {
+  summarizer: '「总结哪些群」请在 **「群组」页**勾选(那里是实时群列表, 也是唯一准绳), 因此这里不再重复显示。',
+  schedule: '定时的模式与时间请在 **「任务」页顶部的定时设置**里改(支持 每天定点 / 每隔一段 / 每周几天); 这里只保留总开关。',
+  collector: '「只收这些群/类型」是**采集阶段**的过滤(决定哪些消息入库); 总结阶段分析哪些类型在上面的「总结器」里设置。',
+};
 
 VIEWS.config = async (v) => {
   const d = await api('/api/config'); if (!d) return;
@@ -631,11 +699,17 @@ VIEWS.config = async (v) => {
   const subBlock = (s, k, obj) => `<div style="flex:1;min-width:260px;border:1px dashed var(--line);border-radius:10px;padding:8px 10px">
       <div class="muted" style="font-size:12px;margin-bottom:6px">${esc(lab(s, k)[0])} · ${esc(lab(s, k)[1])}</div>
       <div class="row">${Object.entries(obj).map(([k2, v2]) =>
-        input(`c_${s}_${k}_${k2}`, v2, [CFG_SUB[k2] || k2, ''])).join('')}</div></div>`;
-  const secHtml = (s, sec) => `<div class="card"><h3>${CFG_SEC[s]} <span class="muted mono" style="font-size:12px">${s}</span></h3>
-    <div class="row">${Object.entries(sec).map(([k, val]) =>
-      (val && typeof val === 'object' && !Array.isArray(val)) ? subBlock(s, k, val) : input(`c_${s}_${k}`, val, lab(s, k))
-    ).join('')}</div></div>`;
+        input(`c_${s}_${k}_${k2}`, v2, [(CFG_SUB[k] || {})[k2] || k2, ''])).join('')}</div></div>`;
+  const secHtml = (s, sec) => {
+    const hideList = CFG_HIDE[s] || [];
+    const shown = Object.entries(sec).filter(([k]) => !hideList.includes(k));
+    const hiddenNames = Object.entries(sec).filter(([k]) => hideList.includes(k)).map(([k]) => lab(s, k)[0]);
+    const note = CFG_NOTE[s] ? `<div class="muted" style="margin-top:10px;font-size:12.5px">说明: ${CFG_NOTE[s].replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')}${hiddenNames.length ? ' <span class="pill">已隐藏重复项: ' + hiddenNames.join('、') + '</span>' : ''}</div>` : '';
+    return `<div class="card"><h3>${CFG_SEC[s]} <span class="muted mono" style="font-size:12px">${s}</span></h3>
+      <div class="row">${shown.map(([k, val]) =>
+        (val && typeof val === 'object' && !Array.isArray(val)) ? subBlock(s, k, val) : input(`c_${s}_${k}`, val, lab(s, k))
+      ).join('')}</div>${note}</div>`;
+  };
   v.innerHTML = `${(d.errors || []).length ? `<div class="card"><b class="err">配置有问题</b><ul>${d.errors.map(e => `<li>${esc(e)}</li>`).join('')}</ul></div>` : ''}
     ${Object.entries(cfg).filter(([s]) => CFG_SEC[s]).map(([s, sec]) => secHtml(s, sec)).join('')}
     <div class="card"><h3>其它</h3>

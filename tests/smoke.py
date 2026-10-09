@@ -800,6 +800,107 @@ class TestPlanStore(unittest.TestCase):
             core.profile_write(old)
 
 
+class TestSchedule(unittest.TestCase):
+    """三种调度模式的下次时间计算 + 配置去重迁移 + 新消息计数。"""
+
+    def test_daily_next_run(self):
+        sch = {"enabled": True, "mode": "daily", "times": ["23:59"]}
+        r = core.next_run(sch)
+        self.assertEqual(r["mode"], "daily")
+        self.assertGreater(r["ts"], core.now())
+        self.assertLessEqual(r["in"], 86400)
+        self.assertIn("每天", r["label"])
+
+    def test_interval_next_run(self):
+        core.state_set("last_summary_ts", core.now() - 100)      # 100 秒前跑过
+        sch = {"enabled": True, "mode": "interval", "every_minutes": 60}
+        r = core.next_run(sch)
+        self.assertEqual(r["mode"], "interval")
+        self.assertGreater(r["ts"], core.now())
+        self.assertLessEqual(r["in"], 60 * 60 + 5)
+        self.assertIn("每隔", r["label"])
+
+    def test_interval_past_due_rolls_forward(self):
+        core.state_set("last_summary_ts", core.now() - 3 * 3600)
+        r = core.next_run({"enabled": True, "mode": "interval", "every_minutes": 60})
+        self.assertLessEqual(r["in"], 5, "已经超时的间隔任务应当立刻(≤5 秒)到期")
+
+    def test_weekly_next_run_respects_weekdays(self):
+        wd = time.localtime().tm_wday + 1
+        sch = {"enabled": True, "mode": "weekly", "weekdays": [wd], "weekly_time": "23:59"}
+        r = core.next_run(sch)
+        self.assertEqual(r["mode"], "weekly")
+        self.assertGreater(r["ts"], core.now())
+        self.assertLessEqual(r["in"], 7 * 86400)
+        self.assertIn("每周", r["label"])
+        # 只选明天时, 结果必须落在"明天"这一天(而不是今天)
+        tomorrow = time.localtime(core.now() + 86400).tm_wday + 1
+        if tomorrow != wd:
+            r2 = core.next_run({"enabled": True, "mode": "weekly", "weekdays": [tomorrow],
+                                "weekly_time": "23:59"})
+            self.assertEqual(time.localtime(r2["ts"]).tm_wday + 1, tomorrow)
+            self.assertGreater(r2["ts"], core.now())
+
+    def test_disabled_and_off(self):
+        r = core.next_run({"enabled": False, "mode": "daily", "times": ["23:59"]})
+        self.assertEqual(r["ts"], 0)
+        self.assertEqual(r["label"], "已停用")
+
+    def test_next_run_time_backward_compatible(self):
+        r = core.next_run_time(["23:59"])
+        self.assertGreater(r["ts"], core.now())
+
+    def test_count_since(self):
+        st = core.Store()
+        t0 = core.now()
+        before = st.count_since(t0)
+        st.insert_message({"time": t0 + 1, "message_type": "group", "group_id": 1, "user_id": 1,
+                           "raw_message": "计数测试", "sender": {"nickname": "x"}, "message": "x"})
+        self.assertEqual(st.count_since(t0), before + 1)
+        self.assertEqual(st.count_since(core.now() + 60), 0)
+
+    def test_migrate_dedupes_schedule_hours(self):
+        raw = json.load(open(core.CONF_PATH, encoding="utf-8-sig"))
+        raw.setdefault("schedule", {})["hours"] = 12
+        raw["summarizer"]["window_hours"] = 24
+        core.atomic_write(core.CONF_PATH, json.dumps(raw, ensure_ascii=False, indent=2))
+        hand = core.Config.__new__(core.Config)      # 直接测 migrate(), 避开 load() 自动迁移
+        hand.path, hand.data = core.CONF_PATH, json.loads(json.dumps(raw))
+        notes = hand.migrate()
+        self.assertTrue(any("hours" in n for n in notes), notes)
+        again = core.Config()
+        self.assertNotIn("hours", again.data["schedule"], "重复项应被清除")
+        self.assertEqual(again.data["summarizer"]["window_hours"], 12, "旧值应合并到时间窗")
+        again.set_values({"summarizer": {"window_hours": 24}})
+
+    def test_migrate_drops_unknown_schedule_keys(self):
+        cfg = core.Config()
+        raw = json.load(open(core.CONF_PATH, encoding="utf-8-sig"))
+        raw["schedule"]["legacy_junk"] = "x"
+        core.atomic_write(core.CONF_PATH, json.dumps(raw, ensure_ascii=False, indent=2))
+        core.Config().migrate()
+        self.assertNotIn("legacy_junk", core.Config().data["schedule"])
+
+    def test_schedule_apply_validates(self):
+        cfg = core.Config()
+        bad = webapp.schedule_apply(cfg, {"mode": "hourly"})
+        self.assertFalse(bad["ok"])
+        self.assertTrue(bad["errors"])
+        bad2 = webapp.schedule_apply(cfg, {"times": ["25:99:x"]})
+        self.assertFalse(bad2["ok"])
+        bad3 = webapp.schedule_apply(cfg, {"every_minutes": 0})
+        self.assertFalse(bad3["ok"])
+        bad4 = webapp.schedule_apply(cfg, {"weekdays": []})
+        self.assertFalse(bad4["ok"])
+        good = webapp.schedule_apply(cfg, {"mode": "interval", "every_minutes": 180})
+        self.assertTrue(good["ok"], good)
+        self.assertEqual(good["schedule"]["mode"], "interval")
+        self.assertEqual(good["schedule"]["every_minutes"], 180)
+        self.assertIn("每隔", good["next"]["label"])
+        webapp.schedule_apply(core.Config(), {"mode": "daily", "times": "22:00, 09:30"})
+        self.assertEqual(core.Config().data["schedule"]["times"], ["22:00", "09:30"])
+
+
 class TestIntegration(unittest.TestCase):
     """真实子进程: 采集器收消息落库 + SIGTERM 必须能退出(死锁回归)。"""
 

@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 import secrets
 
-VERSION = "2.0.1"
+VERSION = "2.1.0"
 
 HOME = os.path.expanduser("~")
 BASE = os.environ.get("QQOPS_HOME") or os.path.join(HOME, "qqops")
@@ -57,7 +57,16 @@ DEFAULT_CONFIG = {
     },
     "push": {"enable": False, "user_id": 0, "group_id": 0, "napcat_api_port": 3000,
              "token": "", "max_chars": 1200, "report_link": True},
-    "schedule": {"enabled": True, "times": ["22:00"], "hours": 24},
+    "schedule": {
+        "enabled": True,
+        "mode": "daily",             # daily=每天定点 | interval=每隔 N 分钟 | weekly=每周几
+        "times": ["22:00"],          # mode=daily: 每日时间点(可多个)
+        "every_minutes": 360,        # mode=interval: 间隔分钟数
+        "weekdays": [1, 2, 3, 4, 5], # mode=weekly: 1=周一 … 7=周日
+        "weekly_time": "22:00",      # mode=weekly: 当天的时刻
+        "skip_if_no_new": True,      # 自上次运行以来没有新消息就跳过(不发空报告)
+        "min_new_messages": 5,       # 至少多少条新消息才值得跑
+    },
     "retention": {"message_days": 0, "log_max_mb": 4, "backup_keep": 7},
     "extract": {
         "structured": True,          # LLM 输出结构化 JSON(事件/待办/链接/事实/记忆)
@@ -156,7 +165,36 @@ class Config:
         if not self.data["web"].get("token"):
             self.data["web"]["token"] = gen_token()
             self.save()
+        self.migrate()
         return self.data
+
+    def migrate(self) -> list:
+        """清理重复/废弃的配置项(去重), 返回改动说明。
+
+        已知重复:
+          * schedule.hours 与 summarizer.window_hours 是同一个"时间窗" → 合并到后者;
+          * 旧版本遗留的 schedule 键(如 times 之外的东西) → 删除。
+        """
+        notes = []
+        sch = self.data.setdefault("schedule", {})
+        if "hours" in sch:
+            try:
+                old = float(sch.pop("hours"))
+            except Exception:
+                old = None
+            cur = float(self.data["summarizer"].get("window_hours", 24) or 24)
+            if old and abs(cur - 24) < 0.01:
+                self.data["summarizer"]["window_hours"] = old
+                notes.append("把重复的 schedule.hours=%s 合并为 summarizer.window_hours" % old)
+            else:
+                notes.append("删除重复的 schedule.hours(时间窗以 summarizer.window_hours 为准)")
+        for k in [k for k in list(sch) if k not in DEFAULT_CONFIG["schedule"]]:
+            sch.pop(k, None)
+            notes.append("删除无用的 schedule.%s" % k)
+        if notes:
+            self.save()
+            log("core", "INFO", "配置去重: " + "; ".join(notes))
+        return notes
 
     def save(self) -> None:
         self.data["version"] = VERSION
@@ -437,6 +475,14 @@ class Store:
             return {"rows": rows, "total": total, "page": page, "size": size,
                     "pages": max(1, (total + size - 1) // size),
                     "mode": mode, "fts_available": self.fts_ok}
+        finally:
+            con.close()
+
+    def count_since(self, ts: int) -> int:
+        """统计某时刻之后的消息数(调度器用来判断"有没有新消息值得总结")。"""
+        con = self.conn()
+        try:
+            return con.execute("SELECT COUNT(*) c FROM messages WHERE ts>?", (int(ts),)).fetchone()["c"]
         finally:
             con.close()
 
@@ -1203,7 +1249,9 @@ def status_snapshot(cfg: Config | None = None) -> dict:
     store = Store()
     stats = store.stats(24)
     sch = cfg.data.get("schedule", {})
-    nxt = next_run_time(sch.get("times") or [])
+    nxt = next_run(sch)
+    last_ts = int(state_get("last_summary_ts", 0) or 0)
+    new_msgs = store.count_since(last_ts) if last_ts else stats["window"]
     return {
         "ts": now(),
         "version": VERSION,
@@ -1215,7 +1263,16 @@ def status_snapshot(cfg: Config | None = None) -> dict:
         "scheduler": {"alive": now() - int(state_get("scheduler_beat", 0) or 0) < 60,
                       "beat": int(state_get("scheduler_beat", 0) or 0),
                       "enabled": sch.get("enabled", True),
+                      "mode": sch.get("mode") or "daily",
+                      "label": nxt.get("label", ""),
                       "times": sch.get("times") or [],
+                      "every_minutes": sch.get("every_minutes"),
+                      "weekdays": sch.get("weekdays") or [],
+                      "weekly_time": sch.get("weekly_time"),
+                      "skip_if_no_new": sch.get("skip_if_no_new", True),
+                      "min_new_messages": sch.get("min_new_messages", 5),
+                      "last_run": last_ts,
+                      "new_since_last": new_msgs,
                       "next": nxt},
         "messages": {"total": stats["total"], "last_hour": stats["last_hour"],
                      "window": stats["window"], "groups": stats["groups"]},
@@ -1280,22 +1337,61 @@ def proc_info(pattern: str) -> dict:
     return {"pid": pid, "rss": rss, "etime": etime}
 
 
+def _day_start(ts: int) -> int:
+    lt = time.localtime(ts)
+    return int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)))
+
+
+def _hhmm(text: str) -> tuple:
+    try:
+        hh, mm = [int(x) for x in str(text).split(":")[:2]]
+        return max(0, min(23, hh)), max(0, min(59, mm))
+    except Exception:
+        return 22, 0
+
+
 def next_run_time(times: list, now_ts: int | None = None) -> dict:
-    """算出 schedule.times 里最近的下一次触发时间。"""
+    """(兼容旧接口)按每日时间点列表算下一次触发。"""
     now_ts = now_ts or now()
-    lt = time.localtime(now_ts)
     best = 0
     for t in (times or []):
-        try:
-            hh, mm = [int(x) for x in str(t).split(":")]
-        except Exception:
-            continue
-        ts = int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, hh, mm, 0, 0, 0, -1)))
+        hh, mm = _hhmm(t)
+        ts = _day_start(now_ts) + hh * 3600 + mm * 60
         while ts <= now_ts:
             ts += 86400
         if best == 0 or ts < best:
             best = ts
     return {"ts": best, "in": max(0, best - now_ts) if best else 0}
+
+
+def next_run(sched: dict, now_ts: int | None = None) -> dict:
+    """按 schedule 配置算下一次运行(支持 每天定点 / 每隔 N 分钟 / 每周几)。"""
+    now_ts = now_ts or now()
+    out = {"ts": 0, "in": 0, "mode": "off", "label": "已停用"}
+    if not (sched or {}).get("enabled", True):
+        return out
+    mode = str(sched.get("mode") or "daily").lower()
+    if mode == "interval":
+        every = max(1, int(sched.get("every_minutes") or 360))
+        last = int(state_get("last_summary_ts", 0) or 0)
+        nxt = (last or now_ts) + every * 60
+        if nxt <= now_ts:            # 已经超过间隔 → 视为"现在就该跑", 与调度器判定保持一致
+            nxt = now_ts
+        return {"ts": nxt, "in": max(0, nxt - now_ts), "mode": mode,
+                "label": "每隔 %s" % (("%d 小时" % (every // 60)) if every % 60 == 0 else ("%d 分钟" % every))}
+    if mode == "weekly":
+        wds = [int(x) for x in (sched.get("weekdays") or [1, 2, 3, 4, 5])]
+        hh, mm = _hhmm(sched.get("weekly_time") or "22:00")
+        for delta in range(0, 9):
+            base = _day_start(now_ts + delta * 86400) + hh * 3600 + mm * 60
+            if base > now_ts and (time.localtime(base).tm_wday + 1) in wds:
+                names = "一二三四五六日"
+                label = "每周" + "、".join(names[w - 1] for w in sorted(set(wds)) if 1 <= w <= 7) + " %02d:%02d" % (hh, mm)
+                return {"ts": base, "in": base - now_ts, "mode": mode, "label": label}
+        return out
+    r = next_run_time(sched.get("times") or ["22:00"], now_ts)
+    return {"ts": r["ts"], "in": r["in"], "mode": "daily",
+            "label": "每天 " + "、".join(sched.get("times") or ["22:00"])}
 
 
 def count_files(path: str, suffix: str = "") -> int:

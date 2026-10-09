@@ -1,8 +1,9 @@
-"""QQOps Scheduler —— 定时总结 + 数据维护。
+"""QQOps Scheduler —— 定时总结(每天定点 / 每隔 N 分钟 / 每周几) + 数据维护。
 
 特性:
-  * 每 15 秒轮询一次配置(改配置无需重启);
-  * 支持多个每日时间点(schedule.times);
+  * 每 15 秒轮询配置(改配置无需重启);
+  * 三种调度模式, 每次运行后记录 last_summary_ts, 供"下次时间"与"有无新消息"判断;
+  * skip_if_no_new: 自上次运行以来新消息不足 min_new_messages 就跳过(不发空报告, 不花模型钱);
   * 同一时间点当天只跑一次(状态写 state.json, 重启不重复跑);
   * 顺带做保留策略清理与每日备份, 备份数量按 retention.backup_keep 滚动;
   * 心跳写入数据库, 控制台可据此判断调度器是否存活。
@@ -31,6 +32,35 @@ def _mark(key: str) -> None:
     core.state_set(key, _today())
 
 
+def _due(cfg: core.Config, store: core.Store, now_str: str) -> tuple:
+    """判断此刻是否该跑。返回 (是否运行, 触发标签)。"""
+    sch = cfg.data.get("schedule", {})
+    if not sch.get("enabled", True):
+        return False, ""
+    mode = str(sch.get("mode") or "daily").lower()
+    if mode == "interval":
+        every = max(1, int(sch.get("every_minutes") or 360)) * 60
+        last = int(core.state_get("last_summary_ts", 0) or 0) or core.now()
+        if core.now() - last >= every:
+            return True, "每隔 %d 分钟" % (every // 60 or 1)
+        return False, ""
+    if mode == "weekly":
+        wds = [int(x) for x in (sch.get("weekdays") or [1, 2, 3, 4, 5])]
+        wd = time.localtime().tm_wday + 1
+        at = str(sch.get("weekly_time") or "22:00")
+        key = "ran_weekly"
+        if wd in wds and now_str >= at and _last_run(key) != _today():
+            _mark(key)
+            return True, "每周 %s %s" % (wd, at)
+        return False, ""
+    for t in (sch.get("times") or []):
+        key = "ran_%s" % t
+        if now_str == t and _last_run(key) != _today():
+            _mark(key)
+            return True, "每天 %s" % t
+    return False, ""
+
+
 def _do_maintenance(cfg: core.Config, store: core.Store) -> None:
     days = int(cfg.data.get("retention", {}).get("message_days", 0) or 0)
     if days > 0:
@@ -39,11 +69,11 @@ def _do_maintenance(cfg: core.Config, store: core.Store) -> None:
     keep = int(cfg.data.get("retention", {}).get("backup_keep", 7) or 7)
     try:
         path = store.backup(core.BACKUP_DIR)
-        core.atomic_write(os.path.join(core.BACKUP_DIR, "config-%s.json" % time.strftime("%Y%m%d")),
-                          open(core.CONF_PATH, encoding="utf-8").read())
+        with open(core.CONF_PATH, encoding="utf-8") as f:
+            core.atomic_write(os.path.join(core.BACKUP_DIR, "config-%s.json" % time.strftime("%Y%m%d")), f.read())
         core.log("scheduler", "INFO", "备份完成: %s" % path)
         files = sorted([f for f in os.listdir(core.BACKUP_DIR) if f.startswith("messages-")])
-        for f in files[:-keep] if keep > 0 else []:
+        for f in (files[:-keep] if keep > 0 else []):
             os.remove(os.path.join(core.BACKUP_DIR, f))
     except Exception as e:
         core.log("scheduler", "ERROR", "备份失败: %s" % e)
@@ -60,18 +90,24 @@ def main(argv=None) -> int:
             cfg = core.Config()
             store = core.Store()
             core.state_set("scheduler_beat", core.now())
-            now = time.strftime("%H:%M")
+            now_str = time.strftime("%H:%M")
             sch = cfg.data.get("schedule", {})
-            if sch.get("enabled", True):
-                for t in (sch.get("times") or []):
-                    key = "ran_%s" % t
-                    if now == t and _last_run(key) != _today():
-                        _mark(key)
-                        core.log("scheduler", "INFO", "到点触发总结: %s" % t)
-                        res = summarizer.run(hours=float(sch.get("hours", 24) or 24),
-                                             job="schedule:%s" % t)
-                        core.log("scheduler", "INFO", "定时总结结束: %s" % res.get("detail", res.get("status")))
-            if now == MAINT_AT and _last_run("ran_maint") != _today():
+
+            ok, label = _due(cfg, store, now_str)
+            if ok:
+                last = int(core.state_get("last_summary_ts", 0) or 0)
+                new_msgs = store.count_since(last) if last else 10 ** 9
+                need = int(sch.get("min_new_messages", 5) or 0)
+                if sch.get("skip_if_no_new", True) and new_msgs < need:
+                    core.log("scheduler", "INFO", "跳过本次(%s): 距上次只有 %d 条新消息(<%d)" % (label, new_msgs, need))
+                    rid = store.run_start("schedule:%s" % label)
+                    store.run_finish(rid, "skipped", "无新消息可总结(%d 条 < %d 条)" % (new_msgs, need))
+                else:
+                    core.log("scheduler", "INFO", "到点触发总结: %s(新消息 %d 条)" % (label, new_msgs))
+                    res = summarizer.run(job="schedule:%s" % label)
+                    core.state_set("last_summary_ts", core.now())
+                    core.log("scheduler", "INFO", "定时总结结束: %s" % res.get("detail", res.get("status")))
+            if now_str == MAINT_AT and _last_run("ran_maint") != _today():
                 _mark("ran_maint")
                 _do_maintenance(cfg, store)
         except Exception as e:

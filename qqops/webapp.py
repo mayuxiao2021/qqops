@@ -281,6 +281,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(snap)
         if path == "/api/status":
             return self.json(core.status_snapshot(cfg))
+        if path == "/api/schedule":
+            return self.json(schedule_payload(cfg, store))
         # ---- 计划: 事件 / 待办 / 记忆 / 链接 / 媒体 ----
         if path == "/api/events":
             st = qs.get("status", ["open"])[0]
@@ -447,6 +449,8 @@ class Handler(BaseHTTPRequestHandler):
             cfg.set_values(body.get("config") or {})
             cfg = core.Config()
             return self.json({"ok": True, "errors": cfg.validate(), "config": cfg.masked()})
+        if path == "/api/schedule":
+            return self.json(schedule_apply(cfg, body))
         if path == "/api/summarize":
             if TASK["running"]:
                 return self.json({"error": "已有任务在运行", "task": TASK}, 409)
@@ -545,6 +549,77 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *a):
         pass
+
+
+def schedule_payload(cfg: core.Config, store: core.Store) -> dict:
+    sch = cfg.data.get("schedule", {})
+    last = int(core.state_get("last_summary_ts", 0) or 0)
+    return {"schedule": sch, "next": core.next_run(sch), "last_run": last,
+            "new_since_last": store.count_since(last) if last else None,
+            "preview": core.next_run(dict(sch, enabled=True))}
+
+
+def schedule_apply(cfg: core.Config, body: dict) -> dict:
+    """校验并保存定时设置(三种模式)。"""
+    import re as _re
+    sch = dict(cfg.data.get("schedule") or {})
+    errs = []
+    if body.get("mode") is not None:
+        mode = str(body["mode"]).lower()
+        if mode not in ("daily", "interval", "weekly"):
+            errs.append("模式只能是 每天/每隔/每周")
+        else:
+            sch["mode"] = mode
+    if body.get("enabled") is not None:
+        sch["enabled"] = bool(body["enabled"])
+    if body.get("times") is not None:
+        ts = [str(x).strip() for x in (body["times"] if isinstance(body["times"], list)
+                                       else str(body["times"]).split(",")) if str(x).strip()]
+        bad = [x for x in ts if not _re.match(r"^\d{1,2}:\d{2}$", x)]
+        if bad:
+            errs.append("时间点格式应为 HH:MM: %s" % ", ".join(bad))
+        elif not ts:
+            errs.append("至少填一个时间点")
+        else:
+            sch["times"] = ["%02d:%02d" % tuple(int(y) for y in x.split(":")) for x in ts]
+    if body.get("every_minutes") is not None:
+        try:
+            v = int(body["every_minutes"])
+            if not (1 <= v <= 10080):
+                errs.append("间隔需在 1~10080 分钟之间")
+            else:
+                sch["every_minutes"] = v
+        except Exception:
+            errs.append("间隔必须是整数分钟")
+    if body.get("weekdays") is not None:
+        try:
+            wd = sorted({int(x) for x in body["weekdays"] if 1 <= int(x) <= 7})
+            if not wd:
+                errs.append("每周模式至少要选一天")
+            else:
+                sch["weekdays"] = wd
+        except Exception:
+            errs.append("星期取值应为 1~7")
+    if body.get("weekly_time") is not None:
+        t = str(body["weekly_time"]).strip()
+        if not _re.match(r"^\d{1,2}:\d{2}$", t):
+            errs.append("每周时刻格式应为 HH:MM")
+        else:
+            sch["weekly_time"] = "%02d:%02d" % tuple(int(y) for y in t.split(":"))
+    if body.get("skip_if_no_new") is not None:
+        sch["skip_if_no_new"] = bool(body["skip_if_no_new"])
+    if body.get("min_new_messages") is not None:
+        try:
+            sch["min_new_messages"] = max(0, int(body["min_new_messages"]))
+        except Exception:
+            errs.append("最小新消息数必须是整数")
+    if errs:
+        return {"ok": False, "errors": errs, **schedule_payload(cfg, core.Store())}
+    cfg.set_values({"schedule": sch})
+    cfg = core.Config()
+    store = core.Store()
+    core.log("web", "INFO", "定时设置已更新: %s" % core.next_run(cfg.data["schedule"]).get("label"))
+    return {"ok": True, "errors": [], **schedule_payload(cfg, store)}
 
 
 def service_action(cfg: core.Config, name: str, action: str) -> dict:
