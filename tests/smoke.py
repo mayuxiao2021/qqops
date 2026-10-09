@@ -35,7 +35,8 @@ os.environ["QQOPS_DATA"] = TMP
 os.environ["TZ"] = "Asia/Shanghai"
 sys.path.insert(0, ROOT)
 
-from qqops import collector, core, summarizer, svc, tools, webapp  # noqa: E402
+from qqops import (collector, core, extract, fileread, linkfetch, media, render,  # noqa: E402
+                   summarizer, svc, tools, webapp)
 
 POSIX = os.name != "nt"
 
@@ -404,21 +405,33 @@ class TestConsistency(unittest.TestCase):
         self.assertEqual(core.DEFAULT_CONFIG["version"], core.VERSION)
 
     def test_stdlib_only(self):
-        """第三方依赖必须为 0: 只有标准库 + 包内相对导入。"""
+        """核心必须只依赖标准库; 允许的可选依赖只能是函数内惰性导入(PDF 解析)。"""
         std = set(sys.stdlib_module_names)
-        outside = set()
+        OPTIONAL = {"pypdf", "PyPDF2"}
+        outside, lazy_ok = set(), set()
         for dirpath, _dirs, files in os.walk(os.path.join(ROOT, "qqops")):
             for fn in files:
                 if not fn.endswith(".py"):
                     continue
-                src = open(os.path.join(dirpath, fn), encoding="utf-8").read()
-                for node in ast.walk(ast.parse(src)):
+                path = os.path.join(dirpath, fn)
+                src = open(path, encoding="utf-8").read()
+                tree = ast.parse(src)
+                top_level = set()
+                for node in tree.body:                      # 模块级 import
+                    if isinstance(node, ast.Import):
+                        top_level.update(a.name.split(".")[0] for a in node.names)
+                    elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                        top_level.add(node.module.split(".")[0])
+                for node in ast.walk(tree):                 # 所有 import(含函数内)
                     if isinstance(node, ast.Import):
                         outside.update(a.name.split(".")[0] for a in node.names)
                     elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
                         outside.add(node.module.split(".")[0])
-        bad = sorted(m for m in outside if m not in std and m != "qqops")
+                for m in (top_level & OPTIONAL):
+                    lazy_ok.add(m)                          # 出现在模块级 → 记为违规
+        bad = sorted(m for m in outside if m not in std and m != "qqops" and m not in OPTIONAL)
         self.assertEqual(bad, [], "出现第三方依赖: %s" % bad)
+        self.assertEqual(sorted(lazy_ok), [], "可选依赖必须函数内惰性导入, 不能在模块级: %s" % lazy_ok)
 
     def test_no_debug_leftovers(self):
         for dirpath, _dirs, files in os.walk(os.path.join(ROOT, "qqops")):
@@ -435,6 +448,356 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+# ---------------------------------------------------------------- v2.0 新能力
+class TestExtract(unittest.TestCase):
+    def test_parse_json_tolerates_fences_and_noise(self):
+        self.assertEqual(extract.parse_json('```json\n{"a":1}\n```'), {"a": 1})
+        self.assertEqual(extract.parse_json('前面废话 {"a":1,} 后面废话'), {"a": 1})
+        self.assertEqual(extract.parse_json("不是 json"), {})
+        self.assertEqual(extract.parse_json(""), {})
+
+    def test_normalize_limits_and_filters(self):
+        obj = {"overview": "x" * 300,
+               "events": [{"title": "甲", "kind": "deadline", "due": "明天", "confidence": 0.9},
+                          {"title": "乙", "confidence": 0.1},          # 低置信被丢
+                          {"title": "", "confidence": 0.9}],           # 无标题被丢
+               "todos": ["写周报", {"what": "交作业", "due": "2026-11-01"}],
+               "links": [{"url": "https://a.com", "title": "T"}, {"url": "ftp://bad"}],
+               "facts": ["事实一"], "memory_update": "记忆"}
+        n = extract.normalize(obj, {"max_events": 5, "low_confidence_drop": 0.35}, 7)
+        self.assertEqual(len(n["events"]), 1)
+        self.assertEqual(n["events"][0]["group_id"], 7)
+        self.assertGreater(n["events"][0]["due_at"], core.now())
+        self.assertEqual(len(n["todos"]), 2)
+        self.assertEqual(n["todos"][0]["kind"], "todo")
+        self.assertEqual([l["url"] for l in n["links"]], ["https://a.com"])
+        self.assertEqual(n["facts"], ["事实一"])
+        self.assertEqual(n["memory_update"], "记忆")
+        self.assertLessEqual(len(n["overview"]), 80)
+
+    def test_normalize_caps_kind(self):
+        n = extract.normalize({"events": [{"title": "x", "kind": "乱写", "confidence": 0.9}]}, {}, 1)
+        self.assertEqual(n["events"][0]["kind"], "event")
+
+
+class TestParseDue(unittest.TestCase):
+    def test_relative_and_absolute(self):
+        day = 86400
+        for kw in ("今天", "明天", "后天", "3天后", "本周五", "月底", "2026-12-31", "12-31"):
+            self.assertGreater(core.parse_due(kw), core.now(), "%s 应解析为未来时间" % kw)
+        self.assertGreater(core.parse_due("明天"), core.now() + day - 7200)
+        self.assertGreater(core.parse_due("后天"), core.now() + 2 * day - 7200)
+        self.assertGreater(core.parse_due("3天后"), core.now() + 3 * day - 7200)
+        self.assertGreater(core.parse_due("下周三"), core.now() + 6 * day)
+        self.assertLessEqual(core.parse_due("下周三") - core.now(), 14 * day)
+
+    def test_due_is_end_of_day(self):
+        v = core.parse_due("明天")
+        self.assertEqual(time.strftime("%H:%M", time.localtime(v)), "23:59")
+
+    def test_explicit_time_is_kept(self):
+        v = core.parse_due("2026-12-31 08:30")
+        self.assertTrue(v)
+        self.assertEqual(time.strftime("%m-%d %H:%M", time.localtime(v)), "12-31 08:30")
+
+    def test_unknown_returns_zero(self):
+        for s in ("", "不知道", "以后", "尽快", None):
+            self.assertEqual(core.parse_due(s), 0)
+
+
+class TestRender(unittest.TestCase):
+    def _sections(self):
+        return [{"group_id": 5, "name": "群A", "stats": "- 消息总数: **3**", "overview": "概览",
+                 "topics": [{"title": "话题", "summary": "摘要"}], "facts": ["事实"],
+                 "events": [{"kind": "deadline", "title": "交稿", "detail": "周五前",
+                             "due_at": core.now() + 86400, "priority": 1, "relevant": True}],
+                 "todos": [{"what": "写周报", "who": "我", "due_at": 0}],
+                 "links": [{"url": "https://a.com", "title": "T", "why": "值得看"}],
+                 "memory": "记忆", "error": ""}]
+
+    def test_xlsx_is_valid_zip_with_parts(self):
+        import io
+        import zipfile
+        data = render.xlsx_bytes([["标题", "数"], ["a", 1]], "表1")
+        self.assertTrue(data.startswith(b"PK"))
+        names = zipfile.ZipFile(io.BytesIO(data)).namelist()
+        for need in ("[Content_Types].xml", "xl/workbook.xml", "xl/worksheets/sheet1.xml"):
+            self.assertIn(need, names)
+        multi = render.xlsx_multi({"事件": [["a"]], "链接": [["b"]]})
+        self.assertIn("xl/worksheets/sheet2.xml", zipfile.ZipFile(io.BytesIO(multi)).namelist())
+
+    def test_docx_is_valid_zip(self):
+        import io
+        import zipfile
+        data = render.docx_bytes([("h1", "标题"), ("p", "正文 <&>"), ("bullet", "项")], "t")
+        self.assertTrue(data.startswith(b"PK"))
+        z = zipfile.ZipFile(io.BytesIO(data))
+        doc = z.read("word/document.xml").decode()
+        self.assertIn("标题", doc)
+        self.assertIn("&lt;&amp;&gt;", doc)          # XML 转义正确
+
+    def test_md_to_docx_blocks(self):
+        blocks = render.md_to_docx_blocks("# 一\n## 二\n- 三\n> 四\n正文")
+        self.assertEqual(blocks[0], ("h1", "一"))
+        self.assertEqual(blocks[1], ("h2", "二"))
+        self.assertEqual(blocks[2], ("bullet", "三"))
+        self.assertEqual(blocks[3], ("quote", "四"))
+
+    def test_reports_contain_key_bits(self):
+        secs, meta = self._sections(), {"stamp": "s", "hours": 24, "generated": core.now(),
+                                        "n_events": 1, "n_todos": 1, "n_links": 1,
+                                        "events_open": 1, "due_7d": 1, "overdue": 0, "due_list": []}
+        md = render.report_md(meta, secs)
+        self.assertIn("重要事件", md)
+        self.assertIn("交稿", md)
+        html_doc = render.report_html(meta, secs, "# 档案")
+        self.assertIn("<!doctype html>", html_doc.lower())
+        self.assertIn("交稿", html_doc)
+        self.assertIn("个人档案", html_doc)
+        digest = render.digest_text(meta, secs)
+        self.assertIn("交稿", digest)
+        self.assertLessEqual(len(digest), 1200)
+
+    def test_events_rows_header(self):
+        rows = render.events_rows([{"title": "t", "kind": "deadline", "status": "open"}])
+        self.assertEqual(rows[0][0], "状态")
+        self.assertEqual(len(rows), 2)
+
+
+class TestLinkfetch(unittest.TestCase):
+    def test_ssrf_guard(self):
+        for bad in ("http://localhost/x", "http://127.0.0.1/x", "http://192.168.1.1/x",
+                    "http://10.0.0.5/x", "http://172.16.0.1/x", "http://169.254.1.1/x",
+                    "file:///etc/passwd", "ftp://a.com/x", "gopher://a.com",
+                    "http://[::1]/x", "not-a-url"):
+            ok, why = linkfetch._host_ok(bad)
+            self.assertFalse(ok, "%s 应被拒绝(%s)" % (bad, why))
+
+    def test_html_to_text(self):
+        title, text = linkfetch.html_to_text(
+            "<html><head><title>标题A</title><style>a{}</style></head>"
+            "<body><nav>导航</nav><p>正文一</p><p>正文二</p><script>x=1</script></body></html>")
+        self.assertEqual(title, "标题A")
+        self.assertIn("正文一", text)
+        self.assertNotIn("x=1", text)
+        self.assertNotIn("导航", text)
+
+    def test_extract_and_filter_urls(self):
+        urls = linkfetch.extract_urls("看 https://a.com/x 和 https://b.com/y)，。 ")
+        self.assertEqual(urls, ["https://a.com/x", "https://b.com/y"])
+        self.assertFalse(linkfetch.interesting("https://multimedia.nt.qq.com.cn/download?a=1"))
+        self.assertFalse(linkfetch.interesting("https://x.com/a.jpg"))
+        self.assertTrue(linkfetch.interesting("https://mp.weixin.qq.com/s/abc"))
+        self.assertEqual(linkfetch.domain_of("https://a.com/x/y"), "a.com")
+
+    def test_fetch_rejects_internal_without_network(self):
+        r = linkfetch.fetch("http://127.0.0.1:8091/", timeout=2)
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["error"])
+
+
+class TestFileread(unittest.TestCase):
+    def test_kind_of(self):
+        self.assertEqual(fileread.kind_of("a.docx"), "docx")
+        self.assertEqual(fileread.kind_of("b.XLSX"), "xlsx")
+        self.assertEqual(fileread.kind_of("c.pdf"), "pdf")
+        self.assertEqual(fileread.kind_of("d.md"), "text")
+        self.assertEqual(fileread.kind_of("e.png"), "image")
+        self.assertEqual(fileread.kind_of("f.bin"), "other")
+
+    def test_text_encodings(self):
+        self.assertEqual(fileread.read_bytes("你好".encode("utf-8"), "a.txt")["text"], "你好")
+        self.assertEqual(fileread.read_bytes("你好".encode("gb18030"), "a.txt")["text"], "你好")
+
+    def test_xlsx_roundtrip(self):
+        """用自己产出的 xlsx 反过来解析 —— 同时验证写入与读取。"""
+        data = render.xlsx_bytes([["姓名", "分数"], ["张三", 90], ["李四", 85]], "成绩")
+        r = fileread.read_bytes(data, "成绩.xlsx")
+        self.assertEqual(r["kind"], "xlsx")
+        self.assertIn("张三", r["text"])
+        self.assertIn("李四", r["text"])
+
+    def test_docx_roundtrip(self):
+        data = render.docx_bytes([("h1", "方案"), ("p", "第一步 收集需求"), ("bullet", "联系设计")], "t")
+        r = fileread.read_bytes(data, "方案.docx")
+        self.assertIn("收集需求", r["text"])
+        self.assertIn("联系设计", r["text"])
+
+    def test_pptx_minimal(self):
+        import io
+        import zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("ppt/slides/slide1.xml",
+                       '<p:sld xmlns:a="x"><a:p><a:t>第一页要点</a:t></a:p></p:sld>')
+        r = fileread.read_bytes(buf.getvalue(), "演示.pptx")
+        self.assertIn("第一页要点", r["text"])
+
+    def test_pdf_reports_error_without_dependency(self):
+        """没有 pypdf 时给出明确提示; 装了 pypdf 时对坏 PDF 也应报错而不是崩溃。"""
+        r = fileread.read_bytes(b"%PDF-1.4 fake", "a.pdf")
+        self.assertTrue(r["error"], "坏 PDF 必须有明确错误")
+        self.assertEqual(r["text"], "")
+        self.assertEqual(r["kind"], "pdf")
+
+    def test_bad_zip_does_not_crash(self):
+        r = fileread.read_bytes(b"not a zip", "x.docx")
+        self.assertTrue(r["error"])
+
+
+class TestMediaHelpers(unittest.TestCase):
+    def test_from_segment(self):
+        info = media.from_segment({"type": "image",
+                                   "data": {"url": "http://x/y.jpg", "file": "y.jpg", "file_size": "1234"}})
+        self.assertEqual(info["url"], "http://x/y.jpg")
+        self.assertEqual(info["size"], 1234)
+        self.assertEqual(media.from_segment("bad"), {})
+
+    def test_guess_mime_and_key(self):
+        self.assertEqual(media.guess_mime("a.png"), "image/png")
+        self.assertEqual(media.guess_mime("b", b"\xff\xd8\xff\xe0"), "image/jpeg")
+        self.assertEqual(len(media.key_of("http://x/y.jpg")), 24)
+        self.assertEqual(media.safe_name("http://x/y.jpg", "报告.docx"), "报告.docx")
+
+    def test_container_path_mapping(self):
+        fake = os.path.join(TMP, "rootfs-a")
+        orig = core._proot_rootfs
+        core._proot_rootfs = lambda: fake
+        try:
+            p = media.container_path("/root/.config/QQ/a.png")
+            self.assertTrue(p.startswith(fake), p)
+            self.assertTrue(os.path.normpath(p).endswith(
+                os.path.normpath(os.path.join("root", ".config", "QQ", "a.png"))), p)
+            self.assertEqual(media.container_path("relative/x.png"), "")
+            self.assertEqual(media.container_path(""), "")
+        finally:
+            core._proot_rootfs = orig
+
+    def test_fetch_media_falls_back_to_napcat_cache(self):
+        """QQ CDN 常会 400, 但 NapCat 已把图片落到容器里 → 直接读本地文件。"""
+        root = os.path.join(TMP, "rootfs-b")
+        target = os.path.join(root, "root", "cache", "img.png")
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        data = b"\x89PNG\r\n\x1a\n" + b"0" * 100
+        with open(target, "wb") as f:
+            f.write(data)
+
+        class FakeNC:
+            def call(self, action, payload=None, timeout=None):
+                return {"status": "ok", "retcode": 0,
+                        "data": {"file": "/root/cache/img.png", "url": ""}}
+
+        orig = core._proot_rootfs
+        core._proot_rootfs = lambda: root
+        try:
+            r = media.fetch_media(FakeNC(), {"url": "", "file": "x.png"}, 1, 1_000_000, "image")
+            self.assertTrue(r["ok"], r)
+            self.assertEqual(r["via"], "napcat-cache")
+            self.assertEqual(r["size"], len(data))
+            self.assertEqual(r["mime"], "image/png")
+        finally:
+            core._proot_rootfs = orig
+
+    def test_find_in_napcat_cache_by_lowercase_name(self):
+        """NapCat 缓存是小写 md5.ext 且按 YYYY-MM 分片; 消息段里给的常是大写。"""
+        root = os.path.join(TMP, "rootfs-c")
+        target = os.path.join(root, "root", ".config", "QQ", "nt_qq_abc", "nt_data", "Pic",
+                              time.strftime("%Y-%m"), "Ori", "deadbeef00112233.png")
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n" + b"1" * 50)
+        orig = core._proot_rootfs
+        core._proot_rootfs = lambda: root
+        try:
+            self.assertEqual(media.find_in_napcat_cache("DEADBEEF00112233.png", core.now()), target)
+            self.assertEqual(media.find_in_napcat_cache("deadbeef0011", core.now()), target)
+            self.assertEqual(media.find_in_napcat_cache("不存在的名字.png", core.now()), "")
+            self.assertEqual(media.find_in_napcat_cache("../etc/passwd", core.now()), "")
+            r = media.fetch_media(None, {"url": "", "file": "DEADBEEF00112233.png", "ts": core.now()},
+                                  1, 1_000_000, "image")
+            self.assertTrue(r["ok"], r)
+            self.assertEqual(r["via"], "cache-scan")
+        finally:
+            core._proot_rootfs = orig
+
+    def test_fetch_media_reports_failure_cleanly(self):
+        class BadNC:
+            def call(self, *a, **k):
+                raise RuntimeError("boom")
+        r = media.fetch_media(BadNC(), {"url": "", "file": ""}, 1, 1000, "image")
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["error"])
+
+
+class TestPlanStore(unittest.TestCase):
+    """事件去重合并 / 状态流转 / 记忆 / 链接 / 媒体 的存储行为。"""
+
+    def setUp(self):
+        self.store = core.Store()
+        self.gid = 8000 + core.now() % 1000
+
+    def test_upsert_dedup_merges(self):
+        ev = {"kind": "deadline", "title": "交设计稿", "group_id": self.gid,
+              "due_at": core.now() + 86400, "priority": 2, "confidence": 0.6}
+        eid1, created1 = self.store.event_upsert(dict(ev))
+        ev2 = dict(ev, priority=1, confidence=0.9, detail="补充说明")
+        eid2, created2 = self.store.event_upsert(ev2)
+        self.assertTrue(created1)
+        self.assertFalse(created2)
+        self.assertEqual(eid1, eid2)
+        row = [e for e in self.store.events(status="all", limit=500) if e["id"] == eid1][0]
+        self.assertEqual(row["priority"], 1)
+        self.assertEqual(row["detail"], "补充说明")
+        self.assertEqual(round(row["confidence"], 2), 0.9)
+
+    def test_status_flow_and_stats(self):
+        eid, _ = self.store.event_upsert({"kind": "event", "title": "状态流转", "group_id": self.gid,
+                                          "confidence": 0.9})
+        self.assertTrue(self.store.event_update(eid, status="done"))
+        row = [e for e in self.store.events(status="done", limit=500) if e["id"] == eid]
+        self.assertEqual(len(row), 1)
+        self.assertIn("done", self.store.event_stats()["by_status"])
+        self.store.event_delete(eid)
+
+    def test_due_soon_and_overdue_query(self):
+        eid, _ = self.store.event_upsert({"kind": "deadline", "title": "明天到期", "group_id": self.gid,
+                                          "due_at": core.now() + 3600, "confidence": 0.9})
+        self.assertTrue(any(e["id"] == eid for e in self.store.events(status="open", soon_only=True, limit=200)))
+        self.store.event_delete(eid)
+
+    def test_memory_roundtrip(self):
+        self.store.memory_set("group:%d" % self.gid, "digest", "记忆A")
+        self.assertEqual(self.store.memory_get("group:%d" % self.gid)["content"], "记忆A")
+        self.store.memory_set("group:%d" % self.gid, "digest", "记忆B", bump_hits=True)
+        rec = self.store.memory_get("group:%d" % self.gid)
+        self.assertEqual(rec["content"], "记忆B")
+        self.assertGreaterEqual(rec["hits"], 1)
+        self.assertTrue(any(m["scope"] == "group:%d" % self.gid for m in self.store.memory_all("group:")))
+
+    def test_link_and_media(self):
+        url = "https://example.com/%d" % core.now()
+        self.store.link_upsert(url, title="T", domain="example.com", group_id=self.gid)
+        self.store.link_update(url, status="ok", excerpt="正文摘要", fetched_at=core.now())
+        rec = [l for l in self.store.links(limit=50) if l["url"] == url][0]
+        self.assertEqual(rec["status"], "ok")
+        self.assertEqual(rec["excerpt"], "正文摘要")
+        k = "key%d" % core.now()
+        self.store.media_upsert(k, group_id=self.gid, kind="image", url=url, size=10, status="downloaded")
+        self.store.media_upsert(k, caption="一只猫", caption_at=core.now(), status="captioned")
+        m = self.store.media_get(k)
+        self.assertEqual(m["caption"], "一只猫")
+        self.assertEqual(m["size"], 10)
+        self.assertTrue(any(x["key"] == k for x in self.store.media_list(limit=50)))
+
+    def test_profile_roundtrip(self):
+        old = core.profile_read()
+        try:
+            core.profile_write("# 测试档案\n- 目标: X")
+            self.assertIn("测试档案", core.profile_read())
+        finally:
+            core.profile_write(old)
 
 
 class TestIntegration(unittest.TestCase):
@@ -550,8 +913,11 @@ class TestIntegration(unittest.TestCase):
         env = self._env()
         for args in (["-m", "qqops.tools", "init"], ["-m", "qqops.tools", "doctor"]):
             p = subprocess.run([sys.executable] + args, cwd=ROOT, env=env,
-                               capture_output=True, text=True, timeout=90)
-            self.assertIn(p.returncode, (0, 1), "命令失败: %s\n%s" % (args, p.stdout[-500:]))
+                               capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=90)
+            out = (p.stdout or "") + (p.stderr or "")
+            self.assertIn(p.returncode, (0, 1), "命令失败: %s\n%s" % (args, out[-500:]))
+            self.assertTrue(out.strip(), "命令没有输出: %s" % args)
 
 
 if __name__ == "__main__":
