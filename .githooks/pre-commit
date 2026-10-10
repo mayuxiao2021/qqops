@@ -1,0 +1,13 @@
+#!/bin/sh
+# 提交前门禁: 只扫暂存区, 发现隐私/密钥就拒绝提交。
+# 安装: bash tools/install-hooks.sh   (等价于 git config core.hooksPath .githooks)
+set -e
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+python3 tools/check_secrets.py --staged --quiet || {
+  echo ""
+  echo "✘ 提交被拦下: 暂存区里有疑似隐私/密钥。"
+  echo "  看详情: python3 tools/check_secrets.py --staged"
+  echo "  确实必要(例如测试用的假密钥): 在该行加注释 'secret-scan: allow' 并说明原因。"
+  exit 1
+}

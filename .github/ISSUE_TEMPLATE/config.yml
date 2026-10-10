@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全问题(请勿公开)
+    url: https://github.com/mayuxiao2021/qqops/security/advisories/new
+    about: 漏洞、凭据泄露、越权等问题请走私密报告,不要开公开 issue。
+  - name: 使用问题先看文档
+    url: https://github.com/mayuxiao2021/qqops/blob/main/docs/FAQ.md
+    about: 部署、成本、隐私、卡片消息等常见问题都在 FAQ 与 docs/ 里。
+  - name: 讨论与想法
+    url: https://github.com/mayuxiao2021/qqops/discussions
+    about: 不确定是不是 bug、想聊设计,用 Discussions。

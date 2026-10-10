@@ -1,0 +1,66 @@
+name: Bug 报告
+description: 报告一个可复现的问题
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈!请**不要**粘贴任何隐私信息(真实 QQ 号/群号、令牌、聊天记录原文、本机绝对路径)。
+        需要贴日志时,请把令牌替换成 `<token>`,把 QQ 号替换成 `<qq>`,群名替换成 `<群名>`。
+        安全问题请走 SECURITY.md 里的私密渠道,不要在这里发。
+  - type: input
+    id: version
+    attributes:
+      label: QQOps 版本
+      description: "`qqops status` 或 VERSION 文件里的版本号"
+      placeholder: "3.3.1"
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: 运行环境
+      description: 平台 / Python 版本 / NapCat 版本(QQ 版本如果有也写上)
+      placeholder: "Android 14 Termux, Python 3.12, NapCat 4.18.x"
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: 运行形态
+      options:
+        - single(单进程)
+        - multi(多进程)
+        - 不确定 / 未设置
+  - type: textarea
+    id: what
+    attributes:
+      label: 发生了什么
+      description: 现象 + 期望结果
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤
+      description: 越具体越好(命令、点击路径、消息样例)
+      placeholder: |
+        1. qqops mode single
+        2. 打开控制台 → 运维 → 资源
+        3. 点"合并为单进程"
+        4. 观察到 …
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: qqops doctor 输出(已脱敏)
+      render: text
+      description: 贴之前请替换掉令牌与真实 QQ 号
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志(已脱敏)
+      render: text
+      description: "`data/logs/*.log` 里相关片段;异常账本 data/crashes.jsonl 也很有用"

@@ -17,6 +17,7 @@
 import ast
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -884,6 +885,64 @@ class TestConsistency(unittest.TestCase):
                     self.assertNotIn("DSH DEBUG", src, fn)
                     self.assertNotIn("breakpoint()", src, fn)
                     self.assertNotIn("pdb.set_trace", src, fn)
+
+
+    def test_repo_has_no_secrets_or_personal_data(self):
+        """仓库里不得出现隐私/密钥 —— 这是硬性发布门禁(工具: tools/check_secrets.py)。
+
+        为什么写进测试而不是只靠 review: 这个项目天然贴着 QQ 号/群号/令牌/设备号,
+        人肉看迟早漏。这里跑一遍扫描器, 保证"任何一次提交都不可能把隐私带进仓库"。
+        """
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import check_secrets as cs                                   # noqa: E402
+
+        # 1) 通用规则 + 本机禁词表: 当前跟踪文件必须干净
+        deny = cs.load_denylist()
+        files = cs.iter_files(None, cs.load_ignore())
+        findings = [f for f in cs.scan_files(files, deny) if f[0] == "hard"]
+        self.assertEqual(findings, [], "发现隐私/密钥: %s" % findings[:5])
+        self.assertGreater(len(files), 30, "扫描文件数异常, 扫描器可能没在工作")
+
+        # 2) 扫描器本身要真的能抓到东西(否则"通过"毫无意义)。
+        #    注意: 下面的假密钥/假路径**故意用拼接构造**而不是字面量 —— 否则扫描器会(正确地)
+        #    把测试文件自己当成泄漏。仓库里因此不需要任何豁免。
+        fake_key = "sk-" + "a" * 20 + "b" * 12
+        bad = cs.scan_text("x.py", 'API_KEY = "%s"\n' % fake_key, [])
+        self.assertTrue([f for f in bad if f[1] == "openai-key"], bad)
+        fake_path = "C:" + "\\Users\\" + "somebody" + "\\qqops\\data"
+        bad = cs.scan_text("x.md", "路径 %s\n" % fake_path, [])
+        self.assertTrue([f for f in bad if f[1] == "personal-path"], bad)
+        bad = cs.scan_text("x.md", "机器人 QQ %s 的日志\n" % ("1234" + "56789"), ["123456789"])
+        self.assertTrue([f for f in bad if f[1] == "denylist"], bad)
+        # 3) 占位符与豁免注释不该误报
+        self.assertEqual([f for f in cs.scan_text(
+            "x.py", 'api_key = "%s..."  # 示例\n' % "sk-", []) if f[0] == "hard"], [])
+        self.assertEqual(cs.scan_text(
+            "x.py", 'token = "%s"  # secret-scan: allow\n' % ("abcdefgh" + "12345678"), []), [])
+
+    def test_docs_and_packaging_are_consistent(self):
+        """文档/打包清单/CI 互相引用一致 —— 发布前最容易出现的"漏打包/死链接"。"""
+        need = ["README.md", "README_EN.md", "LICENSE", "SECURITY.md", "CONTRIBUTING.md",
+                "CODE_OF_CONDUCT.md", "CHANGELOG.md", "docs/DEPLOY.md", "docs/FAQ.md",
+                "docs/ARCHITECTURE.md", "docs/CONSOLE.md", "docs/INGEST.md", "docs/POWER.md",
+                "docs/CHAT.md", "tools/check_secrets.py", "tools/verify_package.py",
+                "tools/console_probe.js", ".github/workflows/ci.yml", "config.example.json"]
+        for rel in need:
+            self.assertTrue(os.path.exists(os.path.join(ROOT, rel)), "缺少 %s" % rel)
+        # README 里指向仓库内的链接必须真实存在
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as f:
+            readme = f.read()
+        for m in re.finditer(r"\]\((?!#)([^)]+)\)", readme):
+            link = m.group(1).split("#")[0]
+            if link.startswith(("http", "mailto")):
+                continue
+            self.assertTrue(os.path.exists(os.path.join(ROOT, link)), "README 死链: %s" % link)
+        # pack.py 的清单必须覆盖所有根级文档
+        sys.path.insert(0, ROOT)
+        import pack as pack_mod                                      # noqa: E402
+        for rel in ("README.md", "README_EN.md", "LICENSE", "SECURITY.md", "CONTRIBUTING.md",
+                    "CODE_OF_CONDUCT.md", "docs", "tools"):
+            self.assertIn(rel, pack_mod.ITEMS, "pack.py 清单缺少 %s" % rel)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):

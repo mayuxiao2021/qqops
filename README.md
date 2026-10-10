@@ -1,62 +1,70 @@
-# 🐧 QQOps
+<div align="center">
 
-面向 **Termux(Android)** 的 QQ 群消息 **采集 / 总结 / 运维控制台**。纯标准库实现,
-零 pip 依赖、零前端构建、不占容器 —— 只要 NapCat 在跑,拷目录即可用。
+# QQOps
 
-```
-QQ ── NapCat(proot 内) ──┬── HTTP 上报 ──▶ QQOps Collector ──▶ SQLite
-                          ├── 反向 WS  ──▶ AstrBot(可选, 存档/分析插件)
-                          └── HTTP API ◀── QQOps Summarizer(只发你自己)
-                                            ▲
-                     QQOps Scheduler(每日定点) ── QQOps Web Console(运维界面)
-```
+**在手机上把 QQ 群消息管起来:采集 · 总结 · 智能查询 · 运维控制台**
 
-## 特性
+纯标准库 Python,零 pip 依赖、零前端构建;NapCat 负责连 QQ,QQOps 负责其余全部。
+
+[![CI](https://github.com/mayuxiao2021/qqops/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/mayuxiao2021/qqops/actions/workflows/ci.yml)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+[![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)](#为什么零依赖)
+[![Platform](https://img.shields.io/badge/platform-Termux%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#安装)
+
+[功能](#功能) · [安装](#安装) · [界面](#界面) · [架构](#架构) · [文档](#文档索引) · [安全](#安全) · [贡献](CONTRIBUTING.md)
+
+</div>
+
+---
+
+## 这是什么
+
+QQOps 是一个**跑在自己设备上的 QQ 群消息管家**。它接在 [NapCat](https://github.com/NapNeko/NapCatQQ)(OneBot v11 实现)后面:
+
+- 群里说过的话 → **落进本地 SQLite**,可按群、类型、时间、关键词全文检索;
+- 每天定时 → **让模型总结**:事件、待办、链接、共识、每群滚动记忆,产出 Markdown/HTML/Excel/Word 报告;
+- 想问什么 → **一句话问记录**("昨天谁提到报告?"),回答必须带来源编号,点开可核对原文;
+- 在 QQ 里 → **直接私聊提问**,答案回到聊天窗口(可选群内问答);
+- 出问题 → **控制台自己会说话**:服务健康、崩溃账本、实时日志、一键自检。
+
+数据**全部留在本机**:模型只看到你允许它看的那部分记录,推送默认只发给你自己。
+
+## 功能
 
 | 模块 | 能力 |
 |---|---|
-| **Collector** | 接收 OneBot v11 HTTP 上报;正确处理 `chunked` 请求体;可选 HMAC 签名;按群/类型过滤;落库 + 采集指标 |
-| **Summarizer** | 按群/类型取消息 → **结构化抽取(JSON)** → 事件/待办留存 → 报告(Markdown + HTML)与摘要推送;token/费用记账 |
-| **补料(enrich)** | **图片多模态识别**、**文档解析**(docx/xlsx/pptx/txt…, PDF 可选 pypdf)、**链接正文抓取**(带 SSRF 防护);全部有配额与缓存 |
-| **计划与记忆** | 事件/待办**去重合并**成长期列表(可勾完成/忽略/编辑)、每群**滚动记忆**让上下文跨天连续、**个人档案**判定"与我相关" |
-| **Scheduler** | 多个每日时间点、当天去重、配置热加载、保留策略清理、每日自动备份、心跳上报 |
-| **Web Console** | 概览 KPI + 趋势图、**消息全文检索(FTS5, 命中高亮)**、CSV 导出、群组开关(实时群列表)、任务历史、报告浏览、日志跟踪、配置编辑、服务与**旁路服务(NapCat/AstrBot)启停**、备份/索引重建/自检 |
-| **CLI** | `qqops start/stop/restart/status/url/logs/summary/backup/prune/doctor` + `qqops extras` / `qqops napcat{start,stop,restart}` / `qqops astrbot{start,stop,restart}` |
+| **采集** | OneBot v11 HTTP 上报;`chunked` 请求体、HMAC 签名、按群/类型过滤、消息去重、撤回标记、时钟回拨保护 |
+| **总结** | 结构化抽取(事件/待办/链接/事实/记忆)→ 报告(Markdown + 自包含 HTML)→ 可选私聊推送;token 与费用记账 |
+| **补料** | 图片多模态识别、文档解析(docx/xlsx/pptx/txt,PDF 可选)、链接正文抓取(带 SSRF 防护),都有配额与缓存 |
+| **智能查询** | 中文提问先分词再检索 → 只依据检索结果作答 → 强制标注 `[M1]/[E1]` 来源 → 控制台或 **QQ 聊天里**回答;会话落库、可追问、每日额度 |
+| **计划与记忆** | 事件/待办去重合并成长期列表;每群滚动记忆让上下文跨天连续;个人档案判定"与我相关" |
+| **调度** | 多个每日时间点 / 间隔 / 每周;无新消息跳过;保留策略清理;每日自动备份 |
+| **控制台** | 15 个页面:仪表盘、对话、消息(FTS5 高亮)、总结、任务、插件、数据、运维(服务/资源/账本/日志/自检/备份)、设置、帮助;手机底部标签栏可用 |
+| **插件体系** | 对齐 AstrBot 的分层:`@register/@route/@command/@task/@on_event/@on_stage`,插件可热重载、可往控制台加页面 |
+| **容错** | 崩溃账本、五层隔离(进程/事件/阶段/请求/插件)、指数退避 + 熔断、端口预检与回收、真实健康检查 |
+| **运行形态** | 一个进程跑全部(`single`,手机省 ~74% 内存)或拆成四个进程(`multi`,隔离更好);`performance/balanced/saver` 三档功耗 |
 
-## 快速开始
+## 安装
+
+> 前置:[NapCat](https://github.com/NapNeko/NapCatQQ) 已在跑(手机用 proot 容器或 Linux 直接跑),并能登录你的 QQ。
 
 ```bash
-# 1) 拷到手机(任选其一)
-#    a. 直接解压部署包
-tar xzf qqops-1.0.0.tar.gz -C ~ && bash ~/qqops-1.0.0/install.sh
-#    b. 或者从已克隆目录安装
-bash ~/qqops/install.sh
+# 1) 下载发布包(或 git clone)
+tar xzf qqops-<版本>.tar.gz -C ~ && bash ~/qqops-<版本>/install.sh
 
-# 2) 装完会打印控制台地址(含令牌):
-#    http://127.0.0.1:8091/?token=xxxxxxxx
+# 2) 安装器会:检查 python3 → 复制程序 → 生成配置与随机令牌 → 注册 qqops 命令
+#    → 启动服务 → 跑一次自检, 最后打印控制台地址(含令牌)
+
+# 3) 把 NapCat 的消息接到采集口(见下), 然后
+qqops doctor
 ```
 
-安装器会自动:检查 `python3`(screen 可选)→ 复制程序 → 生成配置与令牌 → 迁移旧数据(可选)→
-注册 `qqops` 命令 → 启动服务 → 跑一次自检。
-
-服务由 `nohup` + `data/run/*.pid` 管理(不依赖 screen 会话,SSH 断线不受影响):
-`qqops start|stop|restart|status` 即完整的进程生命周期管理,停止时先 `TERM` 再 `KILL` 兜底,保证端口释放。
-
-### 可选参数
-
-| 参数 | 说明 |
-|---|---|
-| `--no-start` | 只安装不启动 |
-| `--import-db <旧库>` | 迁移旧采集库(`messages.db`) |
-| `--import-config <旧配置>` | 迁移旧 `summarize.json`(模型/群/推送) |
-
-## NapCat 侧接线(只做一次)
-
-编辑容器内 `…/app_launcher/napcat/config/onebot11_<QQ>.json`:
+NapCat 侧只需接线一次(容器内 `…/napcat/config/onebot11_<QQ>.json`):
 
 ```jsonc
 "network": {
-  // ① 让消息推给采集器(采集口)
+  // ① 消息上报给采集器
   "httpClients": [
     {"enable": true, "name": "qqops", "url": "http://127.0.0.1:8080/",
      "messagePostFormat": "array", "reportSelfMessage": false, "secret": ""}
@@ -68,163 +76,86 @@ bash ~/qqops/install.sh
 }
 ```
 
-重启 NapCat(`bash /root/_napcat_run.sh`),然后在控制台「配置」页把 `push.napcat_api_port`
-与 `push.token` 填成一致。用 `qqops doctor` 验证:采集口与 NapCat API 都应为 OK。
+详细步骤(Android/Termux、Linux、Windows,含保活与排错):**[docs/DEPLOY.md](docs/DEPLOY.md)**
 
-## 保活:进程为什么会被杀, 怎么防
+## 界面
 
-Android 12+ 的 **幽灵进程查杀**(后台进程数超限时杀掉 Termux 的子进程)、**Doze/电池优化**(冻结后台)、
-以及**重启后没有自启**, 是"进程老是被杀"的三个主因。本程序有三层防护:
-
-1. **看门狗**(`qqops/watchdog.py`, 随服务一起启动):每 60 秒体检采集器/调度器/控制台;
-   进程不在 → 立刻拉起;进程在但**端口不响应/心跳停了**(假活)→ 先清掉再拉起。心跳写在 `data/state.json`,
-   控制台「概览/运维」能看到看门狗是否存活。
-   ```bash
-   qqops watchdog          # 体检一轮(只报告, 不重启)
-   qqops restart watchdog  # 重启看门狗本身
-   ```
-2. **开机自启**:`install.sh` 会写 `~/.termux/boot/qqops.sh`(安装 **Termux:Boot** 后, 重启会自动 `qqops start`);
-   文件里同时会获取唤醒锁。
-3. **设备级设置**(需要电脑 + adb, 一次性, 最有效):
-   ```bash
-   bash tools/android-keepalive.sh        # 一键执行下面这些
-   # 或手动:
-   adb shell settings put global settings_enable_monitor_phantom_procs false
-   adb shell dumpsys deviceidle whitelist +com.termux
-   adb shell cmd appops set com.termux RUN_ANY_IN_BACKGROUND allow
-   adb shell am set-standby-bucket com.termux active
-   ```
-   手机端再手动一次:设置 → 应用 → Termux → 电池 → **不受限制**。
-
-**诊断**:`qqops doctor` 会有一段「手机保活」逐项体检(幽灵进程/白名单/后台权限/唤醒锁/开机自启),
-缺哪项就打印出该执行的命令。
-
-**启动可靠性**:`qqops start` 不再只看"进程在不在", 而是**等到端口真的应答 / 心跳真的刷新**才报成功;
-进程秒退会直接告诉你日志尾部(`qqops start` / `qqops status` 都能看出 `◐` 表示"进程在但没响应")。
-
-## 日常使用
-
-```bash
-qqops status                        # 进程/端口/消息量/关注的群/定时/全文索引
-qqops summary --hours 24            # 立即总结一次(推送到配置目标)
-qqops summary --dry-run             # 只组装提示词, 不花钱
-qqops logs web                      # 跟踪控制台日志
-qqops backup                        # 备份数据库 + 配置
-qqops doctor                        # 全链路自检
-qqops extras                        # 旁路服务(NapCat/AstrBot)状态
-qqops napcat restart                # 重启 NapCat(QQ 接入)
-qqops astrbot stop                  # 停掉 AstrBot(存档旁路, QQOps 不受影响)
-```
-
-### 全文检索
-
-内置 SQLite **FTS5** 索引, 中文按字匹配、拉丁按前缀匹配, 零额外依赖:
-
-* 控制台「消息」页输入关键词即可, 命中词高亮, 并显示当前检索方式(FTS5 / LIKE / 按时间);
-* 中文必须逐字索引 —— `unicode61` 分词器会把整串中文当成一个 token, 所以索引侧在中文字间插空格、
-  查询侧用短语匹配(见 `core.fts_text` / `core.fts_query`);
-* 索引缺失或落后时启动自动重建; 也可在运维页点「重建全文索引」或 `POST /api/reindex`。
-
-### 计划与记忆(个人助理模式)
-
-```
-消息 ──▶ 补料(图片识别 / 文档解析 / 链接正文)
-      ──▶ 结构化抽取(JSON: 事件/待办/链接/事实/记忆)
-      ──▶ events 表(去重合并)◀── 控制台「计划」页: 勾完成 / 忽略 / 编辑 / 手工新增 / 导出
-      ──▶ memories 表(每群滚动记忆)──▶ 注入下次提示词(跨天连续)
-      ──▶ 报告: Markdown + 自包含 HTML(/r/<name>) + XLSX / DOCX 导出
-      ──▶ 私聊摘要: 只发"有截止的 / 重要的 / 待办"
-```
-
-* **个人档案** 在控制台「计划」页底部编辑(或直接改 `data/profile.md`)—— 写清"我关注什么、长期目标、
-  输出偏好", 抽取时会作为背景注入, 用来判断哪些事与我有关。
-* **记忆** 每群一段, 可手动修正; 它是"上次学到的东西", 会让每天的总结接得上。
-* **成本控制**: 图片按张计费但**按 URL 缓存**(同一张只识别一次), 配额在配置页
-  `enrich.vision.max_images` / `enrich.files.max_files` / `enrich.links.max_links`;
-  跑 `qqops summary --dry-run` 不产生任何模型费用。
-
-### 可选依赖
-
-核心**零第三方依赖**。唯一可选件是 PDF 解析:
-
-```bash
-pip install pypdf        # 可选; 不装则 .pdf 会明确提示"未安装 pypdf"
-```
-
-`tests/smoke.py` 里有一项测试专门断言"模块级不得出现第三方导入", 保证不装任何包也能跑。
-
-控制台页面:
+控制台是**零依赖单页**(原生 JS + 一个 CSS 文件,无构建工具),默认只监听 `127.0.0.1`:
 
 | 页面 | 用途 |
 |---|---|
-| 概览 | 消息总量/趋势、服务状态(可一键重启)、NapCat 在线状态、最近任务、立即总结 |
-| **计划** | 事件/待办看板: 状态·类型·群·关键词·仅 7 天内筛选, 勾完成/忽略/编辑/删除, 手工新增, 导出 XLSX/DOCX; 下方是**群记忆**与**个人档案**编辑 |
-| 消息 | 时间窗 + 群 + 类型 + 关键词筛选(**FTS5 全文检索**), 分页, 点行看详情, 导出 CSV |
-| 群组 | **NapCat 实时群列表**(含从未发言的群)、搜索、单个/批量启用总结 |
-| 任务 | 每次运行的状态/耗时/token/费用, 手工触发 |
-| 报告 | 历史报告列表 + Markdown 阅读 + **报告页(HTML)** + XLSX/DOCX 导出 |
-| 日志 | collector / scheduler / web 三份日志在线 tail |
-| 配置 | 全部配置项表单(密钥显示为掩码), 保存即生效 |
-| 运维 | 服务启停、**旁路服务(NapCat/AstrBot)启停**、备份、CSV 导出、NapCat 信息与**发送测试**、采集指标、重建全文索引 |
+| 仪表盘 | 服务健康、今日消息量、最近报告、告警、快捷操作 |
+| **对话** | 一句话问记录:气泡问答 + 内联来源编号(点开原文)+ 会话管理 + 推荐问题 |
+| 消息 | 时间/群/类型/关键词筛选(全文检索,命中高亮)、分页、导出 CSV |
+| 总结 | 报告列表、阅读、导出 XLSX/DOCX、推送状态 |
+| 任务 | 定时设置(每天定点/间隔/每周)、运行历史、token 与费用、手工触发 |
+| 插件 | 内置与第三方插件:启停、配置(带说明的表单)、重载、命令、定时任务 |
+| 数据 | 群组、事件/待办、长期记忆、链接、媒体 |
+| 运维 | 服务启停、**资源与功耗**(单/多进程、三档、内存)、崩溃账本、实时日志、框架自检、备份 |
+| 设置 | 全部配置项(密钥掩码)、令牌、模型、推送、端口 |
 
-## 目录结构
+手机浏览器打开即可,底部有标签栏;桌面用 `adb forward tcp:8091 tcp:8091` 转发后访问。
+
+## 架构
 
 ```
-~/qqops/
-├── bin/qqops                 # 控制脚本
-├── qqops/
-│   ├── core.py               # 配置 / 存储 / NapCat 客户端 / 服务管理 / 日志
-│   ├── collector.py          # 采集器(HTTP 上报入口)
-│   ├── summarizer.py         # 总结器(LLM + 报告 + 推送)
-│   ├── scheduler.py          # 调度器(定时 + 备份 + 清理)
-│   ├── webapp.py             # 控制台(JSON API + SPA 外壳)
-│   ├── tools.py              # init / doctor / import / backup / prune
-│   └── static/               # app.css + app.js(零依赖)
-├── tests/smoke.py            # 冒烟测试(unittest)
-├── install.sh / uninstall.sh / pack.sh
-└── data/                     # ← 全部运行时数据都在这里, 备份只需拷它
-    ├── config.json           # 配置(含令牌)
-    ├── messages.db           # 消息库(SQLite, WAL)
-    ├── run/*.pid             # 服务 PID 文件
-    ├── logs/  reports/  backups/
+QQ ──▶ NapCat ──HTTP 上报──▶ collector ──▶ SQLite(消息/事件/记忆/会话)
+                                  │
+                                  ├─ 管线阶段: ingest → persist → archive → enrich → summarize → notify
+                                  ├─ 插件:     reminders(截止提醒) · assistant(智能查询)
+                                  └─ 事件总线: 插件与框架松耦合, 单插件异常不影响主流程
+   scheduler ──▶ 定时总结 / 维护 / 备份          webapp ──▶ 控制台(HTTP API + SPA)
+   watchdog/runner ──▶ 进程或线程级监督, 退避重启 + 熔断
 ```
 
-## 运维要点
+分层与 AstrBot 对齐(`app.py` 生命周期、`framework/` 骨架、`plugins/` 相当于 builtin_stars、
+`console/` 相当于 dashboard)。设计原则、容错模型、迁移路线见 **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**。
 
-* **备份**: `qqops backup` 或控制台「运维 → 立即备份」;产物在 `data/backups/`。
-  调度器每天 03:30 自动备份并按 `retention.backup_keep` 滚动。
-* **恢复**: 停止服务 → 用备份的 `messages.db` 覆盖 `data/messages.db` → 启动。
-* **升级**: 用新版本覆盖程序目录(`qqops/ bin/ static/ …`), **不要动 `data/`**, 然后 `qqops restart`。
-* **保留策略**: 配置页 `retention.message_days > 0` 时每天自动清理超期消息;也可 `qqops prune --days 30`。
-* **保活**: 安装器会尝试 `termux-wake-lock`;建议同时关闭电池优化,并参考
-  “Android 幽灵进程查杀”的处理(见 `doctor` 输出与本文末)。
+### 为什么零依赖
+
+手机上的 Python 装包经常失败(缺编译环境、空间紧张),而"装不上依赖 = 整个程序不可用"。
+所以核心只用标准库:SQLite(+FTS5)、`http.server`、`urllib`、`threading`。
+`tests/smoke.py` 里有一项测试**专门断言模块级不得出现第三方导入**;唯一可选件是 PDF 解析(`pip install pypdf`)。
+
+## 文档索引
+
+| 文档 | 内容 |
+|---|---|
+| [docs/DEPLOY.md](docs/DEPLOY.md) | 部署:Termux/Android、Linux、Windows;NapCat 接线;保活;升级与卸载;排错 |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 分层设计、事件与管线、插件体系、容错模型、配置体系、迁移路线 |
+| [docs/CONSOLE.md](docs/CONSOLE.md) | 控制台信息架构、页面规格、交互规范 |
+| [docs/INGEST.md](docs/INGEST.md) | OneBot v11 消息接收处理规范(逐条审计) |
+| [docs/POWER.md](docs/POWER.md) | 进程合并与功耗档位(含真机实测内存对比) |
+| [docs/CHAT.md](docs/CHAT.md) | QQ 内问答;卡片消息实测结论(为什么"卡片版本过低") |
+| [docs/FAQ.md](docs/FAQ.md) | 常见问题:成本、隐私、风控、性能、卡片 |
+| [CHANGELOG.md](CHANGELOG.md) | 每个版本做了什么、修了什么 |
 
 ## 安全
 
-* 控制台与采集器**默认只监听 127.0.0.1**;要用电脑访问请用 `adb forward tcp:8091 tcp:8091`。
-* 令牌鉴权 + HttpOnly 会话 Cookie;配置接口只回传**掩码**密钥,不会把明文发回浏览器。
-* 采集器可选 `collector.secret`(HMAC-SHA1 校验 `X-Signature`);如需强制,置 `require_signature=true`。
-* 推送默认**只发私聊**;`push.group_id` 非 0 才会发群 —— 想「不在群里发言」就留 0。
+- **默认只监听 127.0.0.1**;控制台令牌鉴权 + HttpOnly 会话 Cookie;配置接口只回传掩码密钥。
+- **数据不出本机**:消息、报告、会话都在 `data/`;只有你配置的模型接口会看到你允许的那部分记录。
+- **推送默认只发私聊**;群内问答默认关闭,且只对白名单 QQ 生效。
+- **仓库本身不含隐私**:见 [SECURITY.md](SECURITY.md) —— 提交前与 CI 都会跑
+  `python3 tools/check_secrets.py`(通用密钥规则 + 本机禁词表),`data/`、`dist/`、本机脚本一律不入仓。
 
-## 常见问题
-
-| 现象 | 处理 |
-|---|---|
-| 控制台打不开 | `qqops status`;`qqops logs web`;确认端口未被占用 |
-| 消息不增长 | `qqops doctor` 看采集口;确认 NapCat `httpClients` 指向 8080 且已重启 |
-| 总结失败 | 配置页填 `summarizer.api_key`;`qqops logs scheduler` 看错误 |
-| 群里收到消息 | 把 `push.group_id` 归零;检查是否有其它插件在发(本程序默认只发自聊) |
-| 服务老是被杀 | 关电池优化 + `termux-wake-lock`;必要时用 adb 关闭幽灵进程查杀 |
-| 时间不对 | 容器/系统时区;本程序内部强制 `TZ=Asia/Shanghai` |
+发现安全问题请按 [SECURITY.md](SECURITY.md) 的方式私下报告,不要开公开 issue。
 
 ## 开发
 
 ```bash
-python3 -m py_compile qqops/*.py        # 语法检查
-python3 tests/smoke.py -v               # 冒烟测试(不需要网络)
-bash pack.sh                            # 打包 dist/qqops-<ver>.tar.gz
+python3 tests/smoke.py            # 冒烟测试(纯标准库, 不需要网络)
+node tools/console_probe.js       # 用桩 DOM 渲染全部页面 + 点一遍关键按钮
+python3 tools/check_secrets.py    # 隐私/密钥扫描(提交前必跑)
+python3 pack.py                   # 打包 dist/qqops-<版本>.tar.gz
+python3 tools/verify_package.py   # 校验"包 == 工作区 == 已提交代码"
+bash tools/install-hooks.sh       # 装 pre-commit 钩子(自动跑隐私扫描)
 ```
 
-## License
+贡献流程、代码风格与隐私红线见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
-MIT
+## 许可证
+
+[AGPL-3.0](LICENSE) © QQOps contributors
+
+> 使用者需自行遵守 QQ / NapCat / 模型服务商的条款。本项目与腾讯无关,不提供任何形式的账号安全保证;
+> 用于群聊时请遵守群规与当地法律,不要采集他人隐私数据。

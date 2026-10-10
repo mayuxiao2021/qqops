@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  privacy:
+    name: 隐私与密钥扫描
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # --history 需要完整历史
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 扫描工作区
+        run: python tools/check_secrets.py
+      - name: 扫描全历史
+        run: python tools/check_secrets.py --history
+
+  test:
+    name: 测试 ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.10", "3.12", "3.13"]
+        exclude:
+          - os: windows-latest
+            python: "3.10"
+          - os: macos-latest
+            python: "3.10"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: 语法检查
+        run: python -m compileall -q qqops
+      - name: 冒烟测试(纯标准库, 不需要网络)
+        run: python tests/smoke.py
+      - name: 确认没有第三方依赖
+        run: python -c "import sys; sys.path.insert(0,'.'); import qqops, qqops.core, qqops.collector, qqops.summarizer, qqops.webapp, qqops.runner; print('import ok')"
+
+  console:
+    name: 控制台前端探针
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: 用桩 DOM 渲染全部页面并点一遍关键按钮
+        run: node tools/console_probe.js
+
+  package:
+    name: 打包与一致性
+    runs-on: ubuntu-latest
+    needs: [privacy, test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 打包
+        run: python pack.py
+      - name: 校验包内文件与权限位
+        run: python tools/verify_package.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qqops-package
+          path: dist/*.tar.gz
+          if-no-files-found: error

@@ -1,0 +1,22 @@
+# 换行与二进制处理: Windows 上克隆也不会把 shell 脚本变成 CRLF
+* text=auto eol=lf
+
+*.sh            text eol=lf
+*.py            text eol=lf
+*.json          text eol=lf
+*.md            text eol=lf
+
+# 二进制(不要做任何转换)
+*.png           binary
+*.jpg           binary
+*.gif           binary
+*.ico           binary
+*.woff2         binary
+*.gz            binary
+*.zip           binary
+*.tar           binary
+*.db            binary
+
+# 打包产物/生成物: 不参与语言统计
+dist/**         linguist-generated=true
+*.tar.gz        linguist-generated=true

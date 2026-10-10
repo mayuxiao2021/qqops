@@ -17,10 +17,10 @@ import tarfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
-# 与 pack.sh 保持一致的清单(不含 data/ .testdata/ dist/ .git/)
-ITEMS = ["qqops", "bin", "tests", "tools", "docs", "VERSION", "README.md", "CHANGELOG.md",
-         "LICENSE", "install.sh", "uninstall.sh", "pack.sh", "pack.py",
-         "config.example.json"]
+# 与 pack.sh 保持一致的清单(不含 data/ .testdata/ dist/ .git/ .github/)
+ITEMS = ["qqops", "bin", "tests", "tools", "docs", "VERSION", "README.md", "README_EN.md",
+         "CHANGELOG.md", "LICENSE", "SECURITY.md", "CONTRIBUTING.md", "CODE_OF_CONDUCT.md",
+         "install.sh", "uninstall.sh", "pack.sh", "pack.py", "config.example.json"]
 SKIP_DIRS = {"__pycache__", ".testdata", "data", "run", ".git", "dist"}
 
 
@@ -52,6 +52,13 @@ def _dir_filter():
 
 
 def build(out_dir: str = None, verbose: bool = True) -> str:
+    # 打包前的隐私门禁: 包是要发出去的, 里面绝不能有本机隐私/密钥
+    scanner = os.path.join(ROOT, "tools", "check_secrets.py")
+    if os.path.exists(scanner):
+        import subprocess
+        p = subprocess.run([sys.executable, scanner, "--quiet"], cwd=ROOT)
+        if p.returncode != 0:
+            raise SystemExit("✘ 隐私扫描未通过, 已中止打包: python3 tools/check_secrets.py")
     ver = open(os.path.join(ROOT, "VERSION"), encoding="utf-8").read().strip()
     name = "qqops-" + ver
     out_dir = out_dir or os.path.join(ROOT, "dist")

@@ -27,3 +27,11 @@ Thumbs.db
 *.bak-*
 *.broken-*
 *.tmp
+# 隐私: 本机禁词表(QQ号/群号/令牌/设备号等), 只在本地存在, 绝不入仓
+tools/secret_denylist.txt
+
+# 凭据/环境文件
+.env
+.env.*
+*.pem
+*.key

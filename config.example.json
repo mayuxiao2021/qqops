@@ -1,6 +1,6 @@
 {
-  "_说明": "这是配置样例; 实际配置在 data/config.json, 由安装器自动生成(含随机令牌)。",
-  "version": "1.0.0",
+  "_说明": "配置样例: 实际配置在 data/config.json, 由安装器自动生成(含随机令牌)。所有密钥留空, 请在控制台「设置」页或直接编辑该文件填写。",
+  "version": "3.3.1",
   "web": {
     "host": "127.0.0.1",
     "port": 8091,
@@ -16,36 +16,58 @@
     "groups": [],
     "kinds": [],
     "store_private": false,
-    "debug": false
+    "debug": false,
+    "command_private": true
   },
   "summarizer": {
     "base_url": "https://api.deepseek.com/v1",
-    "api_key": "sk-...",
+    "api_key": "",
     "model": "deepseek-chat",
     "temperature": 0.3,
     "timeout": 180,
     "groups": [],
-    "kinds": ["text", "image", "reply", "at", "json"],
+    "kinds": [
+      "text",
+      "image",
+      "reply",
+      "at",
+      "json"
+    ],
     "window_hours": 24,
     "min_messages": 3,
     "max_messages": 600,
     "max_chars_per_group": 12000,
     "prompt_extra": "",
-    "input_price_per_mtok": 0,
-    "output_price_per_mtok": 0
+    "input_price_per_mtok": 0.0,
+    "output_price_per_mtok": 0.0
   },
   "push": {
-    "enable": true,
+    "enable": false,
     "user_id": 0,
     "group_id": 0,
     "napcat_api_port": 3000,
-    "token": "<与 NapCat httpServers.token 一致>",
-    "max_chars": 1200
+    "token": "",
+    "max_chars": 1200,
+    "report_link": true,
+    "format": "text"
   },
   "schedule": {
     "enabled": true,
-    "times": ["22:00"],
-    "hours": 24
+    "mode": "daily",
+    "times": [
+      "22:00"
+    ],
+    "every_minutes": 360,
+    "weekdays": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "weekly_time": "22:00",
+    "skip_if_no_new": true,
+    "min_new_messages": 5
   },
   "retention": {
     "message_days": 0,
@@ -56,5 +78,59 @@
     "enabled": true,
     "interval": 60,
     "manage_extras": false
-  }
+  },
+  "runtime": {
+    "mode": "auto",
+    "power_mode": "balanced",
+    "scheduler_tick": 0,
+    "watchdog_interval": 0,
+    "console_refresh": 0,
+    "defer_enrich": null,
+    "enrich_window": "02:00-06:00",
+    "sqlite_cache_kb": 0,
+    "log_quiet": null
+  },
+  "llm": {
+    "base_url": "",
+    "api_key": "",
+    "model": "",
+    "temperature": 0.2,
+    "max_tokens": 1500,
+    "timeout": 120,
+    "retries": 2,
+    "input_price_per_mtok": 0.0,
+    "output_price_per_mtok": 0.0
+  },
+  "extract": {
+    "structured": true,
+    "max_events": 8,
+    "max_todos": 8,
+    "max_links": 6,
+    "memory_chars": 600,
+    "low_confidence_drop": 0.35
+  },
+  "enrich": {
+    "vision": {
+      "enable": true,
+      "model": "",
+      "max_images": 8,
+      "max_bytes": 3000000,
+      "detail": "简要"
+    },
+    "files": {
+      "enable": true,
+      "max_mb": 8,
+      "max_files": 3,
+      "max_chars": 4000
+    },
+    "links": {
+      "enable": true,
+      "max_links": 5,
+      "max_bytes": 512000,
+      "timeout": 12,
+      "max_redirects": 3,
+      "allow_all": false
+    }
+  },
+  "extras": {}
 }
