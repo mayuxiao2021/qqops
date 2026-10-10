@@ -474,7 +474,7 @@ VIEWS.chat = async (v) => {
   const bubbles = turns.map(t => {
     if (t.role === 'user') return `<div class="bub user">${esc(t.content)}</div>`;
     const srcs = (t.sources || []).map(s =>
-      `<a href="#" class="srcchip" data-src="${esc(s.kind)}" data-ref="${esc(String(s.ref).slice(1))}" data-url="${esc(s.url || '')}" title="${esc(s.text || '')}">${SRC_ICON[s.kind] || '•'} ${esc(s.label || s.ref)}</a>`).join(' ');
+      `<a href="#" class="srcchip" data-src="${esc(s.kind)}" data-ref="${esc(String(s.ref).slice(1))}" data-sid="${esc(s.sid || '')}" data-url="${esc(s.url || '')}" title="${esc(s.text || '')}">${SRC_ICON[s.kind] || '•'} ${esc(s.label || s.ref)}</a>`).join(' ');
     const meta = t.meta || {};
     const info = [
       meta.model ? esc(meta.model) : '',
@@ -483,7 +483,7 @@ VIEWS.chat = async (v) => {
       t.ms ? (t.ms / 1000).toFixed(1) + 's' : '',
       meta.degraded ? '<span class="err">降级</span>' : '',
     ].filter(Boolean).join(' · ');
-    return `<div class="bub bot">${renderAnswer(t.content)}
+    return `<div class="bub bot">${renderAnswer(t.content, t.sources)}
       ${srcs ? `<div class="srcs"><span class="muted">来源</span> ${srcs}</div>` : ''}
       ${info ? `<div class="muted bub-meta">${info}</div>` : ''}</div>`;
   }).join('');
@@ -526,15 +526,16 @@ VIEWS.chat = async (v) => {
       </div>
     </section></div>`;
   const send = async (text) => {
-    const q = (text || q(v, '#chat-q').value || '').trim();
-    if (!q || chatBusy) return;
+    // 注意: 变量名不能叫 q —— 会遮蔽全局 q(root, sel) 帮助函数, 发送按钮点了没反应
+    const question = String(text || q(v, '#chat-q').value || '').trim();
+    if (!question || chatBusy) return;
     chatBusy = true;
     q(v, '#chat-state').textContent = '检索记录并思考中…';
     q(v, '#chat-send').disabled = true;
     q(v, '#chat-q').value = '';
     const hours = parseInt(q(v, '#chat-hours').value, 10) || 0;
     const r = await api('/api/assistant/ask', {method: 'POST',
-      body: JSON.stringify({question: q, session_id: chatSession, hours})});
+      body: JSON.stringify({question, session_id: chatSession, hours})});
     chatBusy = false;
     q(v, '#chat-send').disabled = false;
     q(v, '#chat-state').textContent = '';
@@ -564,25 +565,76 @@ VIEWS.chat = async (v) => {
   });
   v.querySelectorAll('[data-src]').forEach(a => a.onclick = async e => {
     e.preventDefault();
-    const kind = a.dataset.src, ref = a.dataset.ref;
-    const d = await api(`/api/assistant/source/${kind}/${encodeURIComponent(ref)}`);
-    if (!d || !d.ok) return toast('取不到原文', 'bad');
+    const kind = a.dataset.src, ref = a.dataset.ref, sid = a.dataset.sid || '';
+    const url = `/api/assistant/source/${encodeURIComponent(kind)}/${encodeURIComponent(ref)}`
+      + (sid ? '?sid=' + encodeURIComponent(sid) : '');
+    const d = await api(url);
+    if (!d || !d.ok) return toast((d && d.error) || '取不到原文', 'bad');
     const r = d.record || {};
-    const body = kind === 'M'
-      ? `<div class="muted">${esc(r.ts_text || '')} · ${esc(r.group_name || r.group_id || '')} · ${esc(r.nickname || '')}</div>
-         <pre>${esc(r.raw_message || '')}</pre>`
-      : `<pre>${esc(JSON.stringify(r, null, 2))}</pre>`;
-    modal('来源原文', body);
+    modal(d.title || '来源原文', srcBody(kind, r));
   });
   const box = q(v, '#chat-turns');
   if (box.scrollHeight) box.scrollTop = box.scrollHeight;
 };
-/* 把回答里的 [#M1] / [M1] 变成可点的来源芯片(先转义再做替换, 防注入) */
-function renderAnswer(text) {
+/* 来源原文的展示: 每种来源给出"能核对"的字段, 而不是一坨 JSON */
+function srcBody(kind, r) {
+  const line = (k, v) => (v === '' || v == null || v === 0) ? '' :
+    `<div class="it"><b>${esc(k)}</b><span class="right muted">${esc(String(v))}</span></div>`;
+  const when = (ts) => ts ? fmtTs(ts) : '';
+  if (kind === 'M') {
+    return `<div class="muted">${esc(r.ts_text || when(r.ts))} · ${esc(r.group_name || r.group_id || '')} · ${esc(r.nickname || '')}
+      ${r.recalled ? ' · <span class="err">已撤回</span>' : ''}${r.self ? ' · 机器人自己发的' : ''}</div>
+      <pre>${esc(r.raw_message || '')}</pre>${line('消息 id', r.id)}`;
+  }
+  if (kind === 'Y') {
+    const origin = (r.origin_messages || []).map(m =>
+      `<div class="it"><span class="muted">${esc(m.ts_text || '')}</span>
+       <b class="ellip">${esc(m.nickname || '')}</b>
+       <span class="muted ellip">${esc(m.text || '')}</span></div>`).join('');
+    return `<div class="muted">范围 ${esc(r.scope || '')} · 键 ${esc(r.key || '')} ·
+      更新 ${esc(r.updated_text || '')} · 命中 ${esc(String(r.hits || 0))}</div>
+      <pre>${esc(r.content || '')}</pre>
+      ${origin ? `<h3 style="margin-top:12px">沉淀来源(该群最近消息)</h3><div class="list">${origin}</div>` : ''}`;
+  }
+  if (kind === 'E') {
+    return `<div class="list">
+      ${line('标题', r.title)}${line('类型', KIND_CN[r.kind] || r.kind)}${line('状态', r.status)}
+      ${line('截止', r.due_at ? fmtTs(r.due_at) : '')}${line('群', r.group_id)}${line('提出人', r.who)}
+      ${line('来源', r.origin)}${line('置信度', r.confidence)}${line('记录时间', when(r.first_seen))}</div>
+      ${r.detail ? `<pre>${esc(r.detail)}</pre>` : ''}
+      ${r.notes ? `<div class="muted">备注: ${esc(r.notes)}</div>` : ''}`;
+  }
+  if (kind === 'L') {
+    return `<div class="list">${line('标题', r.title)}${line('域名', r.domain)}
+      ${line('群', r.group_id)}${line('状态', r.status)}${line('抓取时间', r.fetched_at ? fmtTs(r.fetched_at) : '')}</div>
+      <div class="row" style="margin:8px 0"><a class="btn" href="${esc(r.url || '#')}" target="_blank" rel="noopener">打开链接</a>
+      <span class="muted ellip">${esc(r.url || '')}</span></div>
+      ${r.excerpt ? `<pre>${esc(r.excerpt)}</pre>` : ''}
+      ${r.error ? `<div class="err">抓取失败: ${esc(r.error)}</div>` : ''}`;
+  }
+  if (kind === 'P') {
+    const isImg = (r.kind === 'image' || !r.kind) && r.key;
+    return `${isImg ? `<img src="/api/media/raw?key=${encodeURIComponent(r.key)}" style="max-width:100%;border-radius:10px" alt="">` : ''}
+      <div class="list">${line('类型', r.kind)}${line('文件名', r.name)}${line('状态', r.status)}
+      ${line('大小', r.size ? humanBytes(r.size) : '')}${line('群', r.group_id)}${line('消息 id', r.message_id)}
+      ${line('识别说明', r.caption)}</div>
+      ${r.url ? `<div class="muted ellip">${esc(r.url)}</div>` : ''}
+      ${r.error ? `<div class="err">${esc(r.error)}</div>` : ''}`;
+  }
+  return `<pre>${esc(JSON.stringify(r, null, 2))}</pre>`;
+}
+/* 把回答里的 [#M1] / [M1] 变成可点的来源芯片(先转义再做替换, 防注入)。
+   `sources` 是该轮回答的来源表: 用它把编号(M1/Y2)换成稳定 sid —— 编号只在一份
+   上下文里唯一, 直接拿序号去查会打开另一条记录或报"未知类型"。 */
+function renderAnswer(text, sources) {
+  const map = {};
+  (sources || []).forEach(s => { if (s && s.ref) map[String(s.ref)] = s; });
   const safe = esc(text || '');
   return safe.replace(/\n/g, '<br>')
-    .replace(/\[#?([MEYLP])(\d+)\]/g, (m, k, n) =>
-      `<a href="#" class="cite" data-src="${k}" data-ref="${n}">[${k}${n}]</a>`);
+    .replace(/\[#?([MEYLP])(\d+)\]/g, (m, k, n) => {
+      const s = map[k + n] || {};
+      return `<a href="#" class="cite" data-src="${k}" data-ref="${n}" data-sid="${esc(s.sid || '')}">[${k}${n}]</a>`;
+    });
 }
 
 /* ------------------------------------------------------- 数据 */
@@ -630,8 +682,16 @@ VIEWS.data = async (v) => {
     if (!d) { box.innerHTML = errState('记忆加载失败'); wireRetry(box, () => VIEWS.data(v)); return; }
     box.innerHTML = card('长期记忆', `<div class="list">${(d.memories || []).map(m =>
       `<div class="it"><b>${esc(m.scope || m.key || '')}</b><span class="muted ellip">${esc((m.content || '').slice(0, 120))}</span>
-       <span class="right muted">${fmtTs(m.updated, 'time')}</span></div>`).join('') || emptyState('还没有记忆', '总结会逐步沉淀群里的共识')}</div>`)
+       <span class="right row"><span class="muted">${fmtTs(m.updated, 'time')}</span>
+       <button data-msrc="${esc(m.scope || '')}|${esc(m.key || 'digest')}">看原文</button></span></div>`).join('')
+      || emptyState('还没有记忆', '总结会逐步沉淀群里的共识')}</div>`,
+      '点「看原文」看这条记忆本身, 以及它是从该群哪些消息沉淀出来的')
       + card('个人档案(profile.md)', `<pre class="md">${esc(d.profile || '(空)')}</pre>`);
+    box.querySelectorAll('[data-msrc]').forEach(b => b.onclick = async () => {
+      const d2 = await api('/api/assistant/source/Y/1?sid=' + encodeURIComponent('y:' + b.dataset.msrc));
+      if (!d2 || !d2.ok) return toast((d2 && d2.error) || '取不到原文', 'bad');
+      modal(d2.title || '长期记忆原文', srcBody('Y', d2.record || {}));
+    });
   } else if (dataTab === 'links') {
     const d = await api('/api/links');
     if (!d) { box.innerHTML = errState('链接加载失败'); wireRetry(box, () => VIEWS.data(v)); return; }
@@ -955,8 +1015,8 @@ VIEWS.groups = async (v) => {
       ${gs.length ? '' : '<div class="empty">还没有群数据(NapCat 未连接或未收到消息)</div>'}
     </div></div>`;
   q(v, '#g-q').oninput = e => {
-    const q = e.target.value.toLowerCase();
-    v.querySelectorAll('.chip').forEach(c => c.style.display = c.dataset.name.includes(q) ? '' : 'none');
+    const kw = e.target.value.toLowerCase();
+    v.querySelectorAll('.chip').forEach(c => c.style.display = c.dataset.name.includes(kw) ? '' : 'none');
   };
   const bulk = async (on) => {
     const ids = [...v.querySelectorAll('.chip input:checked')].map(i => +i.dataset.id);

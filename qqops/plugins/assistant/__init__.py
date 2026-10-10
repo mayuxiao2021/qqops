@@ -212,10 +212,15 @@ class AssistantPlugin(Plugin):
         """把记录排成编号文本 + 来源表(供前端点开原文)。"""
         lines, sources = [], []
 
-        def add(kind, label, text, **meta):
+        def add(kind, label, text, sid="", **meta):
+            """`ref` 是给模型/人看的序号(M1/Y2);`sid` 是能定位到原文的稳定标识。
+
+            序号只在一份上下文里唯一, 跨会话/重新提问就失效 —— 点开原文必须用 sid,
+            否则会打开"编号恰好相同"的另一条记录(踩过: 点记忆直接报未知类型)。
+            """
             ref = "%s%d" % (kind, len([s for s in sources if s["kind"] == kind]) + 1)
             sources.append({"ref": ref, "kind": kind, "label": label,
-                            "text": text[:400], **meta})
+                            "text": text[:400], "sid": sid, **meta})
             return ref
 
         for r in bundle.get("messages") or []:
@@ -232,31 +237,36 @@ class AssistantPlugin(Plugin):
                 mark.append("已撤回")
             if r.get("self"):
                 mark.append("机器人自己发的")
-            ref = add("M", "%s %s" % (when, who), text, id=r.get("id"), ts=r.get("ts"),
+            ref = add("M", "%s %s" % (when, who), text, sid="m:%s" % r.get("id"),
+                      id=r.get("id"), ts=r.get("ts"),
                       group_id=r.get("group_id"), group_name=r.get("group_name"))
             lines.append("[%s] %s %s/%s: %s%s" % (ref, when, gname, who, text,
                                                   ("( %s )" % "、".join(mark)) if mark else ""))
         for e in bundle.get("events") or []:
             due = time.strftime("%m-%d", time.localtime(int(e.get("due_at") or 0))) if e.get("due_at") else "无期限"
             title = e.get("title") or ""
-            ref = add("E", "待办/事件 %s" % title[:24], title, id=e.get("id"), due=e.get("due_at"))
+            ref = add("E", "待办/事件 %s" % title[:24], title, sid="e:%s" % e.get("id"),
+                      id=e.get("id"), due=e.get("due_at"))
             lines.append("[%s] %s事件(%s, %s): %s" % (ref, e.get("kind") or "", e.get("status") or "",
                                                       due, title))
         for mm in bundle.get("memories") or []:
             content = (mm.get("content") or "").strip()
             if not content:
                 continue
-            ref = add("Y", "记忆 %s" % (mm.get("scope") or ""), content)
+            ref = add("Y", "记忆 %s" % (mm.get("scope") or ""), content,
+                      sid="y:%s|%s" % (mm.get("scope") or "", mm.get("key") or "digest"),
+                      scope=mm.get("scope"), key=mm.get("key") or "digest",
+                      updated=mm.get("updated"))
             lines.append("[%s] 长期记忆(%s): %s" % (ref, mm.get("scope") or "", content[:300]))
         for l in bundle.get("links") or []:
             title = l.get("title") or l.get("url") or ""
             ref = add("L", "链接 %s" % title[:24], "%s %s" % (title, l.get("excerpt") or ""),
-                      url=l.get("url"))
+                      sid="l:%s" % (l.get("url") or ""), url=l.get("url"))
             lines.append("[%s] 链接: %s %s" % (ref, title, l.get("url") or ""))
         for md in bundle.get("media") or []:
             cap = (md.get("caption") or "").strip()
             ref = add("P", "图片/文件 %s" % (md.get("name") or md.get("kind") or ""), cap,
-                      key=md.get("key"))
+                      sid="p:%s" % (md.get("key") or ""), key=md.get("key"))
             lines.append("[%s] 媒体说明(%s): %s" % (ref, md.get("kind") or "", cap[:200]))
         return lines, sources
 
@@ -467,44 +477,94 @@ class AssistantPlugin(Plugin):
 
     @route("/api/assistant/source/<kind>/<ref>")
     def api_source(self, req, ctx):
-        """点开某条来源看原文(消息按 id、事件按 id、链接按 url、媒体按 key)。"""
+        """点开某条来源看原文。
+
+        优先用 `?sid=`(稳定标识: `m:12` / `e:3` / `y:group:1|digest` / `l:<url>` / `p:<key>`);
+        没有 sid 时退回老参数(消息/事件按 id、链接按 url、媒体按 key) —— 老会话仍可点开。
+        """
+        # 注意: 真实 HTTP 下 query 是 parse_qs 出来的**列表**, 必须走 req.q() 取首值,
+        # 否则 str(list) 会变成 "['y:...']" → 被当成未知类型(真机踩过)。
+        sid = str(req.q("sid") or "").strip()
+        if not sid and (req.params or {}).get("sid"):
+            sid = str(req.params.get("sid"))
         kind, ref = (req.params or {}).get("kind"), (req.params or {}).get("ref")
+        if sid and ":" in sid:
+            k, val = sid.split(":", 1)
+            kind, ref = k.strip().upper(), val      # sid 用小写前缀(m:/y:), 类型统一大写
+        try:
+            return self._open_source(kind, str(ref))
+        except Exception as e:                       # noqa: BLE001 —— 取原文失败不能让控制台报错
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+    # ------------------------------------------------------------------ 来源定位
+    def _open_source(self, kind: str, ref: str) -> dict:
         store = self.ctx.store
         if kind == "M":
+            con = store.conn()
             try:
-                con = store.conn()
-                try:
-                    row = con.execute(
-                        """SELECT m.*, COALESCE(g.name,'') group_name FROM messages m
-                           LEFT JOIN groups g ON g.id=m.group_id WHERE m.id=?""",
-                        (int(ref),)).fetchone()
-                finally:
-                    con.close()
-                if not row:
-                    return {"ok": False, "error": "消息不存在"}
-                d = dict(row)
-                d["ts_text"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(d.get("ts") or 0)))
-                try:
-                    d["segments"] = json.loads(d.get("segments") or "[]")
-                except Exception:
-                    pass
-                return {"ok": True, "kind": "message", "record": d}
-            except Exception as e:                   # noqa: BLE001
-                return {"ok": False, "error": str(e)}
+                row = con.execute(
+                    """SELECT m.*, COALESCE(g.name,'') group_name FROM messages m
+                       LEFT JOIN groups g ON g.id=m.group_id WHERE m.id=?""",
+                    (int(ref),)).fetchone()
+            finally:
+                con.close()
+            if not row:
+                return {"ok": False, "error": "消息不存在(id %s)" % ref}
+            d = dict(row)
+            d["ts_text"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(d.get("ts") or 0)))
+            try:
+                d["segments"] = json.loads(d.get("segments") or "[]")
+            except Exception:
+                pass
+            return {"ok": True, "kind": "message", "record": d, "title": "消息原文"}
         if kind == "E":
-            try:
-                rows = [e for e in store.events(status="all", limit=500) if int(e.get("id") or 0) == int(ref)]
-                return {"ok": bool(rows), "kind": "event", "record": rows[0] if rows else {}}
-            except Exception as e:                   # noqa: BLE001
-                return {"ok": False, "error": str(e)}
+            rows = [e for e in store.events(status="all", limit=1000)
+                    if int(e.get("id") or 0) == int(ref or 0)]
+            if not rows:
+                return {"ok": False, "error": "事件不存在(id %s)" % ref}
+            return {"ok": True, "kind": "event", "record": rows[0], "title": "事件/待办"}
+        if kind == "Y":
+            # 记忆的稳定标识是 `scope|key`(记忆表没有自增 id)
+            scope, _, mkey = ref.partition("|")
+            rec = store.memory_get(scope, mkey or "digest") if scope else {}
+            if not rec:
+                return {"ok": False, "error": "记忆不存在(%s)" % ref}
+            rec = dict(rec)
+            rec["scope"], rec["key"] = scope, mkey or "digest"
+            rec["updated_text"] = time.strftime(
+                "%Y-%m-%d %H:%M", time.localtime(int(rec.get("updated_at") or rec.get("updated") or 0)))
+            rec["origin_messages"] = self._memory_origins(store, scope, rec)
+            return {"ok": True, "kind": "memory", "record": rec, "title": "长期记忆原文"}
         if kind == "P":
             rec = store.media_get(ref)
-            return {"ok": bool(rec), "kind": "media", "record": rec or {}}
+            if not rec:
+                return {"ok": False, "error": "媒体不存在(%s)" % ref}
+            return {"ok": True, "kind": "media", "record": rec, "title": "媒体"}
         if kind == "L":
-            rows = [x for x in store.links(limit=500) if x.get("url") == ref] or \
-                   [x for x in store.links(limit=500) if ref in (x.get("url") or "")]
-            return {"ok": bool(rows), "kind": "link", "record": rows[0] if rows else {}}
+            rows = [x for x in store.links(limit=1000) if x.get("url") == ref] or \
+                   [x for x in store.links(limit=1000) if ref and ref in (x.get("url") or "")]
+            if not rows:
+                return {"ok": False, "error": "链接不存在(%s)" % ref}
+            return {"ok": True, "kind": "link", "record": rows[0], "title": "链接"}
         return {"ok": False, "error": "未知来源类型: %s" % kind}
+
+    @staticmethod
+    def _memory_origins(store, scope: str, rec: dict) -> list:
+        """这条记忆是"从哪些消息里沉淀出来的" —— 同群、记忆更新时间之前的最近若干条。
+
+        记忆表本身不存消息引用, 所以用"同群 + 时间倒序"作为可核对的原始数据。
+        """
+        try:
+            if not str(scope).startswith("group:"):
+                return []
+            gid = str(scope).split(":", 1)[1]
+            rows = store.messages(group=gid, hours=24 * 365, size=5, order="desc")["rows"]
+            return [{"id": r.get("id"), "nickname": r.get("nickname"),
+                     "ts_text": time.strftime("%Y-%m-%d %H:%M",
+                                              time.localtime(int(r.get("ts") or 0))),
+                     "text": (r.get("raw_message") or "")[:300]} for r in rows]
+        except Exception:
+            return []
 
     @route("/api/assistant/stats")
     def api_stats(self, req, ctx):

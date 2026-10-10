@@ -2418,6 +2418,65 @@ class TestAssistantPlugin(unittest.TestCase):
         finally:
             app.stop()
 
+    def test_source_sid_points_at_the_right_record(self):
+        """来源必须能用稳定 sid 定位: 编号(M1/Y1)只在一份上下文里唯一。
+
+        踩过的坑: 点记忆来源直接报"未知来源类型: Y"; 按序号当 id 去查消息会打开
+        编号恰好相同的**另一条**消息 —— 所以 sid 优先, 且每种来源都要能取到原文。
+        """
+        app = self._app()
+        try:
+            st = self._seed()
+            st.memory_set("group:6666", "digest", "群里的共识: 报告要加预算表")
+            st.event_upsert({"dedup": "d1", "kind": "deadline", "title": "交实验报告",
+                             "group_id": 6666, "due_at": int(time.time()) + 86400})
+            st.link_upsert("http://example.com/r", title="报告模板", excerpt="正文摘要")
+            mid = st.messages(group="6666", q="预算表", hours=24)["rows"][0]["id"]
+            inst, _ = self._inst(app, texts=["看预算表 [#M1] 和长期记忆 [#Y1]"])
+            hit, _ = app.router.match("POST", "/api/assistant/ask")
+            out = hit.fn(fw_web.Request(method="POST", path="/api/assistant/ask",
+                                        body=json.dumps({"question": "报告"}).encode()), app.ctx)
+            self.assertTrue(out["ok"], out)
+            sids = {s["kind"]: s.get("sid") for s in out["sources"]}
+            self.assertTrue(sids.get("M"), sids)      # 消息来源要带稳定定位
+            self.assertTrue(sids.get("Y"), sids)      # 记忆来源也要(原先压根没有)
+            self.assertTrue(sids.get("M").startswith("m:"))
+
+            def src(kind, ref, sid=""):
+                h, _ = app.router.match("GET", "/api/assistant/source/%s/%s" % (kind, ref))
+                self.assertTrue(h, kind)
+                # query 按**真实 HTTP 形态**构造(parse_qs 出来的是列表) —— 用字符串测会漏掉
+                # "str(list)" 这类只在真机上才犯的错
+                req = fw_web.Request(method="GET", path="/api/assistant/source/%s/%s" % (kind, ref),
+                                     params={"kind": kind, "ref": str(ref)},
+                                     query={"sid": [sid]} if sid else {})
+                return h.fn(req, app.ctx)
+
+            # 1) 记忆(原先必然失败): 稳定 sid = y:scope|key
+            d = src("Y", 1, "y:group:6666|digest")
+            self.assertTrue(d["ok"], d)
+            self.assertIn("预算表", d["record"]["content"])
+            self.assertEqual(d["record"]["scope"], "group:6666")
+            self.assertTrue(d["record"]["origin_messages"])     # 给出去核对的消息
+            # 2) 序号张冠李戴: ref=1 但 sid 指向真实 id → 必须按 sid 返回
+            d = src("M", 1, "m:%d" % mid)
+            self.assertTrue(d["ok"], d)
+            self.assertIn("预算表", d["record"]["raw_message"])
+            # 3) 事件/链接同样支持 sid
+            ev = st.events(status="all", limit=5)[0]
+            d = src("E", 1, "e:%d" % ev["id"])
+            self.assertTrue(d["ok"], d)
+            self.assertIn("报告", d["record"]["title"])
+            d = src("L", 1, "l:http://example.com/r")
+            self.assertTrue(d["ok"], d)
+            self.assertEqual(d["record"]["url"], "http://example.com/r")
+            # 4) 没有 sid 的老路径: 记忆给不出定位就如实报错, 不是静默返回空原文
+            d = src("Y", 1)
+            self.assertFalse(d["ok"], d)
+            self.assertIn("记忆", d["error"])
+        finally:
+            app.stop()
+
     def test_llm_from_config_falls_back_to_summarizer(self):
         """llm 段留空时必须回落到 summarizer, 否则会出现"配了总结却问不了"的情况。"""
         cfg = core.Config()
