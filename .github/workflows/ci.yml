@@ -96,12 +96,15 @@ jobs:
     needs: [privacy, test]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0            # 需要 tag 才能做"包 == 已提交 == tag"的一致性检查
+          fetch-tags: true
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: 打包
         run: python pack.py
-      - name: 校验包内文件与权限位
+      - name: 校验"包 == 工作区 == 已提交"
         run: python tools/verify_package.py
       - uses: actions/upload-artifact@v4
         with:

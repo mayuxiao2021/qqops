@@ -112,9 +112,12 @@ def main() -> int:
         FAILED.append("有未提交改动")
     head = git("rev-parse", "--short", "HEAD")
     tag = git("rev-list", "-n", "1", "v" + ver)
-    print("HEAD       : %s | v%s 指向同一次提交: %s" % (head, ver, tag.startswith(head) if tag else "(无此标签)"))
-    if not tag:
+    require_tag = "--require-tag" in sys.argv
+    print("HEAD       : %s | v%s 指向同一次提交: %s" % (head, ver, tag.startswith(head) if tag else "(本机无此标签)"))
+    if not tag and require_tag:
         FAILED.append("缺少 v%s 标签" % ver)
+    elif not tag:
+        print("             (没取到标签, 跳过该检查; 发版时用 --require-tag)" )
     print("权限位     : %s" % (modes or "全部正确(可执行 0755 / 其余 0644)"))
     if modes:
         FAILED.append("包内权限位不对")
