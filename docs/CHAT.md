@@ -102,6 +102,50 @@ NapCat ──上报──▶ collector(:8080)
 5. 控制台「对话」页有 **「测试卡片渲染」** 按钮: 一次把合并转发 / 官方分享 / 签名卡片 /
    裸 JSON 四种都发到你的 QQ, 并列出每种的成功失败与原因 —— 用眼睛确认哪种能渲染。
 
+### Markdown 卡片(专章: 它是 packet 通道, 不是 JSON 卡片)
+
+OneBot 扩展里有 **markdown 段**:
+
+```json
+{"type": "markdown", "data": {"content": "## 标题\n\n**加粗**\n\n- 列表\n"}}
+```
+
+NapCat 里它是这样实现的(源码为证):
+
+| 事实 | 位置 |
+|---|---|
+| 段类型定义 `markdown = 'markdown'`,`OB11MessageMarkdownSchema{content}` | `packages/napcat-onebot/types/message.ts` |
+| 发送时转成 `PacketMsgMarkDownElement` | `packages/napcat-core/packet/message/converter.ts:120` |
+| 组 protobuf `MarkdownData` 发出去 | `packages/napcat-core/packet/message/element.ts:691` |
+
+**关键点: markdown 走的是 PacketBackend 的 protobuf 通道** —— 和签名小程序卡片同一个前置条件,
+不是"带不带签名"的问题。本机实测(NapCat 4.18.33 + QQ 3.2.32-52194):
+
+```
+send_private_msg [{"type":"markdown", ...}]
+→ {"status":"failed","retcode":200,
+   "message":"Timeout: NTEvent serviceAndMethod:NodeIKernelMsgService/sendMsg
+              ListenerName:NodeIKernelMsgListener/onMsgInfoListUpdate
+              EventRet:{\"result\":0,\"errMsg\":\"\"}"}
+```
+
+注意这个报错很阴: 内核 `result: 0` 看着像成功, 但 NapCat 等不到消息回调, **消息实际没发出去**。
+判断真伪的办法是看"机器人自己发的消息"有没有被上报回来(`message_sent`, 库里 `self=1`):
+
+```sql
+SELECT * FROM messages WHERE self=1 ORDER BY id DESC LIMIT 5;   -- 没有这条 = 没发出去
+```
+
+对照: `miniapp` 段直接报 `消息体无法解析`; 而 `json` 段(裸卡片)能发但客户端提示"卡片版本过低"。
+
+**结论**: 想用 markdown 卡片, 必须让 PacketBackend 支持当前 QQ 版本
+(官方支持矩阵: Linux arm64 = QQ 构建号 **28498–36580**; 本机是 **52194**)。
+在那之前, 富文本请用 **合并转发卡片**(各版本可渲染, 内容任意)。
+
+QQOps 的处理: `reply_mode` / `push.format` 都可以选 `markdown`, **发不出去会自动退文本**并记录
+原始报错; 换了 QQ/NapCat 版本后同一个开关自动生效, 不需要改代码。控制台「测试卡片渲染」里也有
+markdown 这一项, 一眼能看到当前能不能用。
+
 ### 相关接口
 
 ```

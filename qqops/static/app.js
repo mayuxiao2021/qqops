@@ -1217,6 +1217,7 @@ const CFG_CN = {
                input_price_per_mtok: ['输入单价(元/百万词元)', '填了才会算费用'],
                output_price_per_mtok: ['输出单价(元/百万词元)', '']},
   push: {enable: ['启用推送', '通过 NapCat 发到你的 QQ'],
+         format: ['推送形态', 'text 纯文本 / forward 合并转发卡片(各版本可渲染) / markdown Markdown 卡片(需 QQ 版本支持)'],
          user_id: ['推送到我的 QQ 号', ''], group_id: ['推送到群号', '留 0 = 只发私聊, 不在群里发言'],
          napcat_api_port: ['NapCat 接口端口', '默认 3000'],
          token: ['NapCat 接口令牌', '留空表示不修改'],

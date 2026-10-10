@@ -492,7 +492,19 @@ class TestWebAndNapcat(unittest.TestCase):
         ark, err = nc.miniapp_ark("标题", "摘要")
         self.assertEqual(ark, "")
         self.assertIn("packetBackend", err)
-        # 4) 官方分享卡片: 从 arkMsg 取出即可发
+        # 4) Markdown 卡片: 段结构对, 失败(内核 timeout/不支持)必须退文本
+        sent.clear()
+        nc.call = fake_call
+        self.assertEqual(nc.send_markdown("## 标题\n\n- 项", user_id=777).get("retcode"), 0)
+        seg = json.dumps(sent[-1][1], ensure_ascii=False)
+        self.assertIn('"type": "markdown"', seg)
+        self.assertIn('"content"', seg)
+        sent.clear()
+        nc.call = fail_call
+        nc.send_markdown("## 标题", user_id=777, fallback_text="退文本")
+        self.assertEqual([a for a, _ in sent], ["send_private_msg", "send_private_msg"])
+        self.assertIn("退文本", json.dumps(sent[-1][1], ensure_ascii=False))
+        # 5) 官方分享卡片: 从 arkMsg 取出即可发
         nc.call = lambda action, payload=None, timeout=None: (
             {"status": "ok", "retcode": 0,
              "data": {"errCode": 0, "arkMsg": '{"app":"com.tencent.contact.lua"}'}}
@@ -500,7 +512,7 @@ class TestWebAndNapcat(unittest.TestCase):
         ark2, err2 = nc.ark_share_peer(user_id=777)
         self.assertIn("contact.lua", ark2)
         self.assertEqual(err2, "")
-        # 5) CQ 码转人话(聊天里提问要先把原始消息洗干净)
+        # 6) CQ 码转人话(聊天里提问要先把原始消息洗干净)
         self.assertEqual(core.cq_plain("[CQ:image,file=a.jpg] 问 谁交报告 [CQ:at,qq=1]"),
                          "[图片] 问 谁交报告")
 

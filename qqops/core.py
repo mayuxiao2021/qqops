@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 import secrets
 
-VERSION = "3.3.0"
+VERSION = "3.3.1"
 
 # 路径解析(踩过坑, 别改回 "靠 $HOME 猜"):
 #   曾经用 BASE = ~/qqops —— 但 $HOME 是环境给的, 从别的目录/cron/adb run-as 调用时
@@ -63,7 +63,9 @@ DEFAULT_CONFIG = {
         "input_price_per_mtok": 0.0, "output_price_per_mtok": 0.0,
     },
     "push": {"enable": False, "user_id": 0, "group_id": 0, "napcat_api_port": 3000,
-             "token": "", "max_chars": 1200, "report_link": True},
+             "token": "", "max_chars": 1200, "report_link": True,
+             # 推送形态: text 纯文本 | forward 合并转发卡片 | markdown Markdown 卡片
+             "format": "text"},
     "schedule": {
         "enabled": True,
         "mode": "daily",             # daily=每天定点 | interval=每隔 N 分钟 | weekly=每周几
@@ -1315,6 +1317,40 @@ class NapCat:
                 return self.send_private(user_id, fallback_text)
             except Exception as e:                   # noqa: BLE001
                 return {"status": "error", "error": str(e), "card_failed": res}
+        return res
+
+    # ------------------------------------------------------------ Markdown 卡片
+    def send_markdown(self, content: str, user_id: int = 0, group_id: int = 0,
+                      fallback_text: str = "", reply_to: int = 0,
+                      timeout: int = 45) -> dict:
+        """发 **Markdown 卡片**(OneBot v11 扩展段 `{"type":"markdown","data":{"content":…}}`)。
+
+        ⚠️ 实测约束: NapCat 的 markdown 是**走 PacketBackend 的 protobuf 通道**实现的
+        (`napcat-core/packet/message/element.ts` 的 `PacketMsgMarkDownElement` → `MarkdownData`),
+        与签名小程序卡片同一个前置条件。PacketBackend 官方支持矩阵里 Linux arm64 只覆盖
+        QQ 构建号 28498-36580; 超出范围时 NapCat 返回
+        `Timeout: NTEvent … NodeIKernelMsgService/sendMsg … onMsgInfoListUpdate` 且消息**发不出去**。
+        因此失败**一定**退回 `fallback_text` 并记日志; 换了 QQ/NapCat 版本后同一个开关自动生效。
+        """
+        segs = []
+        if reply_to:
+            segs.append({"type": "reply", "data": {"id": str(reply_to)}})
+        segs.append({"type": "markdown", "data": {"content": str(content or "")}})
+        try:
+            res = self.send_message(segs, user_id=user_id, group_id=group_id, timeout=timeout)
+        except Exception as e:                       # noqa: BLE001
+            res = {"status": "error", "error": str(e)}
+        if str(res.get("status")) == "ok" and int(res.get("retcode") or 0) == 0:
+            return res
+        log("core", "WARN", "Markdown 卡片发送失败(需要 PacketBackend 支持当前 QQ 版本): %s"
+            % str(res.get("message") or res.get("error") or res)[:160])
+        if fallback_text:
+            try:
+                if group_id:
+                    return self.send_group(group_id, fallback_text)
+                return self.send_private(user_id, fallback_text)
+            except Exception as e:                   # noqa: BLE001
+                return {"status": "error", "error": str(e), "markdown_failed": res}
         return res
 
     # ------------------------------------------------------------ 签名卡片/分享卡片

@@ -541,6 +541,15 @@ class AssistantPlugin(Plugin):
             if str(res.get("status")) == "ok":
                 return res
             mode = "text"                            # 转发失败就退回文本
+        if mode == "markdown":
+            # Markdown 卡片: 能发就发(带签名能力时最漂亮), 发不出去自动退文本
+            res = napcat.send_markdown(answer + tail, user_id=target.get("user_id", 0),
+                                       group_id=target.get("group_id", 0),
+                                       fallback_text="", reply_to=reply_to if cfg.get("quote", True) else 0)
+            if str(res.get("status")) == "ok":
+                return res
+            core.log("assistant", "WARN", "Markdown 卡片不可用, 改用文本回复: %s"
+                     % str(res.get("message") or res.get("error") or res)[:140])
         if mode == "card":
             title = "QQOps 智能查询"
             res = napcat.send_miniapp_card(title, answer[:110], user_id=target.get("user_id", 0),
@@ -561,7 +570,7 @@ class AssistantPlugin(Plugin):
     def api_reply_test(self, req, ctx):
         """把三种"卡片"各发一条到主人 QQ, 用来确认哪种在你这版 QQ 上真的能渲染。"""
         body = req.json() or {}
-        kinds = body.get("kinds") or ["forward", "share", "miniapp"]
+        kinds = body.get("kinds") or ["forward", "share", "markdown", "miniapp", "json"]
         uid = int(body.get("user_id") or self._owner_id() or 0)
         if not uid:
             return {"ok": False, "error": "还没配置 push.user_id, 不知道发给谁"}
@@ -580,6 +589,12 @@ class AssistantPlugin(Plugin):
                                              self._owner_avatar(), "https://qq.com")
                 out["results"]["miniapp"] = ({"status": "ok", "ark": ark[:120]}
                                              if ark else {"status": "failed", "error": err})
+            elif k == "markdown":
+                res = napcat.send_markdown(
+                    "# QQOps Markdown 卡片\n\n**加粗** · *斜体* · `代码`\n\n"
+                    "- 列表项一\n- 列表项二\n\n| 列 | 值 |\n|---|---|\n| 测试 | 通过 |\n\n> 引用: QQOps\n",
+                    user_id=uid, fallback_text="")
+                out["results"]["markdown"] = res
             elif k == "json":
                 card = core.qq_card("QQOps 裸 JSON 卡片", "客户端可能提示卡片版本过低")
                 out["results"]["json"] = napcat.send_card(card, user_id=uid,

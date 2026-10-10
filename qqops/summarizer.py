@@ -440,11 +440,28 @@ def run(hours: float | None = None, groups: list | None = None, dry_run: bool = 
                     base = cfg.data["web"]
                     text += "\n📄 完整报告: http://%s:%s/r/%s?token=%s" % (
                         "127.0.0.1", base["port"], os.path.basename(html_path), base["token"])
-                sent = nc.send_text(text, user_id=int(push_cfg.get("user_id") or 0),
-                                    group_id=int(push_cfg.get("group_id") or 0),
-                                    max_chars=int(push_cfg.get("max_chars", 1200)))
+                target = {"user_id": int(push_cfg.get("user_id") or 0),
+                          "group_id": int(push_cfg.get("group_id") or 0)}
+                fmt = str(push_cfg.get("format") or "text").lower()
+                sent = 0
+                if fmt == "forward":
+                    # 合并转发(聊天记录卡片): 各版本 QQ 都能渲染, 内容任意
+                    nodes = [core.forward_node("QQOps 日报", target.get("user_id") or target.get("group_id") or 0,
+                                               text, title="【%s】" % meta.get("title", "每日总结")),
+                             core.forward_node("QQOps 日报", target.get("user_id") or target.get("group_id") or 0,
+                                               md, title="【完整报告】")]
+                    r = nc.send_forward(nodes, **target)
+                    sent = 1 if str(r.get("status")) == "ok" else 0
+                    if not sent:                     # 转发失败 → 退回文本
+                        sent = nc.send_text(text, max_chars=int(push_cfg.get("max_chars", 1200)), **target)
+                elif fmt == "markdown":
+                    # Markdown 卡片: 需要 PacketBackend 支持当前 QQ 版本, 否则自动退文本
+                    r = nc.send_markdown(md, fallback_text=text, **target)
+                    sent = 1 if str(r.get("status")) == "ok" else 0
+                else:
+                    sent = nc.send_text(text, max_chars=int(push_cfg.get("max_chars", 1200)), **target)
                 result["pushed"] = sent
-                core.log("summarizer", "INFO", "已推送 %d 段" % sent)
+                core.log("summarizer", "INFO", "已推送 %d 段(形态 %s)" % (sent, fmt))
             except Exception as e:
                 result["errors"].append("push: %s" % e)
                 core.log("summarizer", "ERROR", "推送失败: %s" % e)

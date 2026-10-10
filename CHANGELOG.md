@@ -1,5 +1,32 @@
 # CHANGELOG
 
+## [3.3.1] — 2026-10-10
+
+接上一版: 把 **Markdown 卡片**这条线摸到底并接进产品(它的真实身份是 **PacketBackend 的
+protobuf 通道**, 不是"带签名的 JSON 卡片")。
+
+### 新增:Markdown 卡片(可用则用, 不可用自动退文本)
+- `NapCat.send_markdown(content, …, fallback_text=…)`: 发 OneBot 扩展段
+  `{"type":"markdown","data":{"content":…}}`; 失败**一定**退回纯文本并把原始报错写日志。
+- 回答形态 `reply.reply_mode` 与推送形态 `push.format` 新增 `markdown`
+  (推送还新增 `forward` = 合并转发卡片: 各版本 QQ 都能渲染、内容任意)。
+- 控制台「测试卡片渲染」新增 markdown 项, 一次看清当前设备能不能用。
+
+### 查明:Markdown 卡片为什么在这台机器上发不出去(写进 docs/CHAT.md)
+- 源码证据: `napcat-onebot/types/message.ts` 定义 markdown 段 →
+  `napcat-core/packet/message/converter.ts:120` 转 `PacketMsgMarkDownElement` →
+  `napcat-core/packet/message/element.ts:691` 组 protobuf `MarkdownData`。
+  **即 markdown 与签名小程序卡片同源, 都依赖 PacketBackend**(官方支持矩阵: Linux arm64 仅覆盖
+  QQ 构建号 28498–36580; 本机 QQ 3.2.32-52194 超范围)。
+- 实测报错很阴: `Timeout: NTEvent … NodeIKernelMsgService/sendMsg … onMsgInfoListUpdate`,
+  内核 `result: 0` 看着像成功, 但**消息实际没发出**(用"机器人自己发的消息有没有被上报"
+  验证: 库里 `self=1` 没有这条)。`miniapp` 段则报 `消息体无法解析`。
+- 因此当前可渲染的富文本仍是 **合并转发卡片** 与 **ArkSharePeer 官方分享卡片**;
+  markdown 做成"能发就发、不能发就退文本"的开关, 换 QQ/NapCat 版本后自动生效。
+
+### 测试
+- 169 项保持全绿; 新增断言: markdown 段结构(带 `content`)、发送失败必退文本。
+
 ## [3.3.0] — 2026-10-10
 
 三件事:**在 QQ 聊天里直接问记录**、**卡片消息的能力摸清并落地**、**私聊事件通路**。
