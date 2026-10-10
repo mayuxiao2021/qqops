@@ -35,17 +35,30 @@ def cmd_init(_a) -> int:
 
 
 def _device_keepalive() -> list:
-    """手机保活体检: 幽灵进程查杀 / 电池优化 / 后台权限 / 唤醒锁 / 开机自启。"""
+    """手机保活体检: 幽灵进程查杀 / 电池优化 / 后台权限 / 唤醒锁 / 开机自启。
+
+    注意: Termux 应用**没有**权限读这些系统设置(settings/dumpsys 都会失败),
+    所以在手机里跑 doctor 只能报"本机测不到"; 真正的核对要在 PC 上用 adb 做。
+    这里绝不把"读不到"写成"未设置" —— 那会平白吓人一跳。
+    """
     rows = []
 
     def sh(cmd) -> str:
         return core._run(cmd, 8).strip()
 
+    def unreadable(out: str) -> bool:
+        low = out.lower()
+        return (not out) or any(k in low for k in
+                                ("exception", "permission", "denied", "can't", "cannot",
+                                 "not found", "unknown", "error"))
+
     v = sh(["settings", "get", "global", "settings_enable_monitor_phantom_procs"])
     if v in ("0", "false"):
         rows.append(("OK ", "幽灵进程查杀", "已关闭 —— 不会因为后台进程数超限被杀"))
-    elif not v or "Exception" in v or "Permission" in v:
-        rows.append(("?? ", "幽灵进程查杀", "读不到(无权限); PC 上执行: adb shell settings get global settings_enable_monitor_phantom_procs"))
+    elif unreadable(v):
+        rows.append(("?? ", "幽灵进程查杀", "本机测不到(Termux 无权读系统设置); PC 上核验: "
+                                       "adb shell settings get global settings_enable_monitor_phantom_procs "
+                                       "(应为 false)"))
     else:
         rows.append(("!! ", "幽灵进程查杀", "启用中(%s), Android 12+ 会杀后台进程 → PC 上执行: "
                                        "adb shell settings put global settings_enable_monitor_phantom_procs false" % v))
@@ -53,23 +66,32 @@ def _device_keepalive() -> list:
     wl = sh(["dumpsys", "deviceidle", "whitelist"])
     if "com.termux" in wl:
         rows.append(("OK ", "电池优化白名单", "com.termux 已加入"))
-    elif wl:
+    elif unreadable(wl):
+        rows.append(("?? ", "电池优化白名单", "本机测不到(Termux 无权读 dumpsys); PC 上核验: "
+                                            "adb shell dumpsys deviceidle whitelist | findstr termux"))
+    else:
         rows.append(("!! ", "电池优化白名单", "com.termux 未加入 → PC 上执行: "
                                              "adb shell dumpsys deviceidle whitelist +com.termux"))
-    else:
-        rows.append(("?? ", "电池优化白名单", "读不到; 建议 PC 上执行: adb shell dumpsys deviceidle whitelist +com.termux"))
 
     ops = sh(["cmd", "appops", "get", "com.termux", "RUN_ANY_IN_BACKGROUND"])
     if "allow" in ops:
         rows.append(("OK ", "后台运行权限", "允许"))
+    elif unreadable(ops):
+        rows.append(("?? ", "后台运行权限", "本机测不到; PC 上执行: "
+                                          "adb shell cmd appops set com.termux RUN_ANY_IN_BACKGROUND allow"))
     else:
-        rows.append(("?? ", "后台运行权限", "PC 上执行: adb shell cmd appops set com.termux RUN_ANY_IN_BACKGROUND allow"))
+        rows.append(("!! ", "后台运行权限", "当前为 %s → PC 上执行: "
+                                          "adb shell cmd appops set com.termux RUN_ANY_IN_BACKGROUND allow" % ops[:40]))
 
     if shutil.which("termux-wake-lock"):
-        core._run(["termux-wake-lock"], 8)
-        rows.append(("OK ", "唤醒锁", "已尝试获取(termux-wake-lock)"))
+        out = core._run(["termux-wake-lock"], 10).strip()
+        if unreadable(out) and out:
+            rows.append(("!! ", "唤醒锁", "termux-wake-lock 调用失败(通常是没装 Termux:API 应用): %s" % out[:60]))
+        else:
+            rows.append(("?? ", "唤醒锁", "已调用; 但要装了 Termux:API 应用才真正生效"
+                                        "(adb 侧的保活设置更关键)"))
     else:
-        rows.append(("!! ", "唤醒锁", "缺少 termux-wake-lock(需安装 Termux:API)"))
+        rows.append(("?? ", "唤醒锁", "未安装 termux-wake-lock(可选: 装 Termux:API)"))
 
     boot = os.path.join(os.path.expanduser("~"), ".termux", "boot")
     if os.path.isdir(boot) and any(f.endswith(".sh") for f in os.listdir(boot)):

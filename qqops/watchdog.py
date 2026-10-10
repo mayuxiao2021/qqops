@@ -57,6 +57,9 @@ def main(argv=None) -> int:
 
     core.log("watchdog", "INFO", "看门狗启动 (每 %d 秒体检一次)" % interval)
     print("[watchdog] started, interval=%ds" % interval, flush=True)
+    # 先落一次心跳: 首轮体检要跑好几秒, 不先写心跳的话启动瞬间会被
+    # service_health 判成"没心跳", 报出假的"启动异常"(手机上真踩过)。
+    core.state_set("watchdog_beat", core.now())
     while True:
         try:
             cfg = core.Config()

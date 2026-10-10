@@ -28,9 +28,11 @@ run() {  # 描述 命令...
 echo "① 关闭幽灵进程查杀(Android 12+ 后台进程数超限会杀 Termux 子进程)"
 run "settings put global settings_enable_monitor_phantom_procs false" \
     shell settings put global settings_enable_monitor_phantom_procs false
-# Android 14 上还有一道上限, 能设置就设置(需要 root 或 adb 权限)
+# 上限走 device_config(AOSP 的实际读取处); settings 里那个键是历史遗留, 顺手也写一份
 run "device_config put activity_manager max_phantom_processes 2147483647" \
     shell device_config put activity_manager max_phantom_processes 2147483647
+run "settings put global max_phantom_processes 2147483647" \
+    shell settings put global max_phantom_processes 2147483647
 
 echo
 echo "② 电池优化白名单(防止 Doze 冻结后台)"
@@ -48,11 +50,14 @@ echo "④ 待机分桶设为 active(减少被冻结)"
 run "am set-standby-bucket $PKG active" shell am set-standby-bucket "$PKG" active
 
 echo
-echo "⑤ 核对结果"
-echo -n "  幽灵进程: "; "$ADB" shell settings get global settings_enable_monitor_phantom_procs 2>/dev/null | tr -d '\r'
-echo -n "  白名单  : "; "$ADB" shell dumpsys deviceidle whitelist 2>/dev/null | grep -c "$PKG" | tr -d '\r'
-echo -n "  待机桶  : "; "$ADB" shell am get-standby-bucket "$PKG" 2>/dev/null | tr -d '\r'
+echo "⑤ 核对结果(这几项正是 qqops doctor 里标「本机测不到」的)"
+echo -n "  幽灵进程查杀: "; "$ADB" shell settings get global settings_enable_monitor_phantom_procs 2>/dev/null | tr -d '\r'
+echo -n "  进程数上限  : "; "$ADB" shell device_config get activity_manager max_phantom_processes 2>/dev/null | tr -d '\r'
+echo -n "  白名单命中  : "; "$ADB" shell dumpsys deviceidle whitelist 2>/dev/null | grep -c "$PKG" | tr -d '\r'
+echo -n "  待机桶      : "; "$ADB" shell am get-standby-bucket "$PKG" 2>/dev/null | tr -d '\r' | sed 's/$/  (5=EXEMPTED 最优, 10=ACTIVE, 20=WORKING_SET) /'
+echo -n "  后台权限    : "; "$ADB" shell cmd appops get "$PKG" RUN_ANY_IN_BACKGROUND 2>/dev/null | tr -d '\r'
 echo
 echo "完成。建议再手动做两件事:"
 echo "  · 手机设置 → 应用 → Termux → 电池 → 选「不受限制」"
 echo "  · 安装 Termux:Boot 应用(本程序的 install.sh 已写入 ~/.termux/boot/qqops.sh, 关机重启后会自动拉起)"
+echo "  · (可选) 安装 Termux:API 应用, 这样 termux-wake-lock 才真正生效"

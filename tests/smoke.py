@@ -22,6 +22,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tarfile
 import time
 import unittest
 import urllib.error
@@ -62,6 +63,52 @@ def wait_port(port: int, timeout: float = 12.0) -> bool:
         finally:
             s.close()
     return False
+
+
+def owner_identifiable() -> bool:
+    """本机能否认出"占端口的进程是不是自己人"。
+
+    桌面 Linux: 读 /proc/net/tcp 反查 inode; Android: 该文件被禁, 只能用 pgrep + environ。
+    Windows 两者都没有(测试里跳过依赖它的用例)。
+    """
+    return core.proc_net_ok() or bool(shutil.which("pgrep"))
+
+
+def tiny_server() -> tuple:
+    """占住一个随机端口的迷你 TCP 服务(真的 accept)。
+
+    `port_open()` 是"连一下就断开"的探测: 监听方若不 accept, backlog 很快塞满,
+    后续连接会被直接拒绝(Windows 上最明显), 于是"端口有人占着"会被误判成"端口空闲"。
+    """
+    import socketserver
+    import threading
+
+    class H(socketserver.BaseRequestHandler):
+        def handle(self):
+            try:
+                self.request.recv(64)
+            except Exception:
+                pass
+
+    class Srv(socketserver.ThreadingTCPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
+    srv = Srv(("127.0.0.1", 0), H)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+
+    def stop():
+        try:
+            srv.shutdown()
+        except Exception:
+            pass
+        try:
+            srv.server_close()
+        except Exception:
+            pass
+
+    return int(srv.server_address[1]), stop
 
 
 class TestConfig(unittest.TestCase):
@@ -447,11 +494,223 @@ class TestLifecycle(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn("collector", p.stdout or "")
 
+    def test_exit_code_soon(self):
+        """秒退的进程必须能被确认退出码(否则手机上会误报成"启动异常")。"""
+        p = subprocess.Popen([sys.executable, "-c", "raise SystemExit(3)"])
+        self.assertEqual(core._exit_code_soon(p, 8.0), 3)
+        q = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            self.assertIsNone(core._exit_code_soon(q, 0.4))
+        finally:
+            q.kill()
+            q.wait(timeout=10)
+
+    def test_svc_port_lookup(self):
+        cfg = core.Config()
+        self.assertEqual(core._svc_port("collector"), int(cfg.data["collector"]["port"]))
+        self.assertEqual(core._svc_port("web"), int(cfg.data["web"]["port"]))
+        self.assertEqual(core._svc_port("scheduler"), 0)
+
+    def test_port_conflict_detected(self):
+        """端口被占用必须能被发现; 能认出占用者是不是自己人。
+
+        手机上"点启动→显示已启动→其实没起来"的根因就是上一份僵死进程还占着端口。
+        """
+        port, stop = tiny_server()
+        try:
+            self.assertTrue(core.port_open(port))
+            conf = core.check_port_free(port, "qqops.collector")
+            self.assertFalse(conf["ok"])
+            self.assertIn("占用", conf["why"])
+            self.assertIn(str(port), conf["why"])
+            self.assertFalse(conf["ours"])          # 占用者是测试进程, 不是 collector
+            if core.proc_net_ok():
+                self.assertEqual(conf["pid"], os.getpid(), conf)
+                # 模块名命中自身命令行 → 认得出"自己人"
+                self.assertTrue(core.check_port_free(port, "smoke")["ours"])
+            else:
+                # Android: /proc/net/tcp 被禁, 只能如实说"定位不到", 不能瞎猜
+                self.assertIsNone(conf["pid"])
+                self.assertIn("无法定位", conf["why"])
+        finally:
+            stop()
+        self.assertFalse(core.check_port_free(port, "qqops.collector"))
+
+    def test_reclaim_refuses_foreign_port(self):
+        """端口被别的程序占着 → 必须明确拒绝, 而不是拉起一个必然秒退的进程。"""
+        port, stop = tiny_server()
+        try:
+            bad, note = core._reclaim_port("collector", port, "qqops.collector")
+            self.assertTrue(bad, "应拒绝: %r" % (bad,))
+            self.assertIn("占用", bad)
+            self.assertEqual(note, "")
+            self.assertTrue(core.port_open(port), "外部占用者不该被杀掉")
+        finally:
+            stop()
+
+    def _spawn_listener(self, port: int, tag: str, data_dir: str = None):
+        """起一个真的在 accept 的子进程占住端口(tag 会出现在它的命令行里)。
+
+        * 必须真的 accept, 否则 backlog 塞满后连不上, 探测会误判成"端口已释放";
+        * 命令行要带上 `-m <tag>` —— `_own_pids()` 正是按这个形状找自己人的,
+          真实服务就是 `python -m qqops.collector` 这种命令行。
+        """
+        code = ("import socket\n"
+                "s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n"
+                "s.bind(('127.0.0.1',%d));s.listen(8);s.settimeout(0.5)\n"
+                "print('up',flush=True)\n"
+                "while True:\n"
+                "    try:\n"
+                "        c,_=s.accept();c.close()\n"
+                "    except Exception:\n"
+                "        pass\n" % port)
+        env = dict(os.environ)
+        if data_dir is not None:
+            env["QQOPS_DATA"] = data_dir
+        p = subprocess.Popen([sys.executable, "-c", code, "-m", tag], env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.assertEqual(p.stdout.readline().strip(), b"up", "子进程没能占住端口")
+        return p
+
+    def test_reclaim_kills_own_zombie(self):
+        """占用者是我们自己的僵死进程 → 自动回收并给出提示。"""
+        if not owner_identifiable():
+            self.skipTest("本机既读不了 /proc/net/tcp 也没有 pgrep, 无法认定自己人")
+        port = free_port()
+        fake = "qqops.fakecollector"
+        p = self._spawn_listener(port, fake, core.DATA)
+        try:
+            self.assertTrue(core.port_open(port))
+            conf = core.check_port_free(port, fake)
+            self.assertTrue(conf["ours"], conf)
+            self.assertEqual(conf["pid"], p.pid)
+            bad, note = core._reclaim_port("collector", port, fake)
+            self.assertEqual(bad, "")
+            self.assertIn("已回收", note)
+            self.assertIn(str(p.pid), note)
+            self.assertFalse(core.port_open(port))
+        finally:
+            p.kill()
+            p.wait(timeout=10)
+
+    def test_port_owner_needs_same_data_dir(self):
+        """同模块但 QQOPS_DATA 不同 = 另一套实例, 绝不能当僵死进程回收。
+
+        (在真机上跑测试时, 这正是"测试把生产实例干掉"的防线。)
+        """
+        if not owner_identifiable():
+            self.skipTest("本机既读不了 /proc/net/tcp 也没有 pgrep")
+        fake = "qqops.fakecollector"
+        port = free_port()
+        p = self._spawn_listener(port, fake, os.path.join(TMP, "other-install-data"))
+        try:
+            conf = core.check_port_free(port, fake)
+            self.assertFalse(conf["ours"], conf)
+            bad, note = core._reclaim_port("collector", port, fake)
+            self.assertTrue(bad, "不该回收另一套实例")
+            self.assertEqual(note, "")
+            self.assertTrue(core.port_open(port), "那个实例必须还活着")
+        finally:
+            p.kill()
+            p.wait(timeout=10)
+        port2 = free_port()
+        p2 = self._spawn_listener(port2, fake, core.DATA)
+        try:
+            self.assertTrue(core.check_port_free(port2, fake)["ours"])
+        finally:
+            p2.kill()
+            p2.wait(timeout=10)
+
+    def test_legacy_pidfiles_cleaned(self):
+        """旧版本遗留的 run/qqops.<模块>.pid 必须被清掉, 且不碰现行 <服务>.pid。"""
+        core.ensure_dirs()
+        legacy = os.path.join(core.RUN_DIR, "qqops.collector.pid")
+        cur = os.path.join(core.RUN_DIR, "collector.pid")
+        with open(legacy, "w") as f:
+            f.write("9245")
+        with open(cur, "w") as f:
+            f.write(str(os.getpid()))
+        try:
+            core.ensure_dirs()
+            self.assertFalse(os.path.exists(legacy), "遗留 PID 文件没清掉")
+            self.assertTrue(os.path.exists(cur), "现行 PID 文件被误删")
+        finally:
+            for p in (legacy, cur):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
+    def test_watchdog_healthy_right_after_start(self):
+        """看门狗刚启动就必须是可判定的健康状态(先落心跳再体检)。
+
+        手机上真踩过: 首轮体检要好几秒, 期间 service_health 判成"没心跳" →
+        `qqops start` 报出假的"watchdog 启动异常"。
+        """
+        if not POSIX:
+            self.skipTest("依赖 pgrep 与 /proc")
+        cfg = core.Config()
+        cfg.set_values({"watchdog": {"enabled": False, "interval": 15}})   # 只测心跳, 不拉起服务
+        core.state_set("watchdog_beat", 0)
+        p = subprocess.Popen([sys.executable, "-m", "qqops.watchdog"], cwd=ROOT,
+                             env=self._env(), stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        try:
+            h = core.service_health("watchdog", timeout=20)
+            self.assertTrue(h["ok"], h)
+            self.assertGreater(int(core.state_get("watchdog_beat", 0) or 0), 0)
+        finally:
+            p.kill()
+            p.wait(timeout=10)
+
     def _env(self):
         env = dict(os.environ)
         env["QQOPS_DATA"] = TMP
         env["TZ"] = "Asia/Shanghai"
         return env
+
+
+class TestPackaging(unittest.TestCase):
+    """打包器: 清单完整, 且权限位必须显式写入(Windows 上打包不能丢执行位)。"""
+
+    def _packer(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("qqops_pack",
+                                                      os.path.join(ROOT, "pack.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_mode_for_executables(self):
+        m = self._packer()
+        for rel in ("bin/qqops", "install.sh", "uninstall.sh", "pack.sh",
+                    "tools/android-keepalive.sh"):
+            self.assertEqual(m.mode_for(rel), 0o755, rel)
+        for rel in ("qqops/core.py", "VERSION", "config.example.json", "README.md"):
+            self.assertEqual(m.mode_for(rel), 0o644, rel)
+
+    def test_items_all_exist(self):
+        m = self._packer()
+        for item in m.ITEMS:
+            self.assertTrue(os.path.exists(os.path.join(ROOT, item)), "包里缺 %s" % item)
+        self.assertIn("tests", m.ITEMS)          # 手机上也要能自测
+        self.assertNotIn("data", m.ITEMS)        # 数据不能被包进去
+
+    def test_tarball_roundtrip_keeps_modes(self):
+        """真打一次包再读回来: 执行位必须在包里(不再依赖解包后 chmod)。"""
+        m = self._packer()
+        out_dir = os.path.join(TMP, "packout")       # 不用 mkdtemp: 本机沙箱会拒绝
+        try:
+            path = m.build(out_dir, verbose=False)
+            with tarfile.open(path) as tf:
+                modes = {ti.name.split("/", 1)[1]: ti.mode for ti in tf.getmembers()
+                         if "/" in ti.name and ti.isfile()}
+            self.assertEqual(modes.get("bin/qqops"), 0o755, modes.get("bin/qqops"))
+            self.assertEqual(modes.get("qqops/core.py"), 0o644)
+            self.assertIn("tests/smoke.py", modes)
+            self.assertNotIn("data/config.json", modes)
+        finally:
+            shutil.rmtree(out_dir, ignore_errors=True)
 
 
 class TestConsistency(unittest.TestCase):

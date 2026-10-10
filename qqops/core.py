@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 import secrets
 
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 
 HOME = os.path.expanduser("~")
 BASE = os.environ.get("QQOPS_HOME") or os.path.join(HOME, "qqops")
@@ -108,8 +108,27 @@ LINK_BLOCK = ("localhost", "127.", "0.0.0.0", "10.", "192.168.", "172.16.", "172
 
 
 def ensure_dirs() -> None:
-    for d in (DATA, LOG_DIR, REPORT_DIR, BACKUP_DIR):
+    for d in (DATA, LOG_DIR, REPORT_DIR, BACKUP_DIR, RUN_DIR):
         os.makedirs(d, exist_ok=True)
+    _clean_legacy_pidfiles()
+
+
+def _clean_legacy_pidfiles() -> None:
+    """清掉旧版本遗留的 `qqops.<模块>.pid`。
+
+    现在的 PID 文件是 `run/<服务名>.pid`(见 pid_path); 旧版本按模块名写过一批,
+    它们指向早已死掉(且可能被复用)的 PID。stop_service 不会读它们, 但留着会误导排查,
+    所以每次初始化目录时顺手删掉。
+    """
+    try:
+        for f in os.listdir(RUN_DIR):
+            if f.startswith("qqops.") and f.endswith(".pid"):
+                try:
+                    os.remove(os.path.join(RUN_DIR, f))
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 def atomic_write(path: str, text: str) -> None:
@@ -1107,8 +1126,13 @@ def service_health(name: str, cfg: Config | None = None, timeout: float = 12.0) 
         return {"ok": False, "why": "进程不存在"}
     end = time.time() + timeout
     if name == "watchdog":
-        beat = int(state_get("watchdog_beat", 0) or 0)
-        return {"ok": now() - beat < 180, "why": "心跳 %s" % (fmt_ts(beat) if beat else "无")}
+        beat = 0
+        while time.time() < end:                 # 刚启动时首轮体检还没跑完, 要等一等
+            beat = int(state_get("watchdog_beat", 0) or 0)
+            if beat and now() - beat < 180:
+                return {"ok": True, "why": "心跳 %s" % fmt_ts(beat)}
+            time.sleep(1)
+        return {"ok": False, "why": "心跳 %s" % (fmt_ts(beat) if beat else "无")}
     if name == "scheduler":
         while time.time() < end:
             beat = int(state_get("scheduler_beat", 0) or 0)
@@ -1128,17 +1152,247 @@ def service_health(name: str, cfg: Config | None = None, timeout: float = 12.0) 
     return {"ok": False, "why": "进程在但端口 %d 无应答" % port}
 
 
+def _cmdline(pid: int) -> str:
+    """读某进程的完整命令行(拿不到就返回空串)。"""
+    try:
+        with open("/proc/%d/cmdline" % int(pid), "rb") as f:
+            return f.read().decode("utf-8", "replace").replace("\0", " ").strip()
+    except Exception:
+        return ""
+
+
 def _pid_alive_and_matches(pid: int, mod: str) -> bool:
     """校验 PID 文件里的进程是否真的是我们的服务。
 
     重启后 PID 会被复用 —— 不校验就可能杀掉别人的进程。
     """
     try:
-        with open("/proc/%d/cmdline" % int(pid), "rb") as f:
-            cmd = f.read().decode("utf-8", "replace")
-        return mod in cmd
+        os.kill(int(pid), 0)                       # 先确认真的还活着
     except Exception:
         return False
+    return bool(mod) and mod in _cmdline(pid)
+
+
+def kill_pid(pid: int, sig: int = 15) -> bool:
+    try:
+        os.kill(int(pid), sig)
+        return True
+    except Exception:
+        return False
+
+
+def _pid_environ(pid: int) -> dict:
+    """读某进程的环境变量(Termux 同 uid 可读; 读不到就返回空)。"""
+    try:
+        with open("/proc/%d/environ" % int(pid), "rb") as f:
+            raw = f.read().decode("utf-8", "replace")
+    except Exception:
+        return {}
+    out = {}
+    for kv in raw.split("\0"):
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            out[k] = v
+    return out
+
+
+_PROC_NET_OK = None
+
+
+def proc_net_ok() -> bool:
+    """本机能否读 /proc/net/tcp(Android 上普通应用被系统禁止, 只能退回 pgrep)。"""
+    global _PROC_NET_OK
+    if _PROC_NET_OK is None:
+        try:
+            with open("/proc/net/tcp") as f:
+                f.readline()
+            _PROC_NET_OK = True
+        except Exception:
+            _PROC_NET_OK = False
+    return bool(_PROC_NET_OK)
+
+
+def port_owner(port: int) -> dict:
+    """查出监听某 TCP 端口的进程(纯 stdlib)。
+
+    桌面 Linux 上: /proc/net/tcp 里有监听套接字的 inode, 再到 /proc/<pid>/fd 反查即可。
+    Android 上 /proc/net/tcp 是 Permission denied(lsof/fuser/ss 同样读不了),
+    这时返回 {} —— 调用方改用 _own_pids() 按"命令行 + 数据目录"判断是不是自己人。
+    """
+    try:
+        want = "%04X" % int(port)
+    except Exception:
+        return {}
+    if not proc_net_ok():
+        return {}
+    inodes = set()
+    for f in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(f) as fh:
+                next(fh, None)                     # 跳过表头
+                for line in fh:
+                    p = line.split()
+                    if len(p) < 10 or p[3] != "0A":   # 0A = LISTEN
+                        continue
+                    if p[1].rsplit(":", 1)[-1].upper() == want:
+                        inodes.add(p[9])
+        except Exception:
+            continue
+    if not inodes:
+        return {}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        d = "/proc/%s/fd" % pid
+        try:
+            for fd in os.listdir(d):
+                try:
+                    tgt = os.readlink(os.path.join(d, fd))
+                except Exception:
+                    continue
+                if tgt.startswith("socket:[") and tgt[8:-1].strip("]") in inodes:
+                    return {"pid": int(pid), "cmd": _cmdline(int(pid)),
+                            "env": _pid_environ(int(pid))}
+        except Exception:
+            continue
+    return {}
+
+
+def _own_pids(mod: str) -> list:
+    """本套实例的服务进程(模块名命中 + QQOPS_DATA 一致), **完全不看端口**。
+
+    手机上没有端口反查能力, 这是唯一可靠的"这是不是我们自己人"判据;
+    数据目录必须一致, 否则会把另一套实例(比如真机上跑的测试)当成僵死进程杀掉。
+    """
+    out, skip = [], {os.getpid()} | _ancestor_pids()
+    for p in _run(["pgrep", "-f", "[-]m %s" % mod], 8).split():
+        if not p.strip().isdigit():
+            continue
+        pid = int(p)
+        if pid in skip or pid in out:
+            continue
+        other = (_pid_environ(pid) or {}).get("QQOPS_DATA")
+        if other:
+            try:
+                if os.path.realpath(other) != os.path.realpath(DATA):
+                    continue
+            except Exception:
+                continue
+        out.append(pid)
+    return out
+
+
+def _wait_port_free(port: int, secs: float = 5.0) -> bool:
+    for _ in range(max(1, int(secs))):
+        if not port_open(port):
+            return True
+        time.sleep(1)
+    return not port_open(port)
+
+
+def check_port_free(port: int, mod: str = "") -> dict:
+    """端口预检。返回 {} 表示可用; 否则给出占用者。
+
+    ours=True 说明占用者就是我们自己的同一个模块 —— 那多半是"看起来停了、
+    其实还占着端口"的僵死进程, 是手机上"启动即死"的第一大原因。
+
+    手机上定位不到占用者时(见 port_owner), 用 `_own_pids` 兜底: 只要存在
+    "同一模块 + 同一数据目录"的进程, 就认定端口是我们的僵死进程占着, 可以回收。
+    """
+    if not port or not port_open(port):
+        return {}
+    own = port_owner(port)
+    pid, cmd, env = own.get("pid"), own.get("cmd", ""), own.get("env") or {}
+    same_data = True
+    if env.get("QQOPS_DATA"):
+        try:
+            same_data = os.path.realpath(env["QQOPS_DATA"]) == os.path.realpath(DATA)
+        except Exception:
+            same_data = False
+    ours = bool(mod and mod in cmd and same_data)
+    cands = _own_pids(mod) if mod else []
+    if not pid and cands:                       # 手机: 反查不到, 但确实有本套实例在跑
+        ours, pid, cmd = True, cands[0], _cmdline(cands[0])
+    if pid:
+        who = "(pid %s %s)" % (pid, cmd[:70])
+    elif proc_net_ok():
+        who = "(占用者未知)"
+    else:
+        who = "(手机上无法定位占用者: /proc/net/tcp 被系统禁止)"
+    if cands:
+        who += " [本套实例进程 %s]" % ",".join(str(x) for x in cands)
+    return {"ok": False, "port": port, "pid": pid, "cmd": cmd, "ours": ours,
+            "cands": cands, "why": "端口 %d 已被占用 %s" % (port, who)}
+
+
+def _svc_port(name: str) -> int:
+    """服务监听的端口(collector/web 才有; 其它返回 0)。"""
+    key = {"collector": "collector", "web": "web"}.get(name)
+    if not key:
+        return 0
+    try:
+        return int(Config().data[key]["port"])
+    except Exception:
+        return 0
+
+
+def _write_pidfile(name: str, pid: int) -> None:
+    try:
+        os.makedirs(RUN_DIR, exist_ok=True)
+        with open(pid_path(name), "w") as f:
+            f.write(str(int(pid)))
+    except Exception:
+        pass
+
+
+def _find_pid(mod: str) -> int:
+    """pgrep -f 找到的第一个 pid(找不到返回 0)。"""
+    for p in _run(["pgrep", "-f", "[-]m %s" % mod], 8).split():
+        if p.strip().isdigit():
+            return int(p)
+    return 0
+
+
+def _reclaim_port(name: str, port: int, mod: str) -> tuple:
+    """回收被自己僵死进程占着的端口。返回 (错误说明, 提示语), 两者最多一个非空。"""
+    if not port or not port_open(port):
+        return "", ""
+    conf = check_port_free(port, mod)
+    if not conf:
+        return "", ""
+    if not conf.get("ours"):
+        return "%s。请先停掉占用该端口的程序(或改端口)" % conf["why"], ""
+    pids = list(conf.get("cands") or [])
+    if conf.get("pid") and conf["pid"] not in pids:
+        pids.append(conf["pid"])
+    if not pids:
+        return "%s。定位不到占用进程, 请手工处理(可先 qqops stop 或重启 Termux)" % conf["why"], ""
+    note = "已回收占用端口 %d 的僵死进程 pid %s; " % (port, ",".join(str(p) for p in pids))
+    for pid in pids:
+        kill_pid(pid, 15)
+    if _wait_port_free(port, 5):
+        return "", note
+    for pid in pids:
+        kill_pid(pid, 9)
+    if _wait_port_free(port, 2):
+        return "", note
+    return "%s 且强杀 pid %s 后仍未释放" % (conf["why"], ",".join(str(p) for p in pids)), ""
+
+
+def _exit_code_soon(p, secs: float = 3.0):
+    """在 secs 秒内确认子进程是否已退出; 还在跑则返回 None。
+
+    手机上解释器启动/退出都比桌面慢, 单次 poll 会漏掉"刚变成僵尸"的瞬间,
+    于是"秒退"会被误报成"起来了但端口没应答"。
+    """
+    end = time.time() + secs
+    while True:
+        rc = p.poll()
+        if rc is not None:
+            return rc
+        if time.time() >= end:
+            return None
+        time.sleep(0.3)
 
 
 def start_service(name: str, wait: float = 25.0) -> str:
@@ -1149,8 +1403,16 @@ def start_service(name: str, wait: float = 25.0) -> str:
     if pgrep("[-]m %s" % mod):
         h = service_health(name, timeout=6)
         if h["ok"]:
+            pid = _find_pid(mod)                          # 认领已有进程, 保证之后停得掉
+            if pid:
+                _write_pidfile(name, pid)
             return "%s 已在运行(%s)" % (name, h["why"])
-        return "%s 进程在但状态异常: %s(可用 qqops restart %s 修)" % (name, h["why"], name)
+    # 端口预检: 上一份僵死进程占着端口会让新进程秒退, 这是"启动不完全"的头号原因
+    port, note = _svc_port(name), ""
+    if port:
+        bad, note = _reclaim_port(name, port, mod)
+        if bad:
+            return "%s 启动失败: %s" % (name, bad)
     ensure_dirs()
     os.makedirs(RUN_DIR, exist_ok=True)
     logf = os.path.join(LOG_DIR, "%s.log" % mod.split(".")[-1])
@@ -1162,25 +1424,32 @@ def start_service(name: str, wait: float = 25.0) -> str:
                                  start_new_session=True)
     except Exception as e:
         return "%s 启动失败(无法创建进程): %s" % (name, e)
-    try:
-        with open(pid_path(name), "w") as f:
-            f.write(str(p.pid))
-    except Exception:
-        pass
+    _write_pidfile(name, p.pid)
     while time.time() - t0 < wait:
         if p.poll() is not None:                      # 进程自己退了 → 明确报失败
-            return "%s 启动失败(进程秒退, 退出码 %s)。日志尾部: %s" % (
-                name, p.returncode, tail(logf, 3).replace("\n", " | ")[-300:])
+            return "%s启动失败(进程秒退, 退出码 %s)。日志尾部: %s" % (
+                note, p.returncode, tail(logf, 3).replace("\n", " | ")[-300:])
         if pgrep("[-]m %s" % mod):
             break
         time.sleep(0.5)
     else:
-        return "%s 启动失败(%.0f 秒内没起来)。日志尾部: %s" % (
-            name, wait, tail(logf, 3).replace("\n", " | ")[-300:])
+        return "%s启动失败(%.0f 秒内没起来)。日志尾部: %s" % (
+            note, wait, tail(logf, 3).replace("\n", " | ")[-300:])
+    # 手机上解释器启动慢: pgrep 命中时进程可能正在退出, 这里必须再确认一次,
+    # 否则会把"秒退"误报成"起来了但端口没应答"。
+    rc = p.poll()
+    if rc is not None:
+        return "%s启动失败(进程已退出, 退出码 %s)。日志尾部: %s" % (
+            note, rc, tail(logf, 3).replace("\n", " | ")[-300:])
     h = service_health(name, timeout=max(4.0, wait - (time.time() - t0)))
     if h["ok"]:
-        return "%s 已启动 (pid %s, %s)" % (name, p.pid, h["why"])
-    return "%s 启动异常: %s。日志尾部: %s" % (name, h["why"], tail(logf, 4).replace("\n", " | ")[-300:])
+        return "%s%s 已启动 (pid %s, %s)" % (note, name, p.pid, h["why"])
+    rc = _exit_code_soon(p, 3.0)          # 端口没应答: 先确认它是不是已经退出了
+    if rc is not None:
+        return "%s启动失败(进程已退出, 退出码 %s)。日志尾部: %s" % (
+            note, rc, tail(logf, 3).replace("\n", " | ")[-300:])
+    return "%s%s 启动异常: %s。日志尾部: %s" % (note, name, h["why"],
+                                            tail(logf, 4).replace("\n", " | ")[-300:])
 
 
 def stop_service(name: str) -> str:
@@ -1192,10 +1461,7 @@ def stop_service(name: str) -> str:
         except Exception:
             pid = 0
         if pid and (not mod or _pid_alive_and_matches(pid, mod)):
-            try:
-                os.kill(pid, 15)
-            except Exception:
-                pass
+            kill_pid(pid, 15)
         try:
             os.remove(pf)
         except Exception:
@@ -1204,11 +1470,18 @@ def stop_service(name: str) -> str:
         kill_pattern("[-]m %s" % mod)
         for _ in range(6):
             if not pgrep("[-]m %s" % mod):
-                return "%s 已停止" % name
+                break
             time.sleep(1)
-        kill_pattern("[-]m %s" % mod, sig=9)
-        time.sleep(1)
-        return "%s 已停止(强制)" % name
+        else:
+            kill_pattern("[-]m %s" % mod, sig=9)
+            time.sleep(1)
+        # 端口残留回收: 进程没了但端口还占着, 下次启动就会秒退
+        port = _svc_port(name)
+        if port and port_open(port):
+            own = port_owner(port)
+            if own.get("pid") and mod in own.get("cmd", ""):
+                kill_pid(own["pid"], 9)
+                _wait_port_free(port, 3)
     return "%s 已停止" % name
 
 
