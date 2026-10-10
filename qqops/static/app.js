@@ -80,6 +80,14 @@ function toast(msg, kind) {
   q(document, '#toasts').appendChild(el);
   setTimeout(() => el.remove(), 4200);
 }
+/* 数据没拿到时不留白(设计规范: 失败只降级, 不白屏)。
+   会话过期/服务刚重启/接口报错都会走到这里, 复用 errState 的错误卡片 + 一键重试。 */
+function failCard(v, msg) {
+  v.innerHTML = errState(msg || '接口没有返回数据',
+    '常见原因: 令牌/会话过期(用带 ?token= 的地址重新打开) · 服务刚重启(等几秒再重试) · 接口报错(运维 → 日志里有对应记录)。');
+  wireRetry(v, () => { try { render(); } catch (e) { report('retry', e.message); } });
+  return null;
+}
 function modal(title, html) {
   q(document, '#modal-title').textContent = title;
   q(document, '#modal-body').innerHTML = html;
@@ -265,6 +273,10 @@ VIEWS.dashboard = async (v) => {
   const up = Object.values(svc).filter(s => s && s.running).length;
   const total = Object.keys(svc).length;
   const bad = cr.total || 0;
+  const rt = d.runtime || {}, pw = d.power || {};
+  const modeBadge = rt.alive
+    ? (rt.mode === 'single' ? '单进程' : '多进程') + ' · ' + (POWER_CN[pw.power_mode] || pw.power_mode || '')
+    : '';
   if (bad > 0) {
     setBanner(`最近有 <b>${bad}</b> 次异常记录 — <a href="#/ops">到运维页看异常账本</a>`, bad > 20 ? 'bad' : 'warn');
   } else { setBanner(''); }
@@ -272,6 +284,7 @@ VIEWS.dashboard = async (v) => {
     <div class="row"><span class="hdot ${up === total && total ? 'ok' : (up ? 'warn' : 'bad')}"></span>
       <b style="font-size:16px">${up}/${total} 个服务在运行</b>
       <span class="muted">版本 ${esc(d.version)} · ${esc((pl.loaded || 0) + ' 个插件已加载')}${pl.failed ? ` · <span class="err">${pl.failed} 个失败</span>` : ''}</span>
+      ${modeBadge ? `<span class="pill">${esc(modeBadge)}</span>` : ''}
       <span class="right row">
         <button class="primary" id="qa-sum">立即总结</button>
         <button id="qa-reload">重载插件</button>
@@ -665,7 +678,7 @@ python tests/smoke.py               自测(改代码后跑)</pre>`)
     </div>`);
 };
 VIEWS.overview = async (v) => {
-  const d = await api('/api/overview'); if (!d || !d.stats) return;
+  const d = await api('/api/overview'); if (!d || !d.stats) return failCard(v, '概览接口没有返回数据(/api/overview)');
   const s = d.stats, st = d.services, np = d.napcat || {};
   const kpi = (l, val, sub) => `<div class="card kpi"><div class="l">${l}</div><div class="v">${val}</div><div class="sub">${sub || ''}</div></div>`;
   const kinds = Object.entries(s.kinds || {}).slice(0, 5).map(([k, c]) => `<span class="pill">${esc(k)} ${c}</span>`).join(' ');
@@ -761,7 +774,7 @@ VIEWS.plan = async (v) => {
   const qs = new URLSearchParams({status: planState.status, kind: planState.kind,
     group: planState.group, q: planState.q, soon: planState.soon ? '1' : '0', limit: '300'});
   const [d, mem] = await Promise.all([api('/api/events?' + qs), api('/api/memory')]);
-  if (!d) return;
+  if (!d) return failCard(v, '待办接口没有返回数据(/api/events)');
   const st = d.stats || {by_status: {}, by_kind: {}, due_7d: 0, overdue: 0};
   const gs = [...new Map((d.events || []).map(e => [e.group_id, e.group_name || e.group_id])).entries()];
   const kpi = (l, val, sub) => `<div class="card kpi"><div class="l">${l}</div><div class="v">${val}</div><div class="sub">${sub || ''}</div></div>`;
@@ -882,6 +895,7 @@ let msgState = {hours: 24, group: '', kind: '', q: '', page: 1, size: 50};
 VIEWS.messages = async (v) => {
   const [g, res] = await Promise.all([api('/api/groups'), api(`/api/messages?${new URLSearchParams(msgState)}`)]);
   const gs = (g && g.groups) || [];
+  if (!res) return failCard(v, '消息接口没有返回数据(/api/messages)');
   v.innerHTML = `
     <div class="card"><div class="row">
       <select id="f-hours">${[1, 6, 24, 72, 168, 720].map(h => `<option value="${h}" ${h == msgState.hours ? 'selected' : ''}>近 ${h} 小时</option>`).join('')}</select>
@@ -921,7 +935,7 @@ VIEWS.messages = async (v) => {
 
 /* ------------------------------------------------------------------ 群组 */
 VIEWS.groups = async (v) => {
-  const d = await api('/api/groups?refresh=1'); if (!d) return;
+  const d = await api('/api/groups?refresh=1'); if (!d) return failCard(v, '群组接口没有返回数据(/api/groups)');
   const gs = d.groups || [];
   v.innerHTML = `
     <div class="card"><div class="row">
@@ -965,7 +979,7 @@ VIEWS.groups = async (v) => {
 /* ------------------------------------------------------------------ 任务 */
 VIEWS.tasks = async (v) => {
   const [d, s] = await Promise.all([api('/api/runs?limit=80'), api('/api/schedule')]);
-  if (!d) return;
+  if (!d) return failCard(v, '任务接口没有返回数据(/api/runs)');
   const sc = (s && s.schedule) || {};
   const nx = (s && s.next) || {};
   const mins = nx.ts ? Math.max(0, Math.round((nx.ts - Date.now() / 1000) / 60)) : null;
@@ -1033,7 +1047,7 @@ VIEWS.tasks = async (v) => {
 
 /* ------------------------------------------------------------------ 报告 */
 VIEWS.reports = async (v) => {
-  const d = await api('/api/reports'); if (!d) return;
+  const d = await api('/api/reports'); if (!d) return failCard(v, '报告列表没有返回数据(/api/reports)');
   v.innerHTML = `<div class="card"><div class="row">
       <b>报告格式</b>
       <a class="btn" href="/api/export.xlsx">导出表格(Excel)</a>
@@ -1062,7 +1076,7 @@ const LOG_CN = {collector: '采集器', scheduler: '调度器', web: '控制台'
 const logName = (n) => LOG_CN[n] || n;
 let logName_ = 'collector';
 VIEWS.logs = async (v) => {
-  const d = await api('/api/logs?name=' + encodeURIComponent(logName_) + '&lines=300'); if (!d) return;
+  const d = await api('/api/logs?name=' + encodeURIComponent(logName_) + '&lines=300'); if (!d) return failCard(v, '日志接口没有返回数据(/api/logs)');
   v.innerHTML = `<div class="card"><div class="row">
       ${(d.available || ['collector']).map(n => `<button class="${n === d.name ? 'primary' : ''}" data-log="${n}">${logName(n)}</button>`).join('')}
       <span class="muted">当前: ${logName(d.name)}（文件 ${esc(d.name)}.log）</span>
@@ -1151,7 +1165,7 @@ const CFG_NOTE = {
 };
 
 VIEWS.config = async (v) => {
-  const d = await api('/api/config'); if (!d) return;
+  const d = await api('/api/config'); if (!d) return failCard(v, '配置接口没有返回数据(/api/config)');
   const cfg = d.config;
   const isSecret = (k) => ['token', 'secret', 'api_key'].includes(k);
   const label = (s, k) => (CFG_CN[s] || {})[k] || null;
@@ -1228,9 +1242,10 @@ VIEWS.config = async (v) => {
 };
 
 /* ------------------------------------------------------------------ 运维 */
-const OPS_TABS = [['svc', '服务'], ['crash', '异常账本'], ['log', '实时日志'], ['self', '自检'], ['backup', '备份与维护']];
+const OPS_TABS = [['svc', '服务'], ['res', '资源与功耗'], ['crash', '异常账本'],
+                  ['log', '实时日志'], ['self', '自检'], ['backup', '备份与维护']];
 const _opsLegacy = async (v) => {
-  const d = await api('/api/overview?hours=1'); if (!d) return;
+  const d = await api('/api/overview?hours=1'); if (!d) return failCard(v, '服务状态没有返回数据(/api/overview)');
   v.innerHTML = `
     <div class="grid k2">
       <div class="card"><h3>进程与端口 <span class="muted">进程号 / 内存 / 运行时长</span></h3>
@@ -1342,11 +1357,86 @@ VIEWS.ops = async (v) => {
   });
   const box = q(v, '#ops-body');
   if (opsTab === 'svc') return _opsLegacy(box);
+  if (opsTab === 'res') return _opsRes(box);
   if (opsTab === 'crash') return _opsCrash(box);
   if (opsTab === 'log') return _opsLog(box);
   if (opsTab === 'self') return _opsSelf(box);
   return _opsBackup(box);
 };
+/* --------------------------------------------- 运维: 资源与功耗(进程合并/低功耗) */
+const MODE_CN = {single: '单进程(省内存)', multi: '多进程(隔离好)', auto: '自动'};
+const POWER_CN = {performance: '性能', balanced: '均衡', saver: '省电'};
+async function _opsRes(box) {
+  const d = await api('/api/ops/resources');
+  if (!d) { box.innerHTML = errState('资源数据读取失败'); wireRetry(box, render); return; }
+  const rt = d.runtime || {}, prof = d.power || {}, tot = d.totals || {};
+  const mb = n => (n / 1048576).toFixed(1) + ' MB';
+  const mode = rt.mode || 'multi';
+  const cur = prof.power_mode || 'balanced';
+  const svc = (d.services || []).map(s => `<div class="it">
+      <span class="pill ${s.running ? 'ok' : 'bad'}"><span class="dot ${s.running ? 'ok' : 'bad'}"></span>${s.running ? '运行' : '停'}</span>
+      <b style="width:76px">${esc(svcName(s.name))}</b>
+      <span class="muted">${s.pid ? '进程号 ' + s.pid : ''}${s.port ? ' · 端口 ' + s.port : ''}</span>
+      <span class="right muted">${s.rss ? mb(s.rss) : ''}</span></div>`).join('');
+  const procs = (d.processes || []).map(p => `<div class="it">
+      <b>pid ${p.pid}</b>${p.self ? '<span class="pill">当前进程</span>' : ''}
+      <span class="muted ellip">${esc(p.cmd || '')}</span>
+      <span class="right muted">${p.rss ? mb(p.rss) : ''}${p.etime ? ' · ' + esc(p.etime) : ''}</span></div>`).join('');
+  const est = d.estimate || {};
+  box.innerHTML = `<div class="grid k2">
+    ${card('运行形态', `<div class="row" style="margin-bottom:8px">
+        <span class="pill ${mode === 'single' ? 'ok' : ''}">${esc(MODE_CN[mode] || mode)}</span>
+        ${rt.pid ? `<span class="pill">pid ${rt.pid}</span>` : ''}
+        <span class="pill">本机 QQOps 进程 ${tot.count || 0} 个</span>
+        <span class="pill">合计内存 ${mb(tot.rss || 0)}</span>
+      </div>
+      <div class="row">
+        <button data-mode="single" ${mode === 'single' ? 'disabled' : ''}>合并为单进程</button>
+        <button data-mode="multi" ${mode === 'multi' ? 'disabled' : ''}>切回多进程</button>
+        <button data-mode="auto">跟随平台</button>
+      </div>
+      <div class="muted" style="margin-top:8px">
+        单进程 = 采集/调度/控制台/看门狗 共用一个解释器(手机上省 ~25MB×3);
+        多进程 = 各自独立, 一个崩了不影响其它。切换会自动重启实例。
+      </div>`, '进程合并')}
+    ${card('功耗档位', `<div class="row" style="margin-bottom:8px">
+        <span class="pill ${cur === 'saver' ? 'ok' : ''}">${esc(POWER_CN[cur] || cur)}</span>
+        <span class="muted">${esc(prof.desc || '')}</span></div>
+      <div class="row">${['saver', 'balanced', 'performance'].map(k =>
+        `<button data-power="${k}" ${cur === k ? 'disabled' : ''}>${POWER_CN[k]}${k === 'saver' ? '(低功耗)' : ''}</button>`).join('')}</div>
+      <div class="list" style="margin-top:10px">
+        <div class="it"><b>调度间隔</b><span class="right muted">${prof.scheduler_tick} 秒</span></div>
+        <div class="it"><b>主管/看门狗间隔</b><span class="right muted">${prof.watchdog_interval} 秒</span></div>
+        <div class="it"><b>控制台自动刷新</b><span class="right muted">${prof.console_refresh} 秒</span></div>
+        <div class="it"><b>SQLite 缓存</b><span class="right muted">${prof.sqlite_cache_kb} KB</span></div>
+        <div class="it"><b>图片/链接抓取</b><span class="right muted">${prof.defer_enrich ? '夜间窗口 ' + esc(prof.enrich_window) : '收到就抓'}</span></div>
+        <div class="it"><b>日志安静模式</b><span class="right muted">${prof.log_quiet ? '只记 WARN+' : 'INFO 起'}</span></div>
+      </div>`, '越低越省电')}
+  </div>
+  ${card('服务内存', `<div class="list">${svc || '<div class="muted">无</div>'}</div>`,
+    `单进程模式下它们共享同一个 PID · 本进程 ${mb(d.self_rss || 0)}`)}
+  ${card('本机 QQOps 进程', `<div class="list">${procs || '<div class="muted">(读取不到 /proc, Windows 下仅显示当前进程)</div>'}</div>`)}
+  ${est.note ? card('合并的效果', `<div class="muted">${esc(est.note)}</div>
+    <div class="list" style="margin-top:8px">
+      <div class="it"><b>当前合计</b><span class="right">${mb(est.current || 0)}</span></div>
+      ${est.single_expected ? `<div class="it"><b>预计合并后</b><span class="right">约 ${mb(est.single_expected)}</span></div>` : ''}
+      ${est.multi_equivalent ? `<div class="it"><b>若拆成四进程</b><span class="right muted">约 ${mb(est.multi_equivalent)}</span></div>` : ''}
+    </div>`) : ''}
+  ${d.profiles ? card('三档对照', `<div class="list">${Object.entries(d.profiles).map(([k, v]) =>
+    `<div class="it"><b style="width:70px">${esc(v.label)}</b><span class="muted ellip">${esc(v.desc)}</span>
+     <span class="right row"><button data-power="${k}" ${cur === k ? 'disabled' : ''}>切到此档</button></span></div>`).join('')}</div>`) : ''}`;
+  const apply = async (patch) => {
+    const r = await api('/api/ops/power', {method: 'POST', body: JSON.stringify(patch)});
+    if (!r || !r.ok) return toast((r && r.error) || '切换失败', 'bad');
+    toast('已应用: ' + JSON.stringify(r.applied) + ' · ' + (r.restart || ''), 'ok');
+    if (r.restart && String(r.restart).indexOf('已触发') === 0) {
+      toast('实例正在重启, 8 秒后自动刷新…', 'warn');
+      setTimeout(() => location.reload(), 8000);
+    } else { setTimeout(render, 1500); }
+  };
+  box.querySelectorAll('[data-mode]').forEach(b => b.onclick = () => apply({mode: b.dataset.mode}));
+  box.querySelectorAll('[data-power]').forEach(b => b.onclick = () => apply({power_mode: b.dataset.power}));
+}
 async function _opsCrash(box) {
   const d = await api('/api/app/crashes?limit=80');
   if (!d) { box.innerHTML = errState('异常账本读取失败'); wireRetry(box, render); return; }

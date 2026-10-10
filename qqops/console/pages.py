@@ -216,6 +216,88 @@ def register(app) -> list:
                                            if m.get("status") not in ("ok", "done")]), 0)
         return out
 
+    # ------------------------------------------------------------ 资源与功耗
+    def resources(req, ctx):
+        """内存/线程/进程 + 当前功耗档位。手机上看"合并进程到底省了多少"。"""
+        cfg = ctx.cfg
+        inst = core.instance_status(cfg)
+        prof = inst["power"]
+        procs = core.qqops_processes()
+        svc_rows = []
+        seen = set()
+        for n, s in (inst["services"] or {}).items():
+            if n == "napcat":
+                continue
+            svc_rows.append({"name": n, "running": bool(s.get("running")), "pid": s.get("pid") or 0,
+                             "rss": s.get("rss") or 0, "port": s.get("port") or 0,
+                             "mode": s.get("mode") or inst["mode"]})
+            if s.get("pid"):
+                seen.add(int(s["pid"]))
+        total = sum(p.get("rss") or 0 for p in procs)
+        single = next((p.get("rss") or 0 for p in procs if "qqops.runner" in (p.get("cmd") or "")), 0)
+        est = {}
+        if inst["mode"] == "single":
+            est = {"note": "当前已是单进程: 四个服务共享一个解释器, 不再重复占用内存",
+                   "current": total, "multi_equivalent": max(total * 3, total + 3 * 25 * 1048576)}
+        else:
+            est = {"note": "切成单进程大约能省下一个解释器的份额(每进程 ≈25MB)",
+                   "current": total, "single_expected": max(total - 3 * 25 * 1048576, 25 * 1048576)}
+        return {"runtime": {k: inst.get(k) for k in ("mode", "running_mode", "pid", "alive", "rss")},
+                "power": prof, "services": svc_rows, "processes": procs,
+                "totals": {"rss": total, "count": len(procs), "unique_pids": len(seen)},
+                "estimate": est, "self_rss": core.self_rss(),
+                "threads": (ctx.bus and ctx.bus.state().get("workers") or 0),
+                "profiles": prof.get("all_profiles") or {}}
+
+    def power_set(req, ctx):
+        """切换运行模式 / 功耗档位, 然后重启实例使其生效。
+
+        注意: 控制台进程本身就是被重启的对象 —— 所以**先把配置写好并回复**,
+        再用分离进程执行重启, 前端延迟刷新页面。
+        """
+        data = req.json() if hasattr(req, "json") else {}
+        patch = {}
+        if str(data.get("mode") or "") in ("auto", "single", "multi"):
+            patch["mode"] = str(data["mode"])
+        if str(data.get("power_mode") or "") in ("performance", "balanced", "saver"):
+            patch["power_mode"] = str(data["power_mode"])
+        if not patch:
+            return {"ok": False, "error": "没有可应用的改动(可选 mode / power_mode)"}
+        cfg = core.Config()
+        cfg.set_values({"runtime": patch})
+        new_cfg = core.Config()
+        out = {"ok": True, "applied": patch,
+               "power": core.power_profile(new_cfg),
+               "runtime_mode": core.resolve_mode(new_cfg)}
+        if data.get("restart", True):
+            out["restart"] = _spawn_restart()
+        else:
+            out["restart"] = "已保存(未重启, 下次启动生效)"
+        return out
+
+    def _spawn_restart() -> str:
+        """分离式重启实例: 不在当前进程里 stop(会把回复也带走)。"""
+        base = core._base_dir()
+        import subprocess
+        import sys
+        script = os.path.join(base, "bin", "qqops")
+        try:
+            if os.path.isfile(script) and os.name != "nt":
+                subprocess.Popen(["bash", script, "restart"], cwd=base,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 stdin=subprocess.DEVNULL, start_new_session=True)
+                return "已触发重启(bin/qqops restart)"
+        except Exception as e:                       # noqa: BLE001
+            errors.record("console.restart", exc=e, kind="restart_spawn_failed")
+        try:
+            subprocess.Popen([sys.executable, "-m", "qqops.svc", "restart"], cwd=base,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             stdin=subprocess.DEVNULL, start_new_session=True)
+            return "已触发重启(python -m qqops.svc restart)"
+        except Exception as e:                       # noqa: BLE001
+            errors.record("console.restart", exc=e, kind="restart_spawn_failed")
+            return "触发重启失败: %s" % e
+
     # ------------------------------------------------------------ 注册
     add("/api/app/status", app_status, title="应用状态")
     add("/api/app/handlers", app_handlers, title="处理器清单")
@@ -234,5 +316,7 @@ def register(app) -> list:
     add("/api/plugins/command", plugin_command, methods=("POST",), title="执行插件命令")
     add("/api/ops/tasks", tasks_state, title="任务列表")
     add("/api/ops/tasks/run", task_run, methods=("POST",), title="立即执行任务")
+    add("/api/ops/resources", resources, title="资源与功耗")
+    add("/api/ops/power", power_set, methods=("POST",), title="切换模式/档位")
     add("/api/ops/dashboard", dashboard, title="仪表盘")
     return paths

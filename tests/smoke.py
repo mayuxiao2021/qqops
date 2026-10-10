@@ -38,6 +38,7 @@ sys.path.insert(0, ROOT)
 
 from qqops import (collector, core, extract, fileread, linkfetch, media, render,  # noqa: E402
                    summarizer, svc, tools, watchdog, webapp)
+from qqops import runner as runner_mod                                           # noqa: E402
 from qqops.framework import app as fw_app                                        # noqa: E402
 from qqops.framework import bus as fw_bus                                        # noqa: E402
 from qqops.framework import errors as fw_errors                                  # noqa: E402
@@ -2445,6 +2446,197 @@ class TestAssistantPlugin(unittest.TestCase):
         empty = fw_llm.LLM()
         self.assertFalse(empty.configured)
         self.assertFalse(empty.chat([{"role": "user", "content": "hi"}]).ok)
+
+
+class TestRuntimePower(unittest.TestCase):
+    """进程合并 + 功耗档位 + 资源优化。
+
+    真机上踩过的点: 四个 Python 进程各自 ~25MB(≈100MB), 手机上很吃紧;
+    合并成一个进程 + 按档位收紧 SQLite 缓存/唤醒间隔, 才能既省内存又省电。
+    """
+
+    def set_cfg(self, patch: dict):
+        cfg = core.Config()
+        cfg.set_values(patch)
+        return core.Config()
+
+    def setUp(self):
+        # runtime 段每个用例都从默认值开始: 否则上一个用例写的覆盖会串到下一个(真踩过)
+        cfg = core.Config()
+        cfg.set_values({"runtime": dict(core.DEFAULT_CONFIG["runtime"])})
+        core.apply_power_profile(core.Config())
+
+    def test_power_profiles_differ(self):
+        seen = {}
+        for mode in ("performance", "balanced", "saver"):
+            cfg = self.set_cfg({"runtime": {"power_mode": mode}})
+            p = core.power_profile(cfg)
+            self.assertEqual(p["power_mode"], mode)
+            seen[mode] = (p["scheduler_tick"], p["watchdog_interval"], p["console_refresh"],
+                          p["sqlite_cache_kb"], p["defer_enrich"], p["log_quiet"])
+        self.assertLess(seen["performance"][0], seen["saver"][0], "省电档调度应更疏")
+        self.assertLess(seen["performance"][1], seen["saver"][1], "省电档主管间隔应更长")
+        self.assertLess(seen["performance"][3], 1000 * 100, seen)
+        self.assertGreater(seen["performance"][3], seen["saver"][3], "省电档 SQLite 缓存更小")
+        self.assertTrue(seen["saver"][4], "省电档应把富化推到夜间")
+        self.assertFalse(seen["balanced"][4])
+        self.assertEqual(len(set(seen.values())), 3, "三档必须真的不同: %s" % (seen,))
+
+    def test_power_override_and_invalid_fallback(self):
+        cfg = self.set_cfg({"runtime": {"power_mode": "saver", "scheduler_tick": 7,
+                                        "defer_enrich": False, "sqlite_cache_kb": 512}})
+        p = core.power_profile(cfg)
+        self.assertEqual(p["scheduler_tick"], 7, "用户显式配置优先于档位预设")
+        self.assertFalse(p["defer_enrich"])
+        self.assertEqual(p["sqlite_cache_kb"], 512)
+        p2 = core.power_profile(self.set_cfg({"runtime": {"power_mode": "不存在的档"}}))
+        self.assertEqual(p2["power_mode"], "balanced", "非法档位应回退 balanced")
+        self.assertTrue(p2["all_profiles"])
+
+    def test_resolve_mode_auto_by_platform(self):
+        cfg = core.Config()
+        cfg.set_values({"runtime": {"mode": "auto"}})
+        self.assertEqual(core.resolve_mode(core.Config(), android=True), "single",
+                         "手机上 auto 应解析为单进程(省内存)")
+        self.assertEqual(core.resolve_mode(core.Config(), android=False), "multi")
+        cfg.set_values({"runtime": {"mode": "multi"}})
+        self.assertEqual(core.resolve_mode(core.Config(), android=True), "multi", "显式配置优先")
+        cfg.set_values({"runtime": {"mode": "乱写"}})
+        self.assertIn(core.resolve_mode(core.Config(), android=False), ("single", "multi"))
+
+    def test_enrich_window(self):
+        cfg = self.set_cfg({"runtime": {"power_mode": "saver",
+                                        "enrich_window": "02:00-06:00"}})
+        c = core.Config()
+        p = core.power_profile(c)
+        self.assertTrue(p["defer_enrich"])
+        import datetime
+        def ts(h, m=0):
+            d = datetime.datetime.now().replace(hour=h, minute=m, second=0, microsecond=0)
+            return d.timestamp()
+        self.assertTrue(core.should_enrich_now(c, ts(3)), "夜间窗口内应允许富化")
+        self.assertFalse(core.should_enrich_now(c, ts(12)), "白天应跳过富化")
+        # 跨零点窗口
+        c2 = self.set_cfg({"runtime": {"enrich_window": "23:00-05:00"}})
+        self.assertTrue(core.should_enrich_now(c2, ts(1)))
+        self.assertTrue(core.should_enrich_now(c2, ts(23, 30)))
+        self.assertFalse(core.should_enrich_now(c2, ts(12)))
+        # 非省电档永远允许
+        c3 = self.set_cfg({"runtime": {"power_mode": "performance"}})
+        self.assertTrue(core.should_enrich_now(c3, ts(12)))
+
+    def test_sqlite_cache_follows_profile(self):
+        core.apply_power_profile(self.set_cfg({"runtime": {"power_mode": "saver"}}))
+        con = core.Store().conn()
+        try:
+            self.assertEqual(int(con.execute("PRAGMA cache_size").fetchone()[0]), -1000)
+            self.assertGreater(int(con.execute("PRAGMA busy_timeout").fetchone()[0]), 0)
+        finally:
+            con.close()
+        core.apply_power_profile(self.set_cfg({"runtime": {"power_mode": "performance"}}))
+        con = core.Store().conn()
+        try:
+            self.assertEqual(int(con.execute("PRAGMA cache_size").fetchone()[0]), -8000)
+        finally:
+            con.close()
+        core.apply_power_profile(core.Config())
+
+    def test_instance_status_shape(self):
+        st = core.instance_status(core.Config())
+        for k in ("mode", "running_mode", "pid", "alive", "services", "power", "beats"):
+            self.assertIn(k, st)
+        for n in ("collector", "scheduler", "web", "watchdog"):
+            self.assertIn(n, st["services"])
+        self.assertIn(st["mode"], ("single", "multi"))
+
+    def test_lazy_imports_keep_memory_small(self):
+        """控制台/调度进程不该顺带拉起 summarizer(它连带 media/linkfetch/extract/render)。"""
+        code = ("import sys; import qqops.webapp, qqops.scheduler; "
+                "print('summarizer' in str([m for m in sys.modules if 'summarizer' in m]))")
+        p = subprocess.run([sys.executable, "-c", code], cwd=ROOT,
+                           env={**os.environ, "QQOPS_DATA": TMP},
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=90)
+        self.assertEqual(p.returncode, 0, p.stderr[-400:])
+        self.assertIn("False", p.stdout, "webapp/scheduler 顶部不该导入 summarizer: %s" % p.stdout)
+
+    def test_runner_supervision_decisions(self):
+        """主管的判定逻辑: 线程死了→重启; 反复退出→熔断; 退避期内→等待。"""
+        runner = runner_mod.Runner(cfg=core.Config(), services=("collector", "web"))
+        calls = []
+        runner._spawn = lambda name: (calls.append(name), True)[1]
+
+        class Dead:
+            def is_alive(self):
+                return False
+
+        runner.threads["collector"] = Dead()
+        runner.threads["web"] = Dead()
+        res1 = dict((n, (s, m)) for n, s, m in runner.supervise_once())
+        self.assertEqual(res1["collector"][0], "restarted", res1)
+        self.assertIn("collector", calls)
+        # 立刻再判一次: 同一线程仍"死", 但退避时间没到 → 等待, 不无限重启
+        runner.threads["collector"] = Dead()
+        res2 = dict((n, (s, m)) for n, s, m in runner.supervise_once())
+        self.assertEqual(res2["collector"][0], "waiting", res2)
+        # 窗口内失败到阈值 → 熔断
+        for _ in range(6):
+            runner.backoff.fail("collector")
+        runner.threads["collector"] = Dead()
+        res3 = dict((n, (s, m)) for n, s, m in runner.supervise_once())
+        self.assertEqual(res3["collector"][0], "crash_loop", res3)
+        self.assertIn("watchdog", res3)
+        self.assertEqual(res3["watchdog"][0], "ok")
+
+    def test_single_process_instance_end_to_end(self):
+        """单进程模式: 一个进程同时提供采集口与控制台, 状态里四个服务共享同一 PID。"""
+        cfg = core.Config()
+        col_port, web_port = free_port(), free_port()
+        cfg.set_values({"collector": {"port": col_port}, "web": {"port": web_port},
+                        "runtime": {"mode": "single", "power_mode": "saver"}})
+        core.apply_power_profile(core.Config())
+        msg = core.start_instance(core.Config(), wait=45, mode="single")
+        try:
+            self.assertIn("已启动", msg, msg)
+            rt = core.runtime_state()
+            self.assertEqual(rt["mode"], "single")
+            self.assertTrue(rt["alive"], rt)
+            pid = int(rt["pid"])
+            # 四个服务共享同一个 PID(这就是"合并进程"的证据)
+            st = core.service_status(core.Config())
+            for n in ("collector", "scheduler", "web", "watchdog"):
+                self.assertEqual(int(st[n]["pid"]), pid, "%s 应属于同一个进程: %s" % (n, st[n]))
+                self.assertEqual(st[n]["mode"], "single")
+                self.assertTrue(st[n]["running"], "%s 应为运行中: %s" % (n, st[n]))
+            if POSIX:
+                self.assertGreater(st["collector"]["rss"], 0)
+            # 健康检查走单进程分支: 端口/心跳
+            self.assertTrue(core.service_health("collector", core.Config(), timeout=6)["ok"])
+            self.assertTrue(core.service_health("web", core.Config(), timeout=6)["ok"])
+            time.sleep(1)
+            self.assertTrue(core.service_health("scheduler", core.Config(), timeout=10)["ok"])
+            self.assertTrue(core.service_health("watchdog", core.Config(), timeout=10)["ok"])
+            # 端到端: 往采集口发一条消息, 必须落库
+            ev = {"post_type": "message", "message_type": "group", "group_id": 7777,
+                  "user_id": 5, "message_id": 700001, "time": int(time.time()),
+                  "raw_message": "单进程模式端到端测试",
+                  "message": [{"type": "text", "data": {"text": "单进程模式端到端测试"}}],
+                  "sender": {"nickname": "单进程"}}
+            req = urllib.request.Request("http://127.0.0.1:%d/" % col_port,
+                                         data=json.dumps(ev, ensure_ascii=False).encode(),
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                self.assertEqual(r.status, 200)
+            rows = core.Store().messages(group="7777", q="单进程模式端到端", hours=1)["rows"]
+            self.assertEqual(len(rows), 1, "单进程模式下采集口仍要能落库")
+            # 控制台接口可用(同一进程内)
+            with urllib.request.urlopen("http://127.0.0.1:%d/health" % web_port, timeout=10) as r:
+                self.assertEqual(r.status, 200)
+        finally:
+            stopped = core.stop_instance(core.Config())
+            self.assertIn("停止", stopped, stopped)
+        self.assertFalse(core.runtime_state()["alive"], "停止后运行清单必须失效")
+        self.assertFalse(core.port_open(col_port), "采集口应已释放")
 
 
 if __name__ == "__main__":

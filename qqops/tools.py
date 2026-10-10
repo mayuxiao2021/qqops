@@ -127,7 +127,19 @@ def cmd_doctor(_a) -> int:
     n = st.stats(24)
     chk("消息", n["total"] >= 0, "总计 %d 条, 近24h %d 条" % (n["total"], n["window"]))
     print("服务")
-    svc = core.service_status(cfg)
+    inst = core.instance_status(cfg)
+    prof = inst["power"]
+    print("  [%-3s] %-22s %s" % ("OK " if inst["alive"] else "!! ", "运行形态",
+                                "%s(配置 %s)%s" % (inst["mode"], (cfg.data.get("runtime") or {}).get("mode", "auto"),
+                                                 " · 已运行 pid %s · %.1f MB" % (inst["pid"], inst["rss"] / 1048576.0)
+                                                 if inst["alive"] else " · 未运行")))
+    print("  [%-3s] %-22s %s" % ("OK ", "功耗档位",
+                                "%s(%s): 调度 %ds / 主管 %ds / 控制台刷新 %ds / SQLite %dKB / 富化 %s"
+                                % (prof["power_mode"], prof["label"], prof["scheduler_tick"],
+                                   prof["watchdog_interval"], prof["console_refresh"],
+                                   prof["sqlite_cache_kb"],
+                                   "夜间窗口" if prof["defer_enrich"] else "收到就抓")))
+    svc = inst["services"]
     for k, v in svc.items():
         chk(k, v["running"], "端口 %s" % (v["port"] or "-"))
     chk("采集口监听", core.port_open(cfg.data["collector"]["port"]),

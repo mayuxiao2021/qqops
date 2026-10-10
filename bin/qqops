@@ -47,6 +47,10 @@ print("  定时    : %s %s" % (
 print("  全文索引: %s" % ("可用 · %d 条" % store.fts_count() if store.fts_ok else "不可用(退化为 LIKE)"))
 PY
     ) ;;
+  mode)
+    svc mode "${1:-}" ;;
+  power|lowpower)
+    svc power "${1:-}" ;;
   extras)  svc extras ;;
   watchdog)
     sub="${1:-once}"
@@ -85,13 +89,18 @@ QQOps 控制脚本 v$(cat "$BASE/VERSION" 2>/dev/null || echo '?')
   qqops start            启动 采集器/调度器/控制台
   qqops stop             停止全部
   qqops restart          重启全部
-  qqops status           状态(进程/端口/消息量/关注群/定时/全文索引)
+  qqops status           状态(模式/档位/进程/端口/消息量/关注群/定时/全文索引)
   qqops url              打印控制台地址(含令牌)
-  qqops logs [name]      跟踪日志: collector|scheduler|web|summarizer
+  qqops logs [name]      跟踪日志: collector|scheduler|web|summarizer|runner
   qqops summary [--dry-run] [--hours 24]   手动总结
   qqops backup           立即备份数据库与配置
   qqops prune --days N   清理 N 天前的消息
   qqops doctor           环境与链路自检
+
+  资源与功耗:
+  qqops mode [auto|single|multi]   运行形态: 单进程(省内存) / 多进程(隔离好)
+  qqops power [saver|balanced|performance]   功耗档位(切换后自动重启实例)
+  qqops status                     会打印当前模式、内存与生效的档位参数
 
   旁路服务(可选组件):
   qqops extras                  查看 NapCat / AstrBot 状态

@@ -18,12 +18,15 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import core, extract, fileread, linkfetch, media, render, summarizer
+from . import core
 from .console import pages as console_pages
 from .framework import errors
 from .framework.app import QQOpsApp
 from .framework.web import ROUTER, Request, Response
 
+# 注意: 这里**故意不导入** summarizer/render/media/linkfetch —— 它们会连带拉起
+# media/linkfetch/extract/fileread 等一大堆模块, 而控制台大多数请求根本用不到。
+# 手机上每个进程的内存都是实打实的, 需要的地方在函数里再 import(见各调用点注释)。
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 APP = None                    # QQOpsApp(框架装配后的实例, 由 main() 赋值)
 
@@ -312,7 +315,9 @@ class Handler(BaseHTTPRequestHandler):
             if not p or not os.path.isfile(p):
                 return self._send(404, b"not found", "text/plain")
             with open(p, "rb") as fh:
-                return self._send(200, fh.read(), media.guess_mime(os.path.basename(p)), cache="private, max-age=3600")
+                from . import media as _media            # 懒加载: 只有取图才需要
+            return self._send(200, fh.read(), _media.guess_mime(os.path.basename(p)),
+                              cache="private, max-age=3600")
         try:
             return self.api_get(path, qs)
         except Exception as e:
@@ -366,14 +371,16 @@ class Handler(BaseHTTPRequestHandler):
             return self.json({"media": store.media_list(int(qs.get("limit", ["60"])[0]),
                                                         qs.get("kind", [""])[0])})
         if path == "/api/export.xlsx":
+            from . import render as _render          # 懒加载: 只有导出才需要
             return self.download(
-                render.xlsx_multi({"事件待办": render.events_rows(store.events(status="all", limit=2000)),
-                                   "链接": render.links_rows(store.links(limit=1000))}, "QQOps"),
+                _render.xlsx_multi({"事件待办": _render.events_rows(store.events(status="all", limit=2000)),
+                                    "链接": _render.links_rows(store.links(limit=1000))}, "QQOps"),
                 "qqops-events.xlsx",
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         if path == "/api/export.docx":
             md = self._latest_report_md(store)
-            return self.download(render.docx_bytes(render.md_to_docx_blocks(md), "QQOps 整理"),
+            from . import render as _render          # 懒加载: 只有导出才需要
+            return self.download(_render.docx_bytes(_render.md_to_docx_blocks(md), "QQOps 整理"),
                                  "qqops-report.docx",
                                  "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
         if path == "/api/report.docx":
@@ -383,15 +390,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json({"error": "报告不存在"}, 404)
             with open(p, encoding="utf-8", errors="replace") as f:
                 md = f.read()
-            return self.download(render.docx_bytes(render.md_to_docx_blocks(md), name),
+            from . import render as _render          # 懒加载
+            return self.download(_render.docx_bytes(_render.md_to_docx_blocks(md), name),
                                  name.replace(".md", "") + ".docx",
                                  "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
         if path == "/api/report.xlsx":
             name = os.path.basename(qs.get("name", [""])[0])
             base = name.rsplit(".", 1)[0]
             return self.download(
-                render.xlsx_multi({"事件待办": render.events_rows(store.events(status="all", limit=2000)),
-                                   "链接": render.links_rows(store.links(limit=1000))},
+                _render.xlsx_multi({"事件待办": _render.events_rows(store.events(status="all", limit=2000)),
+                                    "链接": _render.links_rows(store.links(limit=1000))},
                                   base[:28] or "QQOps"),
                 base + ".xlsx",
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -593,7 +601,8 @@ class Handler(BaseHTTPRequestHandler):
             url = str(body.get("url") or "")
             if not url:
                 return self.json({"error": "缺少 url"}, 400)
-            r = linkfetch.fetch(url, 12, 512_000, 3)
+            from . import linkfetch as _linkfetch    # 懒加载
+            r = _linkfetch.fetch(url, 12, 512_000, 3)
             store.link_update(url, status="ok" if r["ok"] else "failed",
                               title=(r.get("title") or "")[:200], excerpt=(r.get("text") or "")[:4000],
                               error=(r.get("error") or "")[:200], fetched_at=core.now())
@@ -726,7 +735,8 @@ def service_action(cfg: core.Config, name: str, action: str) -> dict:
 def _run_task(kind: str, params: dict) -> None:
     TASK.update({"running": True, "kind": kind, "started": core.now(), "result": None})
     try:
-        res = summarizer.run(hours=params.get("hours"), groups=params.get("groups"),
+        from . import summarizer as _summarizer      # 懒加载: 只有真跑总结才需要
+        res = _summarizer.run(hours=params.get("hours"), groups=params.get("groups"),
                              dry_run=params.get("dry_run", False), no_push=params.get("no_push", False),
                              job="web")
         TASK["result"] = {k: v for k, v in res.items()}
@@ -737,37 +747,52 @@ def _run_task(kind: str, params: dict) -> None:
         TASK["running"] = False
 
 
+def build_server(cfg=None, app=None, host: str = None, port: int = None):
+    """构造控制台 HTTP 服务(不启动)。`main()` 与单进程 runner 共用。
+
+    返回 `(srv, url, app)`。`app` 为 None 时会现场装配一个 console 角色的框架实例。
+    """
+    global APP
+    cfg = cfg or core.Config()
+    core.apply_power_profile(cfg)
+    if app is None:
+        APP = QQOpsApp(name="console", roles=("console",), cfg=cfg,
+                       store=core.Store()).setup()
+        try:
+            n = len(console_pages.register(APP))
+            core.log("web", "INFO", "控制台接口注册 %d 个(含插件路由)" % n)
+        except Exception as e:                   # noqa: BLE001 —— 接口注册失败不该挡住控制台
+            errors.record("web.console_pages", exc=e, kind="register_failed")
+            core.log("web", "ERROR", "控制台接口注册失败: %s" % e)
+        APP.start()
+    else:
+        APP = app
+        try:
+            console_pages.register(APP)
+        except Exception as e:                   # noqa: BLE001
+            errors.record("web.console_pages", exc=e, kind="register_failed")
+    h = host or cfg.data["web"].get("host", "127.0.0.1")
+    p = int(port or cfg.data["web"].get("port", 8091))
+    srv = ThreadingHTTPServer((h, p), Handler)
+    srv.daemon_threads = True
+    h, p = srv.server_address[0], srv.server_address[1]
+    url = "http://%s:%d/?token=%s" % (h, p, cfg.data["web"]["token"])
+    return srv, url, APP
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="QQOps 控制台")
     ap.add_argument("--host", default=None)
     ap.add_argument("--port", type=int, default=None)
     args = ap.parse_args(argv)
     core.ensure_dirs()
-    cfg = core.Config()
-
-    # 框架装配: 控制台进程只注册"路由/页面"角色, 插件的后台任务由调度进程跑
-    global APP
-    APP = QQOpsApp(name="console", roles=("console",), cfg=cfg,
-                   store=core.Store()).setup()
     try:
-        n = len(console_pages.register(APP))
-        core.log("web", "INFO", "控制台接口注册 %d 个(含插件路由)" % n)
-    except Exception as e:                       # noqa: BLE001 —— 接口注册失败不该挡住控制台
-        errors.record("web.console_pages", exc=e, kind="register_failed")
-        core.log("web", "ERROR", "控制台接口注册失败: %s" % e)
-    APP.start()
-
-    host = args.host or cfg.data["web"].get("host", "127.0.0.1")
-    port = args.port or int(cfg.data["web"].get("port", 8091))
-    try:
-        srv = ThreadingHTTPServer((host, port), Handler)
-    except Exception as e:
-        errors.record("web.bind", exc=e, kind="bind_failed",
-                      message="端口 %s 绑定失败" % port)
+        srv, url, app = build_server(port=args.port, host=args.host)
+    except OSError as e:
+        errors.record("web.bind", exc=e, kind="bind_failed", message="控制台端口绑定失败")
         core.log("web", "ERROR", "控制台启动失败: %s" % e)
         print("[webapp] 启动失败: %s" % e, flush=True)
         return 1
-    url = "http://%s:%d/?token=%s" % (host, port, cfg.data["web"]["token"])
     core.log("web", "INFO", "控制台启动 %s" % url)
     print("[webapp] QQOps console: %s" % url, flush=True)
     try:
@@ -776,7 +801,7 @@ def main(argv=None) -> int:
         pass
     finally:
         try:
-            APP.stop()
+            app.stop()
         except Exception:
             pass
     return 0

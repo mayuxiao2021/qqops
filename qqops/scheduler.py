@@ -14,7 +14,7 @@ import os
 import sys
 import time
 
-from . import core, summarizer
+from . import core
 from .framework import errors
 from .framework.app import QQOpsApp
 
@@ -84,6 +84,7 @@ def _do_maintenance(cfg: core.Config, store: core.Store) -> None:
 
 def _run_summary(cfg: core.Config, store: core.Store, label: str, new_msgs: int) -> None:
     """跑一次总结。失败要有清晰记录, 且不能让调度循环崩掉。"""
+    from . import summarizer          # 懒加载: 只有真到点总结时才需要这几个大模块
     try:
         res = summarizer.run(job="schedule:%s" % label)
         core.state_set("last_summary_ts", core.now())
@@ -98,50 +99,106 @@ def _run_summary(cfg: core.Config, store: core.Store, label: str, new_msgs: int)
         core.log("scheduler", "ERROR", "定时总结失败: %s" % e)
 
 
+def tick_once(cfg: core.Config = None, store: core.Store = None, app=None,
+              now_str: str = None) -> dict:
+    """跑一轮调度: 判断是否到点总结 / 维护窗口 / 插件的定时任务。
+
+    返回本轮动作摘要(便于测试与日志)。**永不抛异常** —— 单进程模式下它跑在线程里,
+    一旦抛出会把整个进程带走, 所以这里逐项隔离 + 记账。
+    """
+    cfg = cfg or core.Config()
+    store = store or core.Store()
+    out = {"beat": core.now(), "summary": "", "maintenance": False, "tasks": []}
+    core.beat("scheduler", out["beat"])
+    now_str = now_str or time.strftime("%H:%M")
+    sch = cfg.data.get("schedule", {})
+
+    try:
+        ok, label = _due(cfg, store, now_str)
+        if ok:
+            last = int(core.state_get("last_summary_ts", 0) or 0)
+            new_msgs = store.count_since(last) if last else 10 ** 9
+            need = int(sch.get("min_new_messages", 5) or 0)
+            if sch.get("skip_if_no_new", True) and new_msgs < need:
+                core.log("scheduler", "INFO", "跳过本次(%s): 距上次只有 %d 条新消息(<%d)"
+                         % (label, new_msgs, need))
+                rid = store.run_start("schedule:%s" % label)
+                store.run_finish(rid, "skipped", "无新消息可总结(%d 条 < %d 条)" % (new_msgs, need))
+                out["summary"] = "skipped:%s" % label
+            else:
+                core.log("scheduler", "INFO", "到点触发总结: %s(新消息 %d 条)" % (label, new_msgs))
+                _run_summary(cfg, store, label, new_msgs)
+                out["summary"] = label
+    except Exception as e:                       # noqa: BLE001
+        errors.record("scheduler.summary", exc=e, kind="summary_failed")
+        core.log("scheduler", "ERROR", "总结流程异常: %s" % e)
+
+    try:
+        if now_str == MAINT_AT and _last_run("ran_maint") != _today():
+            _mark("ran_maint")
+            _do_maintenance(cfg, store)
+            out["maintenance"] = True
+    except Exception as e:                       # noqa: BLE001
+        errors.record("scheduler.maintain", exc=e, kind="maintenance_failed")
+
+    try:
+        if app is not None:
+            for res in app.run_due_tasks():
+                out["tasks"].append({"task": res.get("task"), "ok": res.get("ok")})
+    except Exception as e:                       # noqa: BLE001
+        errors.record("scheduler.tasks", exc=e, kind="task_loop_error")
+    return out
+
+
+def loop(stop=None, tick: int = None, app=None) -> None:
+    """调度循环。`stop` 为 threading.Event(单进程 runner 用); 为 None 时永不退出。
+
+    间隔每轮重读配置: 在控制台改"定时/功耗档位"后, 不用重启就能生效。
+    """
+    core.ensure_dirs()
+    store = core.Store()
+    while True:
+        try:
+            cfg = core.Config()
+            t = int(tick or power_tick(cfg))
+            tick_once(cfg, store, app)
+        except Exception as e:                       # noqa: BLE001 —— 循环绝不能死
+            errors.record("scheduler.loop", exc=e, kind="loop_error")
+            core.log("scheduler", "ERROR", "循环异常: %s" % e)
+            t = 30
+        if stop is not None:
+            if stop.wait(max(1, int(t))):
+                return
+        else:
+            time.sleep(max(1, int(t)))
+
+
+def power_tick(cfg: core.Config = None) -> int:
+    """当前档位下的调度间隔(秒)。"""
+    try:
+        return int((core.power_profile(cfg).get("scheduler_tick") or 15))
+    except Exception:
+        return 15
+
+
 def main(argv=None) -> int:
     core.ensure_dirs()
-    core.log("scheduler", "INFO", "调度器启动 (version %s)" % core.VERSION)
+    cfg = core.Config()
+    core.apply_power_profile(cfg)
+    core.log("scheduler", "INFO", "调度器启动 (version %s, 档位 %s, 间隔 %ds)"
+             % (core.VERSION, core.power_profile(cfg)["power_mode"], power_tick(cfg)))
     print("[scheduler] started", flush=True)
     store = core.Store()
     # 框架装配: 调度进程只跑 tasks 角色(插件的定时任务在这里执行)
+    app = None
     try:
         app = QQOpsApp(name="scheduler", roles=("tasks",), cfg=core.Config(),
                        store=store).setup().start()
     except Exception as e:                       # noqa: BLE001
         errors.record("scheduler.app", exc=e, kind="setup_failed")
-        app = None
         core.log("scheduler", "ERROR", "框架装配失败(只跑内置定时): %s" % e)
-
-    while True:
-        try:
-            cfg = core.Config()
-            store = core.Store()
-            core.state_set("scheduler_beat", core.now())
-            now_str = time.strftime("%H:%M")
-            sch = cfg.data.get("schedule", {})
-
-            ok, label = _due(cfg, store, now_str)
-            if ok:
-                last = int(core.state_get("last_summary_ts", 0) or 0)
-                new_msgs = store.count_since(last) if last else 10 ** 9
-                need = int(sch.get("min_new_messages", 5) or 0)
-                if sch.get("skip_if_no_new", True) and new_msgs < need:
-                    core.log("scheduler", "INFO", "跳过本次(%s): 距上次只有 %d 条新消息(<%d)" % (label, new_msgs, need))
-                    rid = store.run_start("schedule:%s" % label)
-                    store.run_finish(rid, "skipped", "无新消息可总结(%d 条 < %d 条)" % (new_msgs, need))
-                else:
-                    core.log("scheduler", "INFO", "到点触发总结: %s(新消息 %d 条)" % (label, new_msgs))
-                    _run_summary(cfg, store, label, new_msgs)
-            if now_str == MAINT_AT and _last_run("ran_maint") != _today():
-                _mark("ran_maint")
-                _do_maintenance(cfg, store)
-            # 插件的定时任务(到点才跑, 失败只记账)
-            if app is not None:
-                app.run_due_tasks()
-        except Exception as e:
-            errors.record("scheduler.loop", exc=e, kind="loop_error")
-            core.log("scheduler", "ERROR", "循环异常: %s" % e)
-        time.sleep(TICK)
+    loop(tick=power_tick(cfg), app=app)
+    return 0
 
 
 if __name__ == "__main__":

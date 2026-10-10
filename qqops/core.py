@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 import secrets
 
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 
 # 路径解析(踩过坑, 别改回 "靠 $HOME 猜"):
 #   曾经用 BASE = ~/qqops —— 但 $HOME 是环境给的, 从别的目录/cron/adb run-as 调用时
@@ -74,6 +74,18 @@ DEFAULT_CONFIG = {
     },
     "retention": {"message_days": 0, "log_max_mb": 4, "backup_keep": 7},
     "watchdog": {"enabled": True, "interval": 60, "manage_extras": False},
+    # 运行形态与资源档位(合并进程 / 低功耗)
+    "runtime": {
+        "mode": "auto",            # auto | single | multi —— single=四服务合并成一个进程
+        "power_mode": "balanced",  # performance | balanced | saver
+        "scheduler_tick": 0,       # 0=按档位(5/15/60 秒)
+        "watchdog_interval": 0,    # 0=按档位(30/60/180 秒)
+        "console_refresh": 0,      # 0=按档位(10/15/60 秒)
+        "defer_enrich": None,      # None=按档位; true=富化(媒体/链接)推到夜间窗口
+        "enrich_window": "02:00-06:00",
+        "sqlite_cache_kb": 0,      # 0=按档位(8000/4000/1000)
+        "log_quiet": None,         # None=按档位; true=只记 WARN 及以上
+    },
     # 智能查询用的模型配置: 留空则回落到上面的 summarizer(base_url/api_key/model 只维护一份)
     "llm": {
         "base_url": "", "api_key": "", "model": "", "temperature": 0.2,
@@ -405,6 +417,8 @@ class Store:
             con.execute("PRAGMA journal_mode=WAL")
             con.execute("PRAGMA synchronous=NORMAL")
             con.execute("PRAGMA busy_timeout=5000")      # 多进程同时写时先等一会儿再报错
+            # 缓存大小按功耗档位给(省电档 1MB, 性能档 8MB): 手机上每个连接都吃内存, 必须收紧
+            con.execute("PRAGMA cache_size=-%d" % max(256, int(_SQLITE_CACHE_KB)))
         except Exception:
             pass
         return con
@@ -423,13 +437,8 @@ class Store:
                 con.close()
             ok = str(detail).lower() in ("ok", "1")
             if not ok:
-                try:
-                    from .framework import errors
-                    errors.record("store.integrity", kind="db_corrupt",
-                                  message="数据库自检未通过: %s" % str(detail)[:200],
-                                  extra={"db": self.path})
-                except Exception:
-                    pass
+                _record_soft("store.integrity", "db_corrupt",
+                             "数据库自检未通过: %s" % str(detail)[:200], {"db": self.path})
                 log("core", "ERROR", "数据库自检未通过: %s" % str(detail)[:200])
             return ok, str(detail)
         except Exception as e:
@@ -1379,6 +1388,282 @@ def pid_path(name: str) -> str:
     return os.path.join(RUN_DIR, "%s.pid" % name)
 
 
+# ---------------------------------------------------------------- 运行形态与功耗档位
+RUNNER_PATH = os.path.join(RUN_DIR, "runner.json")
+
+# 三档功耗预设: 键名与 runtime 配置一一对应, 便于控制台直接展示"当前生效值"
+POWER_PROFILES = {
+    "performance": {
+        "label": "性能", "desc": "响应最快, 资源占用最高",
+        "scheduler_tick": 5, "watchdog_interval": 30, "console_refresh": 10,
+        "defer_enrich": False, "sqlite_cache_kb": 8000, "log_quiet": False,
+    },
+    "balanced": {
+        "label": "均衡", "desc": "默认档位, 日常使用",
+        "scheduler_tick": 15, "watchdog_interval": 60, "console_refresh": 15,
+        "defer_enrich": False, "sqlite_cache_kb": 4000, "log_quiet": False,
+    },
+    "saver": {
+        "label": "省电", "desc": "唤醒次数最少: 定时更疏、富化推到夜间、内存更省",
+        "scheduler_tick": 60, "watchdog_interval": 180, "console_refresh": 60,
+        "defer_enrich": True, "sqlite_cache_kb": 1000, "log_quiet": True,
+    },
+}
+_SQLITE_CACHE_KB = 4000          # 由 apply_power_profile() 按档位设置, Store.conn() 读取
+
+
+def _is_android() -> bool:
+    """Termux/Android 判定: 手机上默认单进程(省内存), 桌面上默认多进程(隔离更好)。"""
+    if os.environ.get("PREFIX", "").find("com.termux") >= 0:
+        return True
+    return os.path.exists("/system/bin/app_process") or os.path.exists("/system/bin/app_process64")
+
+
+def resolve_mode(cfg: Config, android: bool = None) -> str:
+    """把 `runtime.mode` 解析成 single / multi。`auto` = 手机上单进程, 其它多进程。"""
+    try:
+        mode = str((cfg.data.get("runtime") or {}).get("mode") or "auto").lower()
+    except Exception:
+        mode = "auto"
+    if mode in ("single", "multi"):
+        return mode
+    android = _is_android() if android is None else bool(android)
+    return "single" if android else "multi"
+
+
+def power_profile(cfg: Config = None) -> dict:
+    """当前生效的功耗档位参数(用户覆盖 > 档位预设)。"""
+    cfg = cfg or Config()
+    rt = dict((cfg.data.get("runtime") or {}))
+    name = str(rt.get("power_mode") or "balanced").lower()
+    if name not in POWER_PROFILES:
+        name = "balanced"
+    prof = dict(POWER_PROFILES[name])
+    prof["power_mode"] = name
+    for k in ("scheduler_tick", "watchdog_interval", "console_refresh", "sqlite_cache_kb"):
+        v = rt.get(k)
+        try:
+            v = int(v or 0)
+        except Exception:
+            v = 0
+        if v > 0:
+            prof[k] = v
+    for k in ("defer_enrich", "log_quiet"):
+        v = rt.get(k)
+        if v is not None:
+            prof[k] = bool(v)
+    prof["enrich_window"] = str(rt.get("enrich_window") or "02:00-06:00")
+    prof["all_profiles"] = {k: {"label": v["label"], "desc": v["desc"]} for k, v in POWER_PROFILES.items()}
+    return prof
+
+
+def apply_power_profile(cfg: Config = None) -> dict:
+    """进程启动时调用: 把档位里影响全局的设置落实(SQLite 缓存等)。"""
+    global _SQLITE_CACHE_KB
+    prof = power_profile(cfg)
+    try:
+        _SQLITE_CACHE_KB = max(256, int(prof.get("sqlite_cache_kb") or 4000))
+    except Exception:
+        _SQLITE_CACHE_KB = 4000
+    return prof
+
+
+def should_enrich_now(cfg: Config = None, ts: float = None) -> bool:
+    """现在是否该做"贵"的富化(抓图片/抓链接)。
+
+    省电档把富化推到夜间窗口(默认 02:00-06:00), 白天只落库, 晚上批量补 ——
+    这是白天省电最有效的一刀(网络请求 + 图片解码都是耗电大户)。
+    """
+    prof = power_profile(cfg)
+    if not prof.get("defer_enrich"):
+        return True
+    win = str(prof.get("enrich_window") or "02:00-06:00")
+    try:
+        a, b = win.split("-", 1)
+        ah, am = [int(x) for x in a.strip().split(":")]
+        bh, bm = [int(x) for x in b.strip().split(":")]
+    except Exception:
+        return True
+    lt = time.localtime(ts or now())
+    cur = lt.tm_hour * 60 + lt.tm_min
+    start, end = ah * 60 + am, bh * 60 + bm
+    if start <= end:
+        return start <= cur < end
+    return cur >= start or cur < end        # 跨零点窗口
+
+
+def beat(name: str, ts: float = None) -> None:
+    """服务/线程心跳(单进程模式下靠它判断每个服务是否活着)。
+
+    同时写老键(`<name>_beat`, 多进程的 scheduler/watchdog 模块一直用它),
+    这样两种模式的读者看到的是同一次心跳, 不会出现"单进程里调度显示超时"。
+    """
+    t = int(ts or now())
+    state_set("beat_%s" % name, t)
+    if name in ("scheduler", "watchdog"):
+        state_set("%s_beat" % name, t)
+
+
+def last_beat(name: str) -> int:
+    """某服务最近一次心跳: 新键(`beat_x`)与老键(`x_beat`)取较新。"""
+    return max(int(state_get("beat_%s" % name, 0) or 0),
+               int(state_get("%s_beat" % name, 0) or 0))
+
+
+def beats() -> dict:
+    return {n: last_beat(n) for n in ("collector", "scheduler", "web", "watchdog")}
+
+
+def runtime_state() -> dict:
+    """读运行形态清单。返回 `{mode, pid, services, started, version, alive}`。
+
+    多进程模式没有这个文件(靠 pgrep 判断); 单进程模式由 runner 写入并定期刷新。
+    """
+    try:
+        with open(RUNNER_PATH, encoding="utf-8") as f:
+            d = json.load(f) or {}
+    except Exception:
+        return {"mode": "multi", "pid": 0, "services": [], "alive": False}
+    pid = int(d.get("pid") or 0)
+    alive = bool(pid) and _pid_alive(pid)
+    d["alive"] = alive
+    d.setdefault("mode", "single")
+    d.setdefault("services", [])
+    return d
+
+
+def runtime_write(mode: str, services: list, pid: int = None) -> None:
+    try:
+        os.makedirs(RUN_DIR, exist_ok=True)
+        atomic_write(RUNNER_PATH, json.dumps(
+            {"mode": mode, "pid": int(pid or os.getpid()), "services": list(services),
+             "started": now(), "version": VERSION},
+            ensure_ascii=False, indent=1))
+    except Exception as e:
+        log("core", "WARN", "写入运行清单失败: %s" % e)
+
+
+def runtime_clear() -> None:
+    try:
+        if os.path.exists(RUNNER_PATH):
+            os.remove(RUNNER_PATH)
+    except Exception:
+        pass
+
+
+def _record_soft(component: str, kind: str, message: str, extra: dict = None) -> None:
+    """把一条记录写进崩溃账本(拿不到框架层就跳过 —— core 是地基, 不能因记账失败而报错)。"""
+    try:
+        from .framework import errors
+        errors.record(component, kind=kind, message=message, extra=extra)
+    except Exception:
+        pass
+
+
+def _pid_alive(pid: int) -> bool:
+    """进程是否活着。
+
+    两个必须处理的坑:
+      * **Windows**: `os.kill(pid, 0)` 其实是 `TerminateProcess` —— 探活即杀人(踩过),
+        改用 ctypes 的 OpenProcess + GetExitCodeProcess;
+      * **僵尸进程**: 子进程退出、父进程还没 wait 时 `kill(pid, 0)` 依然成功,
+        会把"已经停掉的实例"永远判成活着(踩过: 停止实例误报失败), 所以先看 /proc/<pid>/stat 的状态位。
+    """
+    pid = int(pid or 0)
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        # Windows 两条禁忌:
+        #   1) os.kill(pid, 0) 是 TerminateProcess —— 探活即杀人;
+        #   2) tasklist/wmic/CIM 在受限环境里会被拒。
+        # 所以直接用 ctypes 调 OpenProcess + GetExitCodeProcess(259 = STILL_ACTIVE)。
+        try:
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            k32 = ctypes.windll.kernel32
+            h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                return False
+            try:
+                code = ctypes.c_ulong(0)
+                if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                    return False
+                return code.value == STILL_ACTIVE
+            finally:
+                k32.CloseHandle(h)
+        except Exception:
+            return False
+    try:                                             # Linux: 先确认不是僵尸
+        with open("/proc/%d/stat" % pid) as f:
+            state = f.read().rsplit(")", 1)[-1].split()
+        if state and state[0] == "Z":
+            return False
+    except Exception:
+        pass
+    try:
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def proc_rss(pid: int) -> int:
+    """某进程常驻内存(字节)。Linux/Termux 读 /proc, Windows 返回 0。"""
+    try:
+        with open("/proc/%d/status" % int(pid)) as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return 0
+
+
+def self_rss() -> int:
+    return proc_rss(os.getpid())
+
+
+def _rss_and_etime(pid: int) -> tuple:
+    """RSS + 运行时长(读 /proc, 拿不到就退回 proc_info)。"""
+    rss = proc_rss(pid)
+    etime = ""
+    try:
+        with open("/proc/%d/stat" % int(pid)) as f:
+            parts = f.read().split()
+        start = int(parts[21]) / os.sysconf("SC_CLK_TCK")
+        up = float(open("/proc/uptime").read().split()[0])
+        secs = max(0, int(up - start))
+        etime = "%02d:%02d:%02d" % (secs // 3600, (secs % 3600) // 60, secs % 60)
+    except Exception:
+        pass
+    return rss, etime
+
+
+def _health_single(name: str, cfg: Config, rt: dict, timeout: float = 8.0) -> dict:
+    """单进程模式的健康判定: 主进程活着 + 该服务的信号(端口/心跳)新鲜。"""
+    pid = int(rt.get("pid") or 0)
+    if not pid or not _pid_alive(pid):
+        return {"ok": False, "why": "主进程不在(pid %s)" % (pid or "?")}
+    if name == "watchdog":
+        beat = last_beat("watchdog")
+        return {"ok": beat > 0 and now() - beat < 300,
+                "why": "主管心跳 %s" % (fmt_ts(beat) if beat else "无")}
+    if name == "scheduler":
+        end = time.time() + max(1.0, timeout / 3.0)
+        while True:
+            beat = last_beat("scheduler")
+            if beat and now() - beat < max(90, int(power_profile(cfg)["scheduler_tick"]) * 4):
+                return {"ok": True, "why": "心跳正常"}
+            if time.time() >= end:
+                return {"ok": False, "why": "心跳超时(单进程调度线程可能卡住)"}
+            time.sleep(1)
+    port = int(cfg.data["collector" if name == "collector" else "web"]["port"])
+    if port_open(port):
+        return {"ok": True, "why": "端口 %d 已应答" % port}
+    return {"ok": False, "why": "端口 %d 无应答" % port}
+
+
 def service_health(name: str, cfg: Config | None = None, timeout: float = 12.0) -> dict:
     """真实健康检查: 不只看进程在不在, 还要端口能应答 / 心跳是新的。
 
@@ -1388,24 +1673,28 @@ def service_health(name: str, cfg: Config | None = None, timeout: float = 12.0) 
     mod = SERVICE_MODULES.get(name)
     if not mod:
         return {"ok": False, "why": "未知服务"}
+    rt = runtime_state()
+    if rt.get("mode") == "single" and name in (rt.get("services") or []):
+        return _health_single(name, cfg, rt)
     if not pgrep("[-]m %s" % mod):
         return {"ok": False, "why": "进程不存在"}
     end = time.time() + timeout
     if name == "watchdog":
         beat = 0
         while time.time() < end:                 # 刚启动时首轮体检还没跑完, 要等一等
-            beat = int(state_get("watchdog_beat", 0) or 0)
+            beat = last_beat("watchdog")
             if beat and now() - beat < 180:
                 return {"ok": True, "why": "心跳 %s" % fmt_ts(beat)}
             time.sleep(1)
         return {"ok": False, "why": "心跳 %s" % (fmt_ts(beat) if beat else "无")}
     if name == "scheduler":
+        win = max(90, int(power_profile(cfg)["scheduler_tick"]) * 3)   # 省电档 60s 一跳也要算得过
         while time.time() < end:
-            beat = int(state_get("scheduler_beat", 0) or 0)
-            if now() - beat < 60:
+            beat = last_beat("scheduler")
+            if now() - beat < win:
                 return {"ok": True, "why": "心跳正常"}
             time.sleep(1)
-        return {"ok": False, "why": "心跳超时(60 秒内没有心跳)"}
+        return {"ok": False, "why": "心跳超时(%d 秒内没有心跳)" % win}
     port = int(cfg.data["collector" if name == "collector" else "web"]["port"])
     path = "/health" if name == "web" else "/"
     while time.time() < end:
@@ -1440,8 +1729,31 @@ def _pid_alive_and_matches(pid: int, mod: str) -> bool:
 
 
 def kill_pid(pid: int, sig: int = 15) -> bool:
+    """终止进程。
+
+    Windows 的坑: `os.kill` 内部用 `OpenProcess(PROCESS_ALL_ACCESS)` + `TerminateProcess`,
+    在受限环境下常被拒 —— 于是"看起来停了, 其实还在跑"(真踩过: runner 报已停止但仍在监听端口)。
+    这里改用最小权限 `PROCESS_TERMINATE`, 成功与否如实返回。
+    """
+    pid = int(pid or 0)
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            PROCESS_TERMINATE = 0x0001
+            k32 = ctypes.windll.kernel32
+            h = k32.OpenProcess(PROCESS_TERMINATE, False, pid)
+            if not h:
+                return False
+            try:
+                return bool(k32.TerminateProcess(h, 1))
+            finally:
+                k32.CloseHandle(h)
+        except Exception:
+            return False
     try:
-        os.kill(int(pid), sig)
+        os.kill(pid, sig)
         return True
     except Exception:
         return False
@@ -1846,21 +2158,175 @@ def extra_action(cfg: Config, name: str, action: str) -> str:
     return "未知动作: %s" % action
 
 
+def qqops_processes() -> list:
+    """列出本机上属于 QQOps 的 python 进程(单进程运行器也算一个进程)。
+
+    用于控制台"资源"页: 让人直观看到"合并前 4 个进程 vs 合并后 1 个"。
+    """
+    out = []
+    if os.path.isdir("/proc"):
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                cmd = _cmdline(int(pid))
+                if "python" not in cmd or "qqops." not in cmd:
+                    continue
+                rss, etime = _rss_and_etime(int(pid))
+                out.append({"pid": int(pid), "cmd": cmd[:140], "rss": rss, "etime": etime,
+                            "self": int(pid) == os.getpid()})
+            except Exception:
+                continue
+    elif os.name == "nt":
+        return [{"pid": os.getpid(), "cmd": "python -m qqops.…(Windows 仅供开发)",
+                 "rss": self_rss(), "etime": "", "self": True}]
+    return sorted(out, key=lambda x: -int(x.get("rss") or 0))
+
+
+def instance_status(cfg: Config = None) -> dict:
+    """整套实例的状态(单进程/多进程都适用)。"""
+    cfg = cfg or Config()
+    rt = runtime_state()
+    alive = bool(rt.get("alive"))
+    return {
+        "mode": resolve_mode(cfg),
+        "running_mode": rt.get("mode") if alive else "",
+        "pid": int(rt.get("pid") or 0) if alive else 0,
+        "alive": alive,
+        "rss": proc_rss(rt.get("pid") or 0) if alive else 0,
+        "services": service_status(cfg),
+        "power": power_profile(cfg),
+        "beats": beats(),
+        "restarts": int(state_get("runner_restarts", 0) or 0),
+    }
+
+
+def start_instance(cfg: Config = None, wait: float = 40.0, mode: str = None) -> str:
+    """按运行模式启动整套服务: single=一个 runner 进程, multi=四个服务进程。"""
+    cfg = cfg or Config()
+    ensure_dirs()                           # 日志/run 目录必须先存在(否则起进程时找不到日志文件)
+    mode = (mode or resolve_mode(cfg)).lower()
+    stop_instance(cfg)                      # 先清掉另一种模式的残留, 避免端口打架
+    if mode == "multi":
+        msgs = []
+        for n in ("collector", "scheduler", "web", "watchdog"):   # 看门狗最后起
+            msgs.append(start_service(n))
+        return " | ".join(msgs)
+    # ---- 单进程 ----
+    os.makedirs(RUN_DIR, exist_ok=True)
+    logf = os.path.join(LOG_DIR, "runner.log")
+    t0 = time.time()
+    try:
+        with open(logf, "ab") as out:
+            p = subprocess.Popen([sys.executable, "-m", "qqops.runner"], cwd=_base_dir(),
+                                 stdout=out, stderr=out, stdin=subprocess.DEVNULL,
+                                 start_new_session=True)
+    except Exception as e:
+        return "实例启动失败(无法创建进程): %s" % e
+    runtime_write("single", list(SERVICE_MODULES), p.pid)
+    while time.time() - t0 < wait:
+        if p.poll() is not None:
+            runtime_clear()
+            return ("实例启动失败(进程秒退, 退出码 %s)。日志尾部: %s"
+                    % (p.returncode, tail(logf, 3).replace("\n", " | ")[-300:]))
+        ok_col = _health_single("collector", cfg, {"pid": p.pid})["ok"]
+        ok_web = _health_single("web", cfg, {"pid": p.pid})["ok"]
+        if ok_col and ok_web:
+            return ("单进程实例已启动 (pid %s, 采集口与 控制台 均已应答, 档位 %s)"
+                    % (p.pid, power_profile(cfg)["power_mode"]))
+        time.sleep(1)
+    return ("实例启动异常: %.0f 秒内端口未就绪。日志尾部: %s"
+            % (wait, tail(logf, 4).replace("\n", " | ")[-300:]))
+
+
+def stop_instance(cfg: Config = None) -> str:
+    """停掉整套服务(两种模式都处理; 切换模式时必须先走这里)。"""
+    cfg = cfg or Config()
+    msgs = []
+    rt = runtime_state()
+    pid = int(rt.get("pid") or 0)
+    if rt.get("mode") == "single" and pid:
+        if _pid_alive(pid):
+            kill_pid(pid, 15)                       # 先礼: SIGTERM / TerminateProcess
+            for _ in range(12):
+                if not _pid_alive(pid):
+                    break
+                time.sleep(1)
+            if _pid_alive(pid):
+                kill_pid(pid, 9)                    # 后兵: SIGKILL
+                for _ in range(5):
+                    if not _pid_alive(pid):
+                        break
+                    time.sleep(1)
+            if _pid_alive(pid):
+                msgs.append("单进程实例停止失败(pid %s 仍在运行)" % pid)
+                _record_soft("instance.stop", "stop_failed",
+                             "单进程实例 pid %s 未能停止" % pid)
+            else:
+                msgs.append("单进程实例已停止 (pid %s)" % pid)
+        else:
+            msgs.append("单进程清单已过期(进程不在)")
+    for n in ("watchdog", "collector", "scheduler", "web"):
+        try:
+            if pgrep("[-]m %s" % SERVICE_MODULES[n]):
+                msgs.append(stop_service(n))
+        except Exception:
+            pass
+    # 孤儿 runner: 清单被覆盖/丢失时也要能收拾干净(否则端口被占, 切模式会失败)
+    try:
+        if pgrep("[-]m qqops.runner"):
+            msgs.append("清理残留 runner 进程(%d 个)" % kill_pattern("[-]m qqops.runner"))
+            for _ in range(6):
+                if not pgrep("[-]m qqops.runner"):
+                    break
+                time.sleep(1)
+            kill_pattern("[-]m qqops.runner", sig=9)
+    except Exception:
+        pass
+    runtime_clear()
+    # 等端口真的释放(切模式立刻重启时, 端口没放开就会"启动失败: 地址被占用")
+    for port in (int(cfg.data["collector"].get("port") or 8080),
+                 int(cfg.data["web"].get("port") or 8091)):
+        try:
+            _wait_port_free(port, 5)
+        except Exception:
+            pass
+    return "; ".join(msgs) or "没有正在运行的服务"
+
+
 def service_status(cfg: Config) -> dict:
     web_port = int(cfg.data["web"]["port"])
     col_port = int(cfg.data["collector"]["port"])
     napcat_port = int(cfg.data["push"].get("napcat_api_port", 3000))
+
     def one(name: str, pattern: str, port: int) -> dict:
         info = proc_info(pattern)
         return {"running": bool(info["pid"]), "port": port, "pid": info["pid"],
-                "rss": info["rss"], "etime": info["etime"]}
-    return {
-        "collector": one("collector", "[-]m qqops.collector", col_port),
-        "scheduler": one("scheduler", "[-]m qqops.scheduler", 0),
-        "web": one("web", "[-]m qqops.webapp", web_port),
-        "watchdog": one("watchdog", "[-]m qqops.watchdog", 0),
-        "napcat": one("napcat", "[o]pt/QQ/qq", napcat_port),
-    }
+                "rss": info["rss"], "etime": info["etime"], "mode": "multi"}
+
+    rt = runtime_state()
+    napcat = one("napcat", "[o]pt/QQ/qq", napcat_port)
+    if rt.get("mode") != "single":
+        return {"collector": one("collector", "[-]m qqops.collector", col_port),
+                "scheduler": one("scheduler", "[-]m qqops.scheduler", 0),
+                "web": one("web", "[-]m qqops.webapp", web_port),
+                "watchdog": one("watchdog", "[-]m qqops.watchdog", 0),
+                "napcat": napcat}
+    # 单进程: 四个服务共享一个 PID, 用各自的心跳/端口区分状态
+    pid = int(rt.get("pid") or 0)
+    alive = bool(pid) and _pid_alive(pid)
+    rss, etime = _rss_and_etime(pid) if alive else (0, "")
+    beats_ts = beats()
+    ports = {"collector": col_port, "web": web_port, "scheduler": 0, "watchdog": 0}
+    out = {}
+    for n in ("collector", "scheduler", "web", "watchdog"):
+        fresh = beats_ts.get(n, 0)
+        ok = alive and (fresh == 0 or now() - fresh < 300)
+        out[n] = {"running": bool(ok), "port": ports[n], "pid": pid if alive else 0,
+                  "rss": rss, "etime": etime, "mode": "single",
+                  "beat": fresh, "thread": ok}
+    out["napcat"] = napcat
+    return out
 
 
 def status_snapshot(cfg: Config | None = None) -> dict:
@@ -1872,16 +2338,20 @@ def status_snapshot(cfg: Config | None = None) -> dict:
     nxt = next_run(sch)
     last_ts = int(state_get("last_summary_ts", 0) or 0)
     new_msgs = store.count_since(last_ts) if last_ts else stats["window"]
+    rt = runtime_state()
+    prof = power_profile(cfg)
     return {
         "ts": now(),
         "version": VERSION,
+        "runtime": rt,
+        "power": prof,
         "services": service_status(cfg),
         "extras": extra_status(cfg),
         "ecosystem": ecosystem_ports(cfg),
         "counters": state_get("collector_counters", {}) or {},
         "fts": {"available": store.fts_ok, "rows": store.fts_count()},
-        "scheduler": {"alive": now() - int(state_get("scheduler_beat", 0) or 0) < 60,
-                      "beat": int(state_get("scheduler_beat", 0) or 0),
+        "scheduler": {"alive": now() - last_beat("scheduler") < 60,
+                      "beat": last_beat("scheduler"),
                       "enabled": sch.get("enabled", True),
                       "mode": sch.get("mode") or "daily",
                       "label": nxt.get("label", ""),

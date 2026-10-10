@@ -84,7 +84,7 @@ def main(argv=None) -> int:
     print("[watchdog] started, interval=%ds" % interval, flush=True)
     # 先落一次心跳: 首轮体检要跑好几秒, 不先写心跳的话启动瞬间会被
     # service_health 判成"没心跳", 报出假的"启动异常"(手机上真踩过)。
-    core.state_set("watchdog_beat", core.now())
+    core.beat("watchdog")
     while True:
         try:
             cfg = core.Config()
@@ -95,7 +95,7 @@ def main(argv=None) -> int:
                 for name, state, msg in res:
                     if state != "ok":
                         core.log("watchdog", "WARN", "%s %s: %s" % (name, state, msg))
-            core.state_set("watchdog_beat", core.now())
+            core.beat("watchdog")
             if wd.get("manage_extras"):
                 for ex, spec in core.EXTRAS.items():
                     if not core.pgrep(spec["pattern"]):

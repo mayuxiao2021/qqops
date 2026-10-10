@@ -252,6 +252,20 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def build_server(cfg=None, store=None, app=None, host: str = None, port: int = None):
+    """构造 HTTP 服务(不启动)。`main()` 与单进程 runner 共用同一份实现。"""
+    cfg = cfg or core.Config()
+    store = store or core.Store()
+    Handler.cfg, Handler.store, Handler.app = cfg, store, app
+    if not Handler.counters.get("started"):
+        Handler.counters["started"] = core.now()
+    h = host or cfg.data["collector"].get("host", "127.0.0.1")
+    p = int(port or cfg.data["collector"].get("port", 8080))
+    srv = ThreadingHTTPServer((h, p), Handler)
+    srv.daemon_threads = True
+    return srv
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="QQOps 采集器")
     ap.add_argument("--port", type=int, default=None)
@@ -260,30 +274,28 @@ def main(argv=None) -> int:
 
     core.ensure_dirs()
     cfg = core.Config()
+    core.apply_power_profile(cfg)                  # 按功耗档位设置 SQLite 缓存等全局参数
     store = core.Store()
-    Handler.cfg, Handler.store = cfg, store
-    Handler.counters["started"] = core.now()
 
     # 框架装配: 采集进程只跑 ingest 角色(管线阶段 + 事件处理器)
+    app = None
     try:
-        Handler.app = QQOpsApp(name="collector", roles=("ingest",), cfg=cfg,
-                               store=store).setup().start()
+        app = QQOpsApp(name="collector", roles=("ingest",), cfg=cfg,
+                       store=store).setup().start()
     except Exception as e:                       # noqa: BLE001 —— 框架装配失败也要能收消息
         errors.record("collector.app", exc=e, kind="setup_failed")
         core.log("collector", "ERROR", "框架装配失败(继续以裸采集模式运行): %s" % e)
 
-    host = args.host or cfg.data["collector"].get("host", "127.0.0.1")
-    port = args.port or int(cfg.data["collector"].get("port", 8080))
-
     try:
-        srv = ThreadingHTTPServer((host, port), Handler)
+        srv = build_server(cfg, store, app, args.host, args.port)
     except OSError as e:
         # 端口被占: 明确记账并退出(否则会变成一个"看起来在跑"的空壳)
         errors.record("collector.bind", exc=e, kind="bind_failed",
-                      message="端口 %s:%d 绑定失败" % (host, port))
-        core.log("collector", "ERROR", "绑定 %s:%d 失败: %s" % (host, port, e))
+                      message="端口绑定失败: %s" % e)
+        core.log("collector", "ERROR", "绑定失败: %s" % e)
         print("[collector] 绑定失败: %s" % e, flush=True)
         return 1
+    host, port = srv.server_address[0], srv.server_address[1]
     core.log("collector", "INFO", "监听 http://%s:%d (db=%s)" % (host, port, store.path))
     print("[collector] listening on http://%s:%d  db=%s" % (host, port, store.path), flush=True)
 
@@ -293,8 +305,8 @@ def main(argv=None) -> int:
         core.log("collector", "INFO", "收到退出信号, 正在关闭")
         core.state_set("collector_counters", dict(Handler.counters))
         try:
-            if Handler.app:
-                Handler.app.stop()
+            if app:
+                app.stop()
         except Exception:
             pass
         sys.stdout.flush()

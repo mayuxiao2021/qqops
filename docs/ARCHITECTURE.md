@@ -41,6 +41,7 @@
 │  适配层  adapters/onebot.py   NapCat/OneBot v11(可扩展其它平台) │
 ├──────────────────────────────────────────────────────────────┤
 │  服务层  core/services.py     进程管理/端口/健康/看门狗          │
+│           runner.py          单进程形态: 四服务合并 + 线程主管     │
 └──────────────────────────────────────────────────────────────┘
     基础层  core/{paths,config,store,state,log,errors}.py
 ```
@@ -226,6 +227,24 @@ attempt: 1 → 2 → 3 → 4 ...      delay: 5s → 15s → 45s → 2m → 5m(�
 - 磁盘水位:可用空间 < 500MB → 控制台告警 + 暂停媒体补抓
 - 全局钩子:`sys.excepthook` / `threading.excepthook` / `SIGTERM/SIGINT` → 账本 + 优雅退出
 - 时钟异常:检测到时间回拨(常见于手机)时`,记录并在调度器上做保护
+
+### 5.6 运行形态与功耗(v3.2)
+
+**同一套代码,两种跑法,靠节拍而不是靠砍功能来省电。** 详见 `docs/POWER.md`。
+
+| 形态 | 进程 | 自愈方式 | 心跳 |
+|---|---|---|---|
+| `multi` | collector / webapp / scheduler / watchdog 各一个进程 | watchdog 进程体检 + 拉起 | `<服务>_beat`(state.json) |
+| `single` | 1 个进程(`runner.py`):主线程当主管,collector/web/scheduler 起线程 | 主线程查线程存活 → 退避重启 → 熔断记账 | `beat_<服务>`(主管只给活着的线程写) |
+
+- 形态解析:`runtime.mode = auto|single|multi`,`auto` 在 Android 上选单进程、其它平台选多进程。
+- 心跳读取统一走 `core.last_beat(name)`:新老键取较新,保证两种模式、四个服务判断一致
+  (踩过坑:runner 写 `beat_scheduler`、读取方看 `scheduler_beat` → 单进程下调度被误判超时)。
+- 功耗档位 `runtime.power_mode = performance|balanced|saver` 展开为四个节拍 + 富化窗口 + SQLite 缓存
+  (`scheduler_tick` / `watchdog_interval` / `console_refresh` / `defer_enrich` / `sqlite_cache_kb`);
+  采集始终事件驱动,入库延迟不受档位影响。
+- 懒加载:控制台与调度不再顶层导入总结/渲染/媒体链路,用不到的模块不占常驻内存。
+- 实测真机:4 进程 104.6 MB → 1 进程 27.5 MB(省 74%),端到端与定时任务照常。
 
 ---
 
