@@ -615,12 +615,13 @@ class TestLifecycle(unittest.TestCase):
             self.assertIn("占用", conf["why"])
             self.assertIn(str(port), conf["why"])
             self.assertFalse(conf["ours"])          # 占用者是测试进程, 不是 collector
-            if core.proc_net_ok():
+            if conf.get("pid"):
+                # 能定位到占用者(桌面 Linux 走 /proc/net/tcp, macOS 走 lsof)→ 必须认出是测试进程
                 self.assertEqual(conf["pid"], os.getpid(), conf)
-                # 模块名命中自身命令行 → 认得出"自己人"
+                # 模块名命中自身命令行 → 认得出"自己人"(仅在本机安装记录/环境变量口径一致时)
                 self.assertTrue(core.check_port_free(port, "smoke")["ours"])
             else:
-                # Android: /proc/net/tcp 被禁, 只能如实说"定位不到", 不能瞎猜
+                # Android: /proc/net/tcp 被禁、也没有 lsof, 只能如实说"定位不到", 不能瞎猜
                 self.assertIsNone(conf["pid"])
                 self.assertIn("无法定位", conf["why"])
         finally:
@@ -639,7 +640,7 @@ class TestLifecycle(unittest.TestCase):
         finally:
             stop()
 
-    def _spawn_listener(self, port: int, tag: str, data_dir: str = None):
+    def _spawn_listener(self, port: int, tag: str, data_dir: str = None, pid_file: str = ""):
         """起一个真的在 accept 的子进程占住端口(tag 会出现在它的命令行里)。
 
         * 必须真的 accept, 否则 backlog 塞满后连不上, 探测会误判成"端口已释放";
@@ -661,6 +662,10 @@ class TestLifecycle(unittest.TestCase):
         p = subprocess.Popen([sys.executable, "-c", code, "-m", tag], env=env,
                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self.assertEqual(p.stdout.readline().strip(), b"up", "子进程没能占住端口")
+        if pid_file:                      # 真实服务会写 data/run/<服务>.pid, 这里照做
+            core.ensure_dirs()
+            with open(pid_file, "w", encoding="utf-8") as f:
+                f.write(str(p.pid))
         return p
 
     def test_reclaim_kills_own_zombie(self):
@@ -669,7 +674,8 @@ class TestLifecycle(unittest.TestCase):
             self.skipTest("本机既读不了 /proc/net/tcp 也没有 pgrep, 无法认定自己人")
         port = free_port()
         fake = "qqops.fakecollector"
-        p = self._spawn_listener(port, fake, core.DATA)
+        pidf = core.pid_path("collector")
+        p = self._spawn_listener(port, fake, core.DATA, pid_file=pidf)
         try:
             self.assertTrue(core.port_open(port))
             conf = core.check_port_free(port, fake)
@@ -705,7 +711,9 @@ class TestLifecycle(unittest.TestCase):
             p.kill()
             p.wait(timeout=10)
         port2 = free_port()
-        p2 = self._spawn_listener(port2, fake, core.DATA)
+        # 这一半假装"本机安装记录里的服务进程": 环境变量一致 + pid 文件指向它
+        p2 = self._spawn_listener(port2, fake, core.DATA,
+                                  pid_file=core.pid_path("collector"))
         try:
             self.assertTrue(core.check_port_free(port2, fake)["ours"])
         finally:
@@ -971,9 +979,9 @@ class TestConsistency(unittest.TestCase):
             # 3) 命令行: ps -o command=
             core._run = lambda cmd, timeout=20: "python -m qqops.webapp --port 8091\n"
             self.assertIn("qqops.webapp", core._cmdline(9999))
-            # 4) 父进程: ps -o ppid=
+            # 4) 父进程: ps -o ppid= (直接测兜底函数 —— Linux 上 /proc 分支优先, 走不到这里)
             core._run = lambda cmd, timeout=20: "42\n"
-            self.assertIn(42, core._ancestor_pids())
+            self.assertIn(42, core._ancestor_pids_ps())
             # 5) lsof 解析: p<pid> / c<command>
             core._run = lambda cmd, timeout=20: "p777\ncnginx\nn*:8091\n"
             own = core._port_owner_lsof(8091)
@@ -984,6 +992,21 @@ class TestConsistency(unittest.TestCase):
             core._run = lambda cmd, timeout=20: "12345\n"
             self.assertEqual(core._own_pids("qqops.webapp"), [],
                              "读不到环境变量时不能认领进程(否则可能误杀别人的进程)")
+            # 7) pid 文件是本机安装自己的记录: 即使 env 读不到(macOS), 也要能证明"这是我们的进程"
+            core.ensure_dirs()
+            pidf = core.pid_path("collector")
+            try:
+                with open(pidf, "w", encoding="utf-8") as f:
+                    f.write(str(os.getpid()))
+                self.assertIn(os.getpid(), core._pids_from_pidfiles("qqops.collector"),
+                              "pid 文件里记着的进程应当被认作自己人")
+                self.assertIn(os.getpid(), core._pids_from_pidfiles(),
+                              "不按模块过滤时也要能看到 pid 文件里的进程")
+            finally:
+                try:
+                    os.remove(pidf)
+                except OSError:
+                    pass
         finally:
             core._run, core._pid_environ = real_run, real_env
             core._is_windows = real_iswin
@@ -3058,11 +3081,15 @@ class TestRuntimePower(unittest.TestCase):
             if POSIX:
                 self.assertGreater(st["collector"]["rss"], 0)
             # 健康检查走单进程分支: 端口/心跳
-            self.assertTrue(core.service_health("collector", core.Config(), timeout=6)["ok"])
-            self.assertTrue(core.service_health("web", core.Config(), timeout=6)["ok"])
+            self.assertTrue(core.service_health("collector", core.Config(), timeout=6)["ok"],
+                            "单进程模式下采集口应健康(端口应答)")
+            self.assertTrue(core.service_health("web", core.Config(), timeout=6)["ok"],
+                            "单进程模式下控制台端口应健康")
             time.sleep(1)
-            self.assertTrue(core.service_health("scheduler", core.Config(), timeout=10)["ok"])
-            self.assertTrue(core.service_health("watchdog", core.Config(), timeout=10)["ok"])
+            self.assertTrue(core.service_health("scheduler", core.Config(), timeout=10)["ok"],
+                            "单进程模式下调度线程应有新鲜心跳")
+            self.assertTrue(core.service_health("watchdog", core.Config(), timeout=10)["ok"],
+                            "单进程模式下主管(看门狗角色)应有心跳")
             # 端到端: 往采集口发一条消息, 必须落库
             ev = {"post_type": "message", "message_type": "group", "group_id": 7777,
                   "user_id": 5, "message_id": 700001, "time": int(time.time()),

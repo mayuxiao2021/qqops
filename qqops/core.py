@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 import secrets
 
-VERSION = "3.3.5"
+VERSION = "3.3.6"
 
 # 路径解析(踩过坑, 别改回 "靠 $HOME 猜"):
 #   曾经用 BASE = ~/qqops —— 但 $HOME 是环境给的, 从别的目录/cron/adb run-as 调用时
@@ -1610,16 +1610,22 @@ def _ancestor_pids() -> set:
         except Exception:
             break
     if not out and not _is_windows():           # macOS/BSD: 没有 /proc, 用 ps 往上爬
-        pid = os.getpid()
-        for _ in range(12):
-            raw = _run(["ps", "-o", "ppid=", "-p", str(pid)], 8).strip()
-            if not raw.isdigit():
-                break
-            ppid = int(raw)
-            if ppid <= 1 or ppid in out:
-                break
-            out.add(ppid)
-            pid = ppid
+        out = _ancestor_pids_ps()
+    return out
+
+
+def _ancestor_pids_ps() -> set:
+    """用 `ps -o ppid=` 往上爬父进程链(macOS/BSD 没有 /proc 时用)。"""
+    out, pid = set(), os.getpid()
+    for _ in range(12):
+        raw = _run(["ps", "-o", "ppid=", "-p", str(pid)], 8).strip()
+        if not raw.isdigit():
+            break
+        ppid = int(raw)
+        if ppid <= 1 or ppid in out:
+            break
+        out.add(ppid)
+        pid = ppid
     return out
 
 
@@ -2166,13 +2172,37 @@ def port_owner(port: int) -> dict:
     return {}
 
 
+def _pids_from_pidfiles(mod: str = "") -> list:
+    """从 data/run/*.pid 读出本机安装记录的服务进程(全平台可用的"自己人"凭据)。
+
+    环境变量证明(QQOPS_DATA 比对)更精确, 但 macOS 读不到别人的 environ;
+    pid 文件是我们自己写下的, 不需要任何权限, 所以作为**主凭据**。
+    """
+    out = []
+    for name, m in SERVICE_MODULES.items():
+        try:
+            with open(pid_path(name), encoding="utf-8") as f:
+                pid = int((f.read() or "0").strip() or 0)
+        except Exception:
+            continue
+        if pid <= 0 or not _pid_alive(pid):
+            continue
+        if mod and mod != m:
+            # 模块不匹配时再看命令行(测试用假模块名模拟"别处的服务")
+            if mod not in (_cmdline(pid) or ""):
+                continue
+        out.append(pid)
+    return out
+
+
 def _own_pids(mod: str) -> list:
     """本套实例的服务进程(模块名命中 + QQOPS_DATA 一致), **完全不看端口**。
 
     手机上没有端口反查能力, 这是唯一可靠的"这是不是我们自己人"判据;
     数据目录必须一致, 否则会把另一套实例(比如真机上跑的测试)当成僵死进程杀掉。
     """
-    out, skip = [], {os.getpid()} | _ancestor_pids()
+    skip = {os.getpid()} | _ancestor_pids()
+    out = [x for x in _pids_from_pidfiles(mod) if x not in skip]
     for p in _run(["pgrep", "-f", "[-]m %s" % mod], 8).split():
         if not p.strip().isdigit():
             continue

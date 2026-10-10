@@ -26,13 +26,22 @@ def esc(s: str) -> str:
 
 def parse(log_text: str, limit: int = 8) -> list:
     """返回 [(失败标题, 原因摘要)]。"""
-    lines = log_text.splitlines()
+    lines = log_text.lstrip("\ufeff").splitlines()      # 容忍 BOM(有些工具写日志会带)
     out = []
     for i, line in enumerate(lines):
         if not FAIL_LINE.match(line):
             continue
-        ctx = [x.strip() for x in lines[i + 1:i + 40] if DETAIL.search(x)]
-        out.append((line.strip(), " / ".join(ctx[-3:]) or "(无堆栈)"))
+        stop = min(i + 60, len(lines))
+        ctx = [x.strip() for x in lines[i + 1:stop] if DETAIL.search(x)]
+        detail = " / ".join(ctx[-3:]) or "(无堆栈)"
+        # 多行失败信息(例如 "未在超时内监听\n<子进程输出>\n<日志尾巴>")在异常行**之后** ——
+        # 这些上下文才是定位关键(CI 上日志本身下载不了)。注意 unittest 的 ---- 分隔线在
+        # FAIL 头之后、异常行之前, 不能拿它当结束标志。
+        last = max([j for j in range(i + 1, stop) if DETAIL.search(lines[j])] or [i])
+        extra = [x.strip() for x in lines[last + 1:last + 8] if x.strip()]
+        if extra:
+            detail += " || " + " / ".join(extra)[:800]
+        out.append((line.strip(), detail))
         if len(out) >= limit:
             break
     return out
@@ -51,10 +60,9 @@ def main(argv: list) -> int:
         return 0                      # 不要让"整理日志"这件事把 CI 再搞挂一次
     items = parse(text)
     if not items:
-        # 没有 FAIL/ERROR 行, 说明是启动/导入期就挂了: 把最后几行原样发出去
+        # 没有 FAIL/ERROR 行, 说明是启动/导入期就挂了: 把最后几行原样发出去(别重复输出)
         tail = " / ".join(x.strip() for x in text.splitlines()[-6:] if x.strip())
-        print("::error title=冒烟测试未产生失败详情::%s" % esc(tail[:900] or "(日志为空)"))
-        items = [("(无 FAIL/ERROR 行)", tail[:900])]
+        items = [("冒烟测试未产生失败详情", tail[:900] or "(日志为空)")]
     for name, detail in items:
         print("::error title=%s::%s" % (esc(name[:120]), esc(detail[:900])))
     if "--summary" in argv:
