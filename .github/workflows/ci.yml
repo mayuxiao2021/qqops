@@ -61,21 +61,8 @@ jobs:
           rc=$?
           cat smoke.log
           if [ $rc -ne 0 ]; then
-            # 把失败测试名 + 堆栈行号 + 原因发成 annotation: 日志要登录才能看, annotation 是公开的
-            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
-            import re, sys
-            log = open("smoke.log", encoding="utf-8", errors="replace").read().splitlines()
-            def esc(s):
-                return s.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
-            hits = [i for i, l in enumerate(log) if re.match(r"^(FAIL|ERROR): ", l)]
-            for i in hits[:8]:
-                name = log[i]
-                # 从失败头往后找第一段 Traceback 的关键行(文件名:行号 + 异常类型)
-                ctx = [l for l in log[i + 1:i + 40] if re.search(r'File ".*", line \d+|^[A-Za-z]*Error|^AssertionError', l)]
-                detail = " / ".join(x.strip() for x in ctx[-3:]) or "(无堆栈)"
-                print("::error title=%s::%s" % (esc(name[:120]), esc(detail[:600])))
-                print("- %s\n  - %s" % (name, detail))
-            PY
+            # 失败测试名 + 堆栈行号 + 原因 → annotation(公开可读)与 job summary
+            python tools/ci_annotate.py smoke.log --summary
           fi
           exit $rc
       - name: 确认没有第三方依赖

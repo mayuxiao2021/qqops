@@ -1,5 +1,20 @@
 # CHANGELOG
 
+## [3.3.5] — 2026-10-10
+
+**修 CI 自己**:上一版把"失败整理"逻辑以 heredoc 内嵌在 workflow 的 `run:` 里,YAML 缩进一错,
+bash 就把它当语法错误 → **exit 2,全平台一起挂**,而且看不到任何失败详情。
+
+### 修复
+- 抽出 `tools/ci_annotate.py`:解析冒烟测试日志 → 输出 `::error::` annotation(失败测试名 +
+  堆栈行号 + 原因)并追加到 job summary。workflow 里只留一行调用,不再内嵌 heredoc。
+- CI 失败信息现在**公开可读**(annotation 与 summary),不必登录下载日志 —— 上一轮 macOS 的问题
+  就是靠这个才定位到的。
+
+### 测试
+- 173 → **174 项**:新增 `test_ci_annotate_extracts_failures`(工具本身也要有测试:
+  它坏了会让"看不到失败原因"雪上加霜)。
+
 ## [3.3.4] — 2026-10-10
 
 **跨平台修复**:CI 一跑, macOS 与 Linux/py3.10 上各暴露一批问题(本地 Windows + 中文编码全看不出来)。

@@ -922,6 +922,31 @@ class TestConsistency(unittest.TestCase):
         self.assertEqual(cs.scan_text(
             "x.py", 'token = "%s"  # secret-scan: allow\n' % ("abcdefgh" + "12345678"), []), [])
 
+    def test_ci_annotate_extracts_failures(self):
+        """CI 的失败整理工具本身要有测试 —— 它坏了会让"看不到失败原因"雪上加霜。
+
+        (背景: 曾把这段逻辑以 heredoc 内嵌在 workflow 里, YAML 缩进一错 bash 就 exit 2,
+        全平台一起挂还查不到原因。)
+        """
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import ci_annotate as ca                                      # noqa: E402
+
+        log = ("test_ok (m.T) ... ok\n"
+               "FAIL: test_a (m.T)\n"
+               "----------------------------------------------------------------------\n"
+               "Traceback (most recent call last):\n"
+               '  File "/x/tests/smoke.py", line 42, in test_a\n'
+               "    self.assertTrue(False)\n"
+               "AssertionError: False is not true\n")
+        items = ca.parse(log)
+        self.assertEqual(len(items), 1, items)
+        self.assertIn("test_a", items[0][0])
+        self.assertIn("line 42", items[0][1])
+        self.assertIn("AssertionError", items[0][1])
+        self.assertEqual(ca.esc("a%b\nc"), "a%25b%0Ac")
+        # 完全没有 FAIL 行(启动期就挂)时, parse 返回空 —— main() 会退化成"贴日志尾部"
+        self.assertEqual(ca.parse("boom\nImportError: no module\n"), [])
+
     def test_non_linux_fallbacks_and_ownership_safety(self):
         """macOS/BSD 没有 /proc: RSS/命令行/父进程要走 `ps` 兜底, 端口占用走 `lsof`。
 
