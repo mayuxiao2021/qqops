@@ -1,5 +1,34 @@
 # CHANGELOG
 
+## [3.3.4] — 2026-10-10
+
+**跨平台修复**:CI 一跑, macOS 与 Linux/py3.10 上各暴露一批问题(本地 Windows + 中文编码全看不出来)。
+
+### 修复:macOS / BSD 没有 `/proc` 时的能力缺失
+- `proc_rss()` / `_rss_and_etime()` 加 `ps -o rss=` / `ps -o etime=` 兜底(macOS 上内存与运行时长
+  不再是 0 / 空);
+- `_cmdline()` 加 `ps -o command=` 兜底;`_ancestor_pids()` 加 `ps -o ppid=` 兜底(否则父进程集合为空);
+- `port_owner()` 在没有 `/proc/net/tcp` 时退回 **`lsof -iTCP:<port> -sTCP:LISTEN`**(macOS 自带),
+  端口占用者能定位到 pid 与命令;
+- 新增 `_is_windows()` 把"平台判断"抽成可 mock 的 helper —— macOS 分支因此能在任何平台上被测试覆盖。
+
+### 修复:进程归属判断的安全语义(顺带修 macOS 误判)
+- `_own_pids()` 原先是"**读不到**对方 `QQOPS_DATA` 环境变量就当成自己人";macOS 上没有
+  `/proc/<pid>/environ`,于是把别人的进程认成自己的 → 端口预检误报、还可能**误杀别人的进程**。
+  现在改成:读不到环境变量就**不认领**(宁可报"占用者不是我们"),安全性优先。
+
+### 修复:单进程健康检查的时序
+- `_health_single()` 里 collector/web 的端口检查只查一次就下结论;冷启动慢的机器(CI 的 py3.10)
+  会误判成不健康。现在和多进程分支一样**等到超时**再判定。
+
+### 测试与 CI
+- 172 → **173 项**:新增「非 Linux 兜底与归属安全」——mock `ps`/`lsof` 输出验证解析、
+  并锁住"读不到环境变量不能认领进程"这条安全语义。
+- 启动超时的失败信息现在自带**退出码 + 子进程输出 + 日志尾巴**(CI 上日志要登录才能看,
+  失败信息必须自解释 —— macOS 那次就是靠它定位的)。
+- CI 失败时把**失败测试名 + 堆栈行号 + 原因**发成 check annotation(公开可读),
+  并在 job summary 里留一份摘要。
+
 ## [3.3.3] — 2026-10-10
 
 **修一个只在"西文 Windows"上才暴露的 bug**(CI 的 `windows-latest` 上抓到):非 UTF-8 控制台下

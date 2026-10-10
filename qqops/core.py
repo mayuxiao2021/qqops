@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 import secrets
 
-VERSION = "3.3.3"
+VERSION = "3.3.4"
 
 # 路径解析(踩过坑, 别改回 "靠 $HOME 猜"):
 #   曾经用 BASE = ~/qqops —— 但 $HOME 是环境给的, 从别的目录/cron/adb run-as 调用时
@@ -1609,6 +1609,17 @@ def _ancestor_pids() -> set:
             pid = ppid
         except Exception:
             break
+    if not out and not _is_windows():           # macOS/BSD: 没有 /proc, 用 ps 往上爬
+        pid = os.getpid()
+        for _ in range(12):
+            raw = _run(["ps", "-o", "ppid=", "-p", str(pid)], 8).strip()
+            if not raw.isdigit():
+                break
+            ppid = int(raw)
+            if ppid <= 1 or ppid in out:
+                break
+            out.add(ppid)
+            pid = ppid
     return out
 
 
@@ -1861,15 +1872,35 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _is_windows() -> bool:
+    """是否 Windows。
+
+    单独抽出来是为了**可测**: macOS/BSD 的兜底分支(ps/lsof)在 Windows 上跑不到,
+    测试里把 `core._is_windows` 打成 False 就能验证那些分支(否则只能靠真机 macOS 才发现)。
+    """
+    return os.name == "nt"
+
+
 def proc_rss(pid: int) -> int:
-    """某进程常驻内存(字节)。Linux/Termux 读 /proc, Windows 返回 0。"""
+    """某进程常驻内存(字节)。
+
+    Linux/Termux 读 /proc;macOS/BSD 没有 /proc, 退回 `ps -o rss=`(单位 KB);
+    Windows 返回 0(没有等价且可靠的零依赖取法)。
+    """
+    pid = int(pid or 0)
+    if pid <= 0:
+        return 0
     try:
-        with open("/proc/%d/status" % int(pid)) as f:
+        with open("/proc/%d/status" % pid) as f:
             for line in f:
                 if line.startswith("VmRSS:"):
                     return int(line.split()[1]) * 1024
     except Exception:
         pass
+    if not _is_windows():                       # macOS/BSD: ps 的 rss 单位是 KB
+        out = _run(["ps", "-o", "rss=", "-p", str(pid)], 8).strip()
+        if out.isdigit():
+            return int(out) * 1024
     return 0
 
 
@@ -1890,6 +1921,24 @@ def _rss_and_etime(pid: int) -> tuple:
         etime = "%02d:%02d:%02d" % (secs // 3600, (secs % 3600) // 60, secs % 60)
     except Exception:
         pass
+    if not etime and not _is_windows():       # macOS/BSD: ps 的 etime 形如 [[dd-]hh:]mm:ss
+        raw = _run(["ps", "-o", "etime=", "-p", str(int(pid))], 8).strip()
+        if raw:
+            days, rest = 0, raw
+            if "-" in raw:                    # 只有真的带 '-' 时, 前面那段才是天数
+                head, _, tail = raw.partition("-")
+                days = int(head) if head.strip().isdigit() else 0
+                rest = tail
+            bits = [int(x) for x in rest.split(":") if x.strip().isdigit()]
+            if len(bits) == 3:
+                h, m, sec = bits
+            elif len(bits) == 2:
+                h, m, sec = 0, bits[0], bits[1]
+            elif len(bits) == 1:
+                h, m, sec = 0, 0, bits[0]
+            else:
+                h = m = sec = 0
+            etime = "%02d:%02d:%02d" % (h + days * 24, m, sec)
     return rss, etime
 
 
@@ -1912,9 +1961,14 @@ def _health_single(name: str, cfg: Config, rt: dict, timeout: float = 8.0) -> di
                 return {"ok": False, "why": "心跳超时(单进程调度线程可能卡住)"}
             time.sleep(1)
     port = int(cfg.data["collector" if name == "collector" else "web"]["port"])
-    if port_open(port):
-        return {"ok": True, "why": "端口 %d 已应答" % port}
-    return {"ok": False, "why": "端口 %d 无应答" % port}
+    # 单进程刚起来时端口可能还没 bind(慢机器/CI 冷启动), 所以和多进程分支一样等到超时
+    end = time.time() + max(1.0, timeout / 3.0)
+    while True:
+        if port_open(port):
+            return {"ok": True, "why": "端口 %d 已应答" % port}
+        if time.time() >= end:
+            return {"ok": False, "why": "端口 %d 无应答" % port}
+        time.sleep(0.5)
 
 
 def service_health(name: str, cfg: Config | None = None, timeout: float = 12.0) -> dict:
@@ -1966,7 +2020,10 @@ def _cmdline(pid: int) -> str:
         with open("/proc/%d/cmdline" % int(pid), "rb") as f:
             return f.read().decode("utf-8", "replace").replace("\0", " ").strip()
     except Exception:
-        return ""
+        pass
+    if not _is_windows():                       # macOS/BSD: ps 的 command 列
+        return _run(["ps", "-o", "command=", "-p", str(int(pid))], 8).strip()
+    return ""
 
 
 def _pid_alive_and_matches(pid: int, mod: str) -> bool:
@@ -2043,6 +2100,26 @@ def proc_net_ok() -> bool:
     return bool(_PROC_NET_OK)
 
 
+def _port_owner_lsof(port: int) -> dict:
+    """用 `lsof` 查监听进程(macOS/BSD 没有 /proc/net/tcp; lsof 是系统自带的)。
+
+    解析 `-Fpcn` 的机器可读输出: p<pid> / c<command> / n<地址>。
+    """
+    out = _run(["lsof", "-nP", "-iTCP:%d" % int(port), "-sTCP:LISTEN", "-Fpcn"], 10)
+    pid, cmd = 0, ""
+    for line in out.splitlines():
+        if line.startswith("p") and line[1:].strip().isdigit():
+            pid = int(line[1:].strip())
+        elif line.startswith("c"):
+            cmd = line[1:].strip()
+        if pid and cmd:
+            break
+    if not pid:
+        return {}
+    return {"ok": True, "port": int(port), "pid": pid, "cmd": cmd,
+            "env": _pid_environ(pid), "source": "lsof"}
+
+
 def port_owner(port: int) -> dict:
     """查出监听某 TCP 端口的进程(纯 stdlib)。
 
@@ -2055,7 +2132,7 @@ def port_owner(port: int) -> dict:
     except Exception:
         return {}
     if not proc_net_ok():
-        return {}
+        return _port_owner_lsof(port)
     inodes = set()
     for f in ("/proc/net/tcp", "/proc/net/tcp6"):
         try:
@@ -2103,12 +2180,15 @@ def _own_pids(mod: str) -> list:
         if pid in skip or pid in out:
             continue
         other = (_pid_environ(pid) or {}).get("QQOPS_DATA")
-        if other:
-            try:
-                if os.path.realpath(other) != os.path.realpath(DATA):
-                    continue
-            except Exception:
+        if not other:
+            # 读不到对方环境变量(权限不足 / macOS 没有 /proc)时**不能**认领它 ——
+            # 认错人就会去杀别人的进程。宁可报"占用者不是我们", 也不要误杀。
+            continue
+        try:
+            if os.path.realpath(other) != os.path.realpath(DATA):
                 continue
+        except Exception:
+            continue
         out.append(pid)
     return out
 

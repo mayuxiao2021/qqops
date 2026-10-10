@@ -922,6 +922,48 @@ class TestConsistency(unittest.TestCase):
         self.assertEqual(cs.scan_text(
             "x.py", 'token = "%s"  # secret-scan: allow\n' % ("abcdefgh" + "12345678"), []), [])
 
+    def test_non_linux_fallbacks_and_ownership_safety(self):
+        """macOS/BSD 没有 /proc: RSS/命令行/父进程要走 `ps` 兜底, 端口占用走 `lsof`。
+
+        顺带锁住一条安全语义: **读不到对方环境变量时绝不能认领那个进程** ——
+        认错人就会去杀别人的进程(macOS 上真实踩到: 端口占用被误判成"我们自己人")。
+        """
+        import builtins
+
+        real_run, real_env, real_open = core._run, core._pid_environ, builtins.open
+        real_iswin = core._is_windows
+        core._is_windows = lambda: False        # 假装是 macOS/BSD, 才跑得到 ps/lsof 兜底
+        try:
+            # 1) proc_rss: /proc 不可用时退回 ps -o rss=(单位 KB)
+            core._run = lambda cmd, timeout=20: "  2048\n" if "rss=" in " ".join(cmd) else ""
+            builtins.open = lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError("/proc"))
+            self.assertEqual(core.proc_rss(1234), 2048 * 1024)
+            # 2) etime: ps 的 [[dd-]hh:]mm:ss 要能解析成 HH:MM:SS
+            core._run = lambda cmd, timeout=20: "01:02:03\n"
+            rss, etime = core._rss_and_etime(4321)
+            self.assertEqual(etime, "01:02:03", etime)
+            builtins.open = real_open
+            # 3) 命令行: ps -o command=
+            core._run = lambda cmd, timeout=20: "python -m qqops.webapp --port 8091\n"
+            self.assertIn("qqops.webapp", core._cmdline(9999))
+            # 4) 父进程: ps -o ppid=
+            core._run = lambda cmd, timeout=20: "42\n"
+            self.assertIn(42, core._ancestor_pids())
+            # 5) lsof 解析: p<pid> / c<command>
+            core._run = lambda cmd, timeout=20: "p777\ncnginx\nn*:8091\n"
+            own = core._port_owner_lsof(8091)
+            self.assertEqual(own["pid"], 777)
+            self.assertEqual(own["cmd"], "nginx")
+            # 6) 安全语义: 环境变量读不到 → 不算"我们自己人"
+            core._pid_environ = lambda pid: {}
+            core._run = lambda cmd, timeout=20: "12345\n"
+            self.assertEqual(core._own_pids("qqops.webapp"), [],
+                             "读不到环境变量时不能认领进程(否则可能误杀别人的进程)")
+        finally:
+            core._run, core._pid_environ = real_run, real_env
+            core._is_windows = real_iswin
+            builtins.open = real_open
+
     def test_console_encoding_never_breaks_chinese(self):
         """非 UTF-8 控制台(西文 Windows 是 cp1252/cp437)下, 打印中文不能把程序打崩。
 
@@ -1435,6 +1477,31 @@ class TestIntegration(unittest.TestCase):
         env["PYTHONIOENCODING"] = "utf-8"      # 子进程打印中文不能崩(西文 Windows)
         return env
 
+    @staticmethod
+    def _why_not_listening(proc, log_name: str) -> str:
+        """子进程没起来时, 把能拿到的线索凑成一段人话(CI 上日志看不到, 全靠它)。"""
+        parts = []
+        try:
+            if proc.poll() is not None:
+                parts.append("子进程已退出, 退出码 %s" % proc.returncode)
+        except Exception:
+            pass
+        try:
+            out = (proc.stdout.read() if proc.stdout else "")[-1500:]
+            parts.append("子进程输出:\n%s" % (out or "(空)"))
+        except Exception as e:
+            parts.append("读子进程输出失败: %s" % e)
+        try:
+            logf = os.path.join(TMP, "logs", "%s.log" % log_name)
+            if os.path.exists(logf):
+                with open(logf, encoding="utf-8", errors="replace") as f:
+                    parts.append("日志 %s 末尾:\n%s" % (log_name, f.read()[-1500:]))
+            else:
+                parts.append("没有日志文件 %s" % logf)
+        except Exception as e:
+            parts.append("读日志失败: %s" % e)
+        return "\n".join(parts)
+
     def test_collector_roundtrip_and_shutdown(self):
         port = free_port()
         proc = subprocess.Popen([sys.executable, "-m", "qqops.collector", "--port", str(port)],
@@ -1444,7 +1511,7 @@ class TestIntegration(unittest.TestCase):
             if not wait_port(port):
                 proc.kill()
                 out = (proc.stdout.read() if proc.stdout else "")[-1500:]
-                self.fail("采集器未在超时内监听, 输出:\n%s" % out)
+                self.fail("采集器未在超时内监听\n%s" % self._why_not_listening(proc, "collector"))
             ev = {"post_type": "message", "message_type": "group", "group_id": 4242,
                   "user_id": 7, "message_id": 4242001, "time": int(time.time()),
                   "raw_message": "集成测试 头像 讨论", "sender": {"nickname": "集成"},
@@ -1483,7 +1550,7 @@ class TestIntegration(unittest.TestCase):
             if not wait_port(port):
                 proc.kill()
                 out = (proc.stdout.read() if proc.stdout else "")[-1500:]
-                self.fail("控制台未在超时内监听, 输出:\n%s" % out)
+                self.fail("控制台未在超时内监听\n%s" % self._why_not_listening(proc, "web"))
             base = "http://127.0.0.1:%d" % port
             opener = urllib.request.build_opener(_NoRedirect)
 
