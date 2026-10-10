@@ -38,8 +38,18 @@ sys.path.insert(0, ROOT)
 
 from qqops import (collector, core, extract, fileread, linkfetch, media, render,  # noqa: E402
                    summarizer, svc, tools, watchdog, webapp)
+from qqops.framework import app as fw_app                                        # noqa: E402
+from qqops.framework import bus as fw_bus                                        # noqa: E402
+from qqops.framework import errors as fw_errors                                  # noqa: E402
+from qqops.framework import event as fw_event                                    # noqa: E402
+from qqops.framework import log as fw_log                                        # noqa: E402
+from qqops.framework import pipeline as fw_pipeline                              # noqa: E402
+from qqops.framework import registry as fw_registry                              # noqa: E402
+from qqops.framework import schema as fw_schema                                  # noqa: E402
+from qqops.framework import web as fw_web                                        # noqa: E402
 
 POSIX = os.name != "nt"
+PLUGIN_DIR = os.path.join(ROOT, "qqops", "plugins")
 
 
 def free_port() -> int:
@@ -620,6 +630,43 @@ class TestLifecycle(unittest.TestCase):
         finally:
             p2.kill()
             p2.wait(timeout=10)
+
+    def test_paths_independent_of_cwd_and_home(self):
+        """数据目录必须由代码位置决定, 不能靠 $HOME 猜。
+
+        (真踩过: 从别的目录/别的 HOME 调用 CLI 时, 程序在别处另建了一套空数据, 控制台显示"消息 0 条"。)
+        """
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("QQOPS_DATA", "QQOPS_HOME")}
+        code = ("import os, sys; sys.path.insert(0, %r);"
+                "from qqops import core; print(core.DATA)" % ROOT)
+        for cwd, home in (("C:\\" if not POSIX else "/", "/tmp/nonexistent-home"),
+                          (ROOT, "/tmp/another-home")):
+            e = dict(env)
+            e["HOME"] = home
+            try:
+                e["USERPROFILE"] = home
+            except Exception:
+                pass
+            p = subprocess.run([sys.executable, "-c", code], cwd=cwd, env=e,
+                               capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=60)
+            got = (p.stdout or "").strip().splitlines()[-1] if p.stdout else ""
+            self.assertEqual(os.path.realpath(got), os.path.realpath(os.path.join(ROOT, "data")),
+                             "cwd=%s HOME=%s 时数据目录跑偏了: %r %s" % (cwd, home, got, p.stderr[-200:]))
+
+    def test_store_integrity_and_wal(self):
+        """数据库应处于 WAL 模式并能通过完整性自检(手机断电/被杀后要能发现损坏)。"""
+        st = core.Store()
+        ok, detail = st.check_integrity()
+        self.assertTrue(ok, detail)
+        con = st.conn()
+        try:
+            mode = con.execute("PRAGMA journal_mode").fetchone()[0]
+            self.assertEqual(str(mode).lower(), "wal", mode)
+            self.assertGreater(int(con.execute("PRAGMA busy_timeout").fetchone()[0]), 0)
+        finally:
+            con.close()
 
     def test_legacy_pidfiles_cleaned(self):
         """旧版本遗留的 run/qqops.<模块>.pid 必须被清掉, 且不碰现行 <服务>.pid。"""
@@ -1320,6 +1367,86 @@ class TestIntegration(unittest.TestCase):
                 self.assertEqual(len(cc), 1, "Cache-Control 重复: %s" % cc)
                 self.assertNotIn("no-store", cc[0])
                 self.assertIn("max-age", cc[0])
+
+            # ---- v3 框架与控制台接口(插件路由表 + 容错 + 日志流) ----
+            def get(path):
+                rq = urllib.request.Request(base + path, headers={"X-Token": token})
+                with urllib.request.urlopen(rq, timeout=20) as rr:
+                    return json.loads(rr.read().decode())
+
+            def post(path, payload=None):
+                data = json.dumps(payload or {}).encode()
+                rq = urllib.request.Request(base + path, data=data,
+                                            headers={"X-Token": token,
+                                                     "Content-Type": "application/json"})
+                with urllib.request.urlopen(rq, timeout=30) as rr:
+                    return json.loads(rr.read().decode())
+
+            fw = get("/api/app/status")
+            self.assertIn("plugins", fw)
+            self.assertIn("handlers", fw)
+            self.assertIn("bus", fw)
+            self.assertEqual(fw.get("roles"), ["console"])
+            self.assertGreaterEqual(fw["handlers"].get("route", 0), 10, fw["handlers"])
+
+            pl = get("/api/plugins")
+            self.assertIn("plugins", pl)
+            ids = [p["id"] for p in pl["plugins"]]
+            self.assertIn("reminders", ids, pl)
+
+            cfgv = get("/api/plugins/config?id=reminders")
+            self.assertTrue(cfgv.get("fields"), cfgv)
+            paths = {f["path"] for f in cfgv["fields"]}
+            self.assertIn("basic.enabled", paths)
+
+            logs = get("/api/app/log?since=0")
+            self.assertIn("entries", logs)
+            self.assertIn("modules", logs)
+
+            crash = get("/api/app/crashes?limit=5")
+            self.assertIn("stats", crash)
+            self.assertIn("items", crash)
+
+            dash = get("/api/ops/dashboard")
+            self.assertIn("services", dash)
+            self.assertIn("stats", dash)
+            self.assertIn("partial", dash)
+
+            selfcheck = get("/api/app/selftest")
+            self.assertIn("items", selfcheck)
+            self.assertTrue(selfcheck["items"])
+
+            # 插件命令要能真跑通(走注册表 → 插件方法)
+            res = post("/api/plugins/command", {"name": "reminders.due"})
+            self.assertTrue(res.get("ok"), res)
+
+            # 故意触发的异常必须进账本, 而不是把控制台打崩
+            before = get("/api/app/crashes?limit=1")["stats"]["total"]
+            try:
+                urllib.request.urlopen(urllib.request.Request(
+                    base + "/api/app/errors_test", data=b"{}",
+                    headers={"X-Token": token, "Content-Type": "application/json"}), timeout=15)
+            except urllib.error.HTTPError as e:
+                self.assertEqual(e.code, 500, "插件接口异常应返回 500 而不是崩掉")
+                payload = json.loads(e.read().decode())
+                self.assertFalse(payload.get("ok"))
+                self.assertTrue(payload.get("rid"), payload)
+            kinds = [r["kind"] for r in get("/api/app/crashes?limit=10")["items"]]
+            self.assertIn("route_error", kinds, kinds)
+            self.assertGreaterEqual(get("/api/app/crashes?limit=1")["stats"]["total"], before)
+
+            # 停用/启用插件: 路由要跟着消失再出现
+            off = post("/api/plugins/toggle", {"id": "reminders", "enabled": False})
+            self.assertTrue(off.get("ok"), off)
+            rq = urllib.request.Request(base + "/api/plugins/reminders/list", headers={"X-Token": token})
+            try:
+                urllib.request.urlopen(rq, timeout=10)
+                self.fail("停用插件后其路由应不可用")
+            except urllib.error.HTTPError as e:
+                self.assertIn(e.code, (404, 500))
+            on = post("/api/plugins/toggle", {"id": "reminders", "enabled": True})
+            self.assertEqual(on.get("status"), "loaded")
+            self.assertIn("items", get("/api/plugins/reminders/list"))
         finally:
             proc.terminate()
             try:
@@ -1336,6 +1463,540 @@ class TestIntegration(unittest.TestCase):
             out = (p.stdout or "") + (p.stderr or "")
             self.assertIn(p.returncode, (0, 1), "命令失败: %s\n%s" % (args, out[-500:]))
             self.assertTrue(out.strip(), "命令没有输出: %s" % args)
+
+
+class TestFramework(unittest.TestCase):
+    """框架内核: 事件 / 总线 / 管线 / 注册表 / schema / 路由 / 容错。"""
+
+    def _isolated_ledger(self, name):
+        path = os.path.join(TMP, "crashes_%s.jsonl" % name)
+        if os.path.exists(path):
+            os.remove(path)
+        return fw_errors.CrashLedger(path), path
+
+    # ------------------------------------------------------------ 事件与总线
+    def test_event_helper_and_fields(self):
+        evt = fw_event.Event.message({"message_type": "group", "group_id": 42,
+                                      "user_id": 7, "time": 1700000000})
+        self.assertEqual(evt.kind, "message.received")
+        self.assertEqual(evt.session, "group:42")
+        self.assertEqual(evt.ts, 1700000000.0)
+        self.assertFalse(evt.dropped)
+        evt.drop("测试")
+        self.assertTrue(evt.dropped and evt.drop_reason == "测试")
+        self.assertIn("payload_keys", evt.to_dict())
+
+    def test_bus_isolates_bad_handler_and_stage(self):
+        """一个插件抛异常, 其它插件照样收到事件 —— 这是容错的底线。"""
+        reg = fw_registry.Registry()
+        seen = []
+
+        def bad(evt, ctx):
+            raise RuntimeError("这个插件坏了")
+
+        def good(evt, ctx):
+            seen.append(evt.id)
+
+        def bad_stage(evt, ctx):
+            raise ValueError("阶段炸了")
+
+        def good_stage(evt, ctx):
+            evt.add_result("ok")
+
+        reg.add(fw_registry.Ref(kind="event", name="x.y", fn=bad, plugin_id="bad"))
+        reg.add(fw_registry.Ref(kind="event", name="x.y", fn=good, plugin_id="good"))
+        reg.add(fw_registry.Ref(kind="stage", name="s1", fn=bad_stage, plugin_id="bad", priority=10))
+        reg.add(fw_registry.Ref(kind="stage", name="s2", fn=good_stage, plugin_id="good", priority=20))
+        pipe = fw_pipeline.Pipeline(registry=reg)
+        bus = fw_bus.EventBus(registry=reg, pipeline=pipe)
+        ld, path = self._isolated_ledger("bus")
+        old = fw_errors.LEDGER
+        fw_errors.LEDGER = ld
+        try:
+            evt = bus.dispatch(fw_event.Event("x.y", {"a": 1}))
+            self.assertEqual(seen, [evt.id], "坏处理器把好处理器带崩了")
+            self.assertIn("ok", evt.results)
+            self.assertFalse(evt.dropped)
+            kinds = [r["kind"] for r in ld.recent(10)]
+            self.assertIn("stage_error", kinds)
+            self.assertIn("handler_error", kinds)
+        finally:
+            fw_errors.LEDGER = old
+            if os.path.exists(path):
+                os.remove(path)
+
+    def test_pipeline_critical_stage_drops_event(self):
+        reg = fw_registry.Registry()
+        calls = []
+
+        def critical(evt, ctx):
+            raise RuntimeError("落库失败")
+
+        def later(evt, ctx):
+            calls.append("later")
+
+        reg.add(fw_registry.Ref(kind="stage", name="persist", fn=critical, priority=20,
+                                meta={"critical": True}))
+        reg.add(fw_registry.Ref(kind="stage", name="enrich", fn=later, priority=40))
+        pipe = fw_pipeline.Pipeline(registry=reg)
+        ld, path = self._isolated_ledger("crit")
+        old = fw_errors.LEDGER
+        fw_errors.LEDGER = ld
+        try:
+            evt = pipe.run(fw_event.Event("message.received"))
+            self.assertTrue(evt.dropped, "关键阶段失败必须丢弃事件")
+            self.assertEqual(calls, [], "关键阶段失败后不该继续跑后续阶段")
+            self.assertIn("关键阶段", evt.drop_reason)
+        finally:
+            fw_errors.LEDGER = old
+            if os.path.exists(path):
+                os.remove(path)
+
+    def test_pipeline_stage_timing_recorded(self):
+        reg = fw_registry.Registry()
+        reg.add(fw_registry.Ref(kind="stage", name="t", fn=lambda e, c: None, priority=10))
+        pipe = fw_pipeline.Pipeline(registry=reg)
+        evt = pipe.run(fw_event.Event("k"))
+        notes = [n for n in evt.meta["stages"] if n.get("stage") == "t"]
+        self.assertTrue(notes and "ms" in notes[0], evt.meta)
+
+    # ------------------------------------------------------------ schema
+    def test_schema_defaults_validate_and_coerce(self):
+        sch = {"g": {"type": "object", "description": "组", "items": {
+            "on": {"type": "bool", "description": "开关", "default": True},
+            "n": {"type": "int", "description": "数量", "default": 5, "min": 1, "max": 10},
+            "mode": {"type": "string", "description": "模式", "default": "a", "options": ["a", "b"]},
+            "words": {"type": "list", "description": "词", "default": []},
+        }}}
+        self.assertEqual(fw_schema.defaults(sch), {"g": {"on": True, "n": 5, "mode": "a", "words": []}})
+        clean, errs = fw_schema.validate(sch, {"g": {"on": "no", "n": "99", "mode": "c",
+                                                     "words": "a, b"}})
+        self.assertFalse(clean["g"]["on"])
+        self.assertEqual(clean["g"]["n"], 5, "越界必须回退默认值")
+        self.assertEqual(clean["g"]["mode"], "a", "非法枚举必须回退默认值")
+        self.assertEqual(clean["g"]["words"], ["a", "b"])
+        self.assertEqual(len(errs), 2, errs)
+        # 未知键保留(插件可能自己存状态)
+        clean2, _ = fw_schema.validate(sch, {"g": {"extra": 1}, "top": 2})
+        self.assertEqual(clean2["g"]["extra"], 1)
+        self.assertEqual(clean2["top"], 2)
+
+    def test_schema_flatten_for_ui(self):
+        sch = {"g": {"type": "object", "description": "组", "items": {
+            "k": {"type": "string", "description": "密钥", "default": "", "secret": True,
+                  "hint": "填了才生效"}}}}
+        rows = fw_schema.flatten(sch)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["path"], "g.k")
+        self.assertTrue(rows[0]["secret"])
+        self.assertEqual(rows[0]["group_label"], "组")
+        self.assertEqual(rows[0]["hint"], "填了才生效")
+
+    # ------------------------------------------------------------ 路由
+    def test_router_match_exact_and_param(self):
+        r = fw_web.Router()
+        r.add("/api/a", lambda req, ctx: {"ok": 1})
+        r.add("/api/item/<rid>", lambda req, ctx: {"rid": "x"}, methods=("GET", "POST"))
+        hit, params = r.match("GET", "/api/a")
+        self.assertTrue(hit)
+        self.assertEqual(params, {})
+        hit, params = r.match("post", "/api/item/r001")
+        self.assertTrue(hit)
+        self.assertEqual(params, {"rid": "r001"})
+        hit, _ = r.match("DELETE", "/api/item/r001")
+        self.assertIsNone(hit)
+        hit, _ = r.match("GET", "/api/nope")
+        self.assertIsNone(hit)
+
+    def test_request_and_response_helpers(self):
+        req = fw_web.Request(method="POST", query={"a": ["1"]}, body=b'{"x": 2}')
+        self.assertEqual(req.q("a"), "1")
+        self.assertEqual(req.q("missing", "d"), "d")
+        self.assertEqual(req.json(), {"x": 2})
+        resp = fw_web.Response.json({"ok": True})
+        self.assertEqual(resp.status, 200)
+        self.assertIn(b'"ok"', resp.body)
+
+    # ------------------------------------------------------------ 容错
+    def test_crash_ledger_dedupe_redact_clear(self):
+        ld, path = self._isolated_ledger("led")
+        ld.record("comp.a", exc=ValueError("token=abcdef123456 出错了"))
+        ld.record("comp.a", exc=ValueError("token=abcdef123456 出错了"))   # 窗口内去重
+        rows = ld.load()
+        self.assertEqual(len(rows), 1, "同 key 在窗口内应只落一条")
+        self.assertNotIn("abcdef123456", rows[0]["message"], "密钥必须脱敏")
+        ld.record("comp.b", exc=TypeError("另一种错"))
+        st = ld.stats()
+        self.assertEqual(st["total"], 2)
+        self.assertEqual(st["by_exception"].get("ValueError"), 1)
+        self.assertEqual(ld.clear(), 2)
+        self.assertEqual(ld.load(), [])
+        if os.path.exists(path):
+            os.remove(path)
+
+    def test_guard_decorator_and_context_manager(self):
+        ld, path = self._isolated_ledger("guard")
+        old = fw_errors.LEDGER
+        fw_errors.LEDGER = ld
+        try:
+            @fw_errors.guard("t.deco", fallback=[])
+            def boom():
+                raise RuntimeError("x")
+            self.assertEqual(boom(), [])
+
+            @fw_errors.guard("t.re", fallback=None, reraise=True)
+            def boom2():
+                raise RuntimeError("y")
+            self.assertRaises(RuntimeError, boom2)
+
+            ran = []
+            with fw_errors.guard("t.ctx"):
+                ran.append(1)
+                raise ValueError("吞掉我")
+            self.assertEqual(ran, [1])
+            self.assertEqual(ld.stats()["total"], 3)
+
+            with fw_errors.guard("t.ctx2", reraise=True):
+                self.assertRaises(ValueError, _raise_inside)
+        finally:
+            fw_errors.LEDGER = old
+            if os.path.exists(path):
+                os.remove(path)
+
+    def test_retry_then_success_and_exhaust(self):
+        calls = {"n": 0}
+
+        @fw_errors.retry(times=3, delay=0.01, component="t.retry")
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise ValueError("还没好")
+            return "ok"
+        self.assertEqual(flaky(), "ok")
+        self.assertEqual(calls["n"], 3)
+
+        ld, path = self._isolated_ledger("retry")
+        old = fw_errors.LEDGER
+        fw_errors.LEDGER = ld
+        try:
+            @fw_errors.retry(times=2, delay=0.01, component="t.retry2")
+            def always():
+                raise RuntimeError("永远失败")
+            self.assertRaises(RuntimeError, always)
+            kinds = [r["kind"] for r in ld.recent(5)]
+            self.assertIn("retry_exhausted", kinds)
+        finally:
+            fw_errors.LEDGER = old
+            if os.path.exists(path):
+                os.remove(path)
+
+    def test_backoff_grows_and_trips(self):
+        b = fw_errors.Backoff(base=1.0, factor=2.0, cap=10.0, window=60, trip=3)
+        self.assertFalse(b.tripped("s"))
+        self.assertEqual(b.fail("s"), 1.0)
+        self.assertEqual(b.fail("s"), 2.0)
+        self.assertEqual(b.fail("s"), 4.0)
+        self.assertTrue(b.tripped("s"), "同窗口内失败达阈值必须熔断")
+        self.assertFalse(b.due("s"))
+        st = b.state("s")
+        self.assertEqual(st["attempt"], 3)
+        b.reset("s")
+        self.assertFalse(b.tripped("s"))
+        self.assertTrue(b.due("s"))
+
+    def test_install_global_hooks(self):
+        old = sys.excepthook
+        try:
+            fw_errors.install_global_hooks(component="t.hooks")
+            self.assertIsNot(sys.excepthook, old)
+        finally:
+            sys.excepthook = old
+
+    def test_log_broker_cursor(self):
+        br = fw_log.LogBroker(size=10)
+        br.publish("m1", "INFO", "第一条")
+        br.publish("m2", "WARN", "第二条")
+        br.publish("m1", "ERROR", "第三条")
+        got = br.since(0)
+        self.assertEqual(len(got["entries"]), 3)
+        self.assertEqual(got["next"], 3)
+        got2 = br.since(got["next"])
+        self.assertEqual(got2["entries"], [])
+        only = br.since(0, module="m1")
+        self.assertEqual(len(only["entries"]), 2)
+        warn = br.since(0, level="WARN")
+        self.assertEqual(len(warn["entries"]), 2, "WARN 及以上应包含 ERROR")
+        self.assertEqual(len(br.tail(1)), 1)
+        self.assertEqual(br.state()["cap"], 10)
+        self.assertEqual(sorted(m["module"] for m in br.modules()), ["m1", "m2"])
+        self.assertEqual(br.clear(), 3)
+        # 环形缓冲: 超出容量后序号继续增长(clear 不清零序号, 免得客户端游标错乱)
+        base = br.state()["seq"]
+        for i in range(15):
+            br.publish("m", "INFO", "x%d" % i)
+        self.assertEqual(br.state()["size"], 10)
+        info = br.since(0)
+        self.assertEqual(info["entries"][0]["seq"], base + 6, "只应保留最后 10 条")
+        self.assertEqual(info["dropped"], base + 5, "被环挤掉的条数要如实上报")
+
+
+def _raise_inside():
+    raise ValueError("re-raise 测试")
+
+
+class TestPluginSystem(unittest.TestCase):
+    """插件体系: 加载/隔离/配置/任务/命令/路由/页面/热重载。"""
+
+    def setUp(self):
+        # 每个用例一份干净的插件数据/配置, 避免互相串味
+        for sub in ("plugin_data", "config"):
+            shutil.rmtree(os.path.join(TMP, sub), ignore_errors=True)
+
+    def _isolated_ledger(self, name):
+        path = os.path.join(TMP, "crashes_%s.jsonl" % name)
+        if os.path.exists(path):
+            os.remove(path)
+        return fw_errors.CrashLedger(path), path
+
+    def _app(self, roles=("all",), dirs=None):
+        app = fw_app.QQOpsApp(name="test", roles=roles,
+                              plugin_dirs=dirs if dirs is not None else [PLUGIN_DIR],
+                              workers=1)
+        app.setup()
+        return app
+
+    def test_builtin_reminders_plugin_loads(self):
+        app = self._app()
+        try:
+            st = app.plugins.state()
+            self.assertGreaterEqual(st["total"], 1, st)
+            row = [p for p in st["plugins"] if p["id"] == "reminders"]
+            self.assertTrue(row, st["plugins"])
+            self.assertEqual(row[0]["status"], "loaded", row[0])
+            self.assertGreaterEqual(row[0]["handlers"], 5, "提醒插件应注册阶段/任务/命令/路由/页面")
+            counts = app.registry.counts()
+            self.assertGreaterEqual(counts.get("stage", 0), 1)
+            self.assertGreaterEqual(counts.get("task", 0), 1)
+            self.assertGreaterEqual(counts.get("route", 0), 3)
+            self.assertGreaterEqual(counts.get("page", 0), 1)
+        finally:
+            app.stop()
+
+    def test_reminders_extracts_time_from_message(self):
+        app = self._app(roles=("ingest",))
+        try:
+            evt = fw_event.Event.message({
+                "post_type": "message", "message_type": "group", "group_id": 111,
+                "user_id": 222, "message_id": 1, "time": int(time.time()),
+                "raw_message": "记得下周三交实验报告 [CQ:at,qq=1]",
+                "sender": {"nickname": "小明"}})
+            app.dispatch_now(evt)
+            inst = app.plugins.plugins["reminders"]["inst"]
+            self.assertTrue(os.path.isfile(inst.inbox_path), "识别到的待办应进入收件箱")
+            with open(inst.inbox_path, encoding="utf-8") as f:
+                item = json.loads(f.readline())
+            self.assertIn("实验报告", item["title"])
+            self.assertGreater(item["due"], time.time())
+            self.assertEqual(item["session"], "group:111")
+            self.assertEqual(item["sender"], "小明")
+        finally:
+            app.stop()
+
+    def test_reminders_ignores_noise(self):
+        app = self._app(roles=("ingest",))
+        try:
+            inst = app.plugins.plugins["reminders"]["inst"]
+            for text in ("哈哈哈哈", "交", "今天天气不错", "明年见"):
+                evt = fw_event.Event.message({
+                    "message_type": "group", "group_id": 1, "user_id": 2,
+                    "raw_message": text, "time": int(time.time())})
+                app.dispatch_now(evt)
+            self.assertFalse(os.path.isfile(inst.inbox_path),
+                             "噪声消息不该产生待办: %s" % text)
+        finally:
+            app.stop()
+
+    def test_reminders_tick_notifies_and_dedupes(self):
+        app = self._app(roles=("ingest", "tasks"))
+        try:
+            inst = app.plugins.plugins["reminders"]["inst"]
+            now = int(time.time())
+            # 一条刚到点、一条早就过期(要能区分"到点"与"过期")
+            rows = [{"title": "交报告", "due": now - 10, "session": "group:9", "group": 9,
+                     "user": 1, "sender": "我", "created": now - 100, "exact": True},
+                    {"title": "体检", "due": now - 7200, "session": "group:9", "group": 9,
+                     "user": 1, "sender": "我", "created": now - 9000, "exact": True}]
+            os.makedirs(os.path.dirname(inst.inbox_path), exist_ok=True)
+            with open(inst.inbox_path, "a", encoding="utf-8") as f:
+                for r in rows:
+                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            res1 = inst.tick(app.ctx)
+            self.assertEqual(res1["added"], 2)
+            self.assertEqual(res1["notified"], 2, res1)
+            # 第二次 tick: 不能重复提醒
+            res2 = inst.tick(app.ctx)
+            self.assertEqual(res2["notified"], 0, res2)
+            st = inst._load()
+            status = {i["title"]: i["status"] for i in st["items"]}
+            self.assertEqual(status.get("交报告"), "notified")
+            self.assertEqual(status.get("体检"), "late")
+            self.assertIn("未开启推送", st["items"][0]["push_result"])
+        finally:
+            app.stop()
+
+    def test_reminders_scan_command_reads_store(self):
+        """补扫命令必须真的能从数据库里读出消息并抽出待办。
+
+        (这条用例是为了记住一次真实的翻车: 命令里用了不存在的 Store 方法,
+         因为没有测试覆盖"命令 → 数据库"这条链路, 直到真机上点了才发现。)
+        """
+        app = self._app(roles=("console", "tasks"))
+        try:
+            store = app.ctx.store
+            before = len(store.messages(hours=6, page=1, size=5).get("rows") or [])
+            store.insert_message({
+                "message_type": "group", "group_id": 555, "user_id": 9, "message_id": 4242,
+                "time": int(time.time()), "raw_message": "提醒我明天下午3点提交材料",
+                "message": [{"type": "text", "data": {"text": "提醒我明天下午3点提交材料"}}],
+                "sender": {"nickname": "补扫测试"}})
+            res = app.plugins.run_command("reminders.scan", {"hours": 6}, app.ctx)
+            self.assertTrue(res["ok"], res)
+            out = res["result"]
+            self.assertTrue(out.get("ok", True), out)
+            self.assertGreater(out.get("scanned", 0), before, out)
+            self.assertGreaterEqual(out.get("found", 0), 1, out)
+            inst = app.plugins.plugins["reminders"]["inst"]
+            self.assertTrue(os.path.isfile(inst.inbox_path))
+            with open(inst.inbox_path, encoding="utf-8") as f:
+                first = json.loads(f.readline())
+            self.assertIn("提交材料", first["title"])
+        finally:
+            app.stop()
+
+    def test_reminders_routes_and_commands(self):
+        app = self._app(roles=("console",))
+        try:
+            hit, params = app.router.match("GET", "/api/plugins/reminders/list")
+            self.assertTrue(hit, "插件的路由应注册到路由表")
+            req = fw_web.Request(method="GET", path="/api/plugins/reminders/list")
+            out = hit.fn(req, app.ctx)
+            self.assertIn("items", out)
+            self.assertIn("open", out)
+            self.assertTrue(app.plugins.commands())
+            names = [c["command"] for c in app.plugins.commands()]
+            self.assertIn("reminders.due", names)
+            res = app.plugins.run_command("reminders.due", {}, app.ctx)
+            self.assertTrue(res["ok"], res)
+            self.assertTrue(app.plugins.pages(), "插件应能往控制台加页面")
+        finally:
+            app.stop()
+
+    def test_plugin_config_schema_and_save(self):
+        app = self._app(roles=("console",))
+        try:
+            view = app.plugins.config_view("reminders")
+            self.assertTrue(view["fields"])
+            paths = {f["path"] for f in view["fields"]}
+            self.assertIn("basic.enabled", paths)
+            self.assertIn("notify.push", paths)
+            cfg = app.plugins.config("reminders")
+            self.assertTrue(cfg["basic"]["enabled"])
+            ok, errs, saved = app.plugins.set_config("reminders", {"basic": {"max_days_ahead": 9999}})
+            self.assertFalse(ok, "越界应报错")
+            self.assertEqual(saved["basic"]["max_days_ahead"], 60, "越界应回退默认值")
+            ok2, _, saved2 = app.plugins.set_config("reminders", {"notify": {"push": True}})
+            self.assertTrue(ok2, saved2)
+            self.assertTrue(app.plugins.config("reminders", force=True)["notify"]["push"])
+            # 密钥掩码
+            app.plugins.set_config("reminders", {"notify": {"target_session": "group:123"}})
+            v2 = app.plugins.config_view("reminders")
+            self.assertEqual(v2["config"]["notify"]["target_session"], "group:123")
+        finally:
+            app.stop()
+
+    def test_manager_isolates_broken_plugin(self):
+        """坏插件只影响它自己: 加载失败要记账, 其它插件照常可用。"""
+        d = os.path.join(TMP, "plugin_src")
+        shutil.rmtree(d, ignore_errors=True)
+        for pid, code, meta in (
+            ("broken", "import 这不是 python\n", {"id": "broken", "name": "坏插件"}),
+            ("healthy", ("from qqops.framework.api import Plugin, register, command\n"
+                         "@register(id='healthy', name='好插件')\n"
+                         "class H(Plugin):\n"
+                         "    @command('healthy.ping')\n"
+                         "    def ping(self, args=None, ctx=None):\n"
+                         "        return 'pong'\n"), {"id": "healthy", "name": "好插件"}),
+        ):
+            pdir = os.path.join(d, pid)
+            os.makedirs(pdir, exist_ok=True)
+            with open(os.path.join(pdir, "__init__.py"), "w", encoding="utf-8") as f:
+                f.write(code)
+            with open(os.path.join(pdir, "metadata.json"), "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False)
+        ld, path = self._isolated_ledger("plug")
+        old = fw_errors.LEDGER
+        fw_errors.LEDGER = ld
+        try:
+            app = self._app(roles=("console",), dirs=[d])
+            try:
+                st = {p["id"]: p for p in app.plugins.state()["plugins"]}
+                self.assertEqual(st["broken"]["status"], "failed", st["broken"])
+                self.assertIn("SyntaxError", st["broken"]["error"] + st["broken"]["error"])
+                self.assertEqual(st["healthy"]["status"], "loaded", st["healthy"])
+                self.assertTrue(app.plugins.run_command("healthy.ping", {})["ok"])
+                self.assertIn("load_failed", [r["kind"] for r in ld.recent(5)])
+            finally:
+                app.stop()
+        finally:
+            fw_errors.LEDGER = old
+            shutil.rmtree(d, ignore_errors=True)
+            if os.path.exists(path):
+                os.remove(path)
+
+    def test_plugin_enable_disable_and_reload(self):
+        app = self._app(roles=("console",))
+        try:
+            self.assertEqual(app.plugins.disable("reminders"), "disabled")
+            self.assertEqual(app.registry.handlers("route", "/api/plugins/reminders/list"), [])
+            self.assertEqual(app.plugins.enable("reminders"), "loaded")
+            self.assertTrue(app.registry.handlers("route", "/api/plugins/reminders/list"))
+            self.assertEqual(app.plugins.reload("reminders"), "loaded")
+            # 重复重载不应产生重复处理器
+            rows = app.registry.handlers("command", "reminders.due")
+            self.assertEqual(len(rows), 1, rows)
+        finally:
+            app.stop()
+            app.plugins.enable("reminders")
+
+    def test_app_status_shape(self):
+        app = self._app(roles=("all",))
+        try:
+            app.start()
+            st = app.status()
+            for key in ("version", "roles", "plugins", "handlers", "bus", "crashes"):
+                self.assertIn(key, st)
+            self.assertIn("stages", st["bus"])
+            self.assertTrue(st["plugins"]["total"] >= 1)
+        finally:
+            app.stop()
+
+    def test_role_filtering(self):
+        """按角色注册: 采集进程不该注册控制台路由, 控制台进程不该注册阶段。"""
+        ingest = self._app(roles=("ingest",))
+        try:
+            self.assertFalse(ingest.router.match("GET", "/api/plugins/reminders/list")[0])
+            self.assertTrue(ingest.registry.handlers("stage", "reminders_scan"))
+        finally:
+            ingest.stop()
+        console = self._app(roles=("console",))
+        try:
+            self.assertTrue(console.router.match("GET", "/api/plugins/reminders/list")[0])
+            self.assertFalse(console.registry.handlers("stage", "reminders_scan"))
+        finally:
+            console.stop()
+        # 清掉残留注册, 避免影响其它用例
+        app = self._app(roles=("all",))
+        app.stop()
 
 
 if __name__ == "__main__":

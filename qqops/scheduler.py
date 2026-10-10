@@ -15,6 +15,8 @@ import sys
 import time
 
 from . import core, summarizer
+from .framework import errors
+from .framework.app import QQOpsApp
 
 TICK = 15
 MAINT_AT = "03:30"
@@ -76,7 +78,24 @@ def _do_maintenance(cfg: core.Config, store: core.Store) -> None:
         for f in (files[:-keep] if keep > 0 else []):
             os.remove(os.path.join(core.BACKUP_DIR, f))
     except Exception as e:
+        errors.record("scheduler.backup", exc=e, kind="backup_failed")
         core.log("scheduler", "ERROR", "备份失败: %s" % e)
+
+
+def _run_summary(cfg: core.Config, store: core.Store, label: str, new_msgs: int) -> None:
+    """跑一次总结。失败要有清晰记录, 且不能让调度循环崩掉。"""
+    try:
+        res = summarizer.run(job="schedule:%s" % label)
+        core.state_set("last_summary_ts", core.now())
+        msg = res.get("detail", res.get("status"))
+        core.log("scheduler", "INFO", "定时总结结束: %s" % msg)
+        if res.get("status") not in ("ok", "skipped"):
+            errors.record("scheduler.summary", kind="summary_bad_status",
+                          message="总结状态 %s: %s" % (res.get("status"), msg))
+    except Exception as e:                       # noqa: BLE001 —— 一次失败不能停掉调度
+        errors.record("scheduler.summary", exc=e, kind="summary_failed",
+                      extra={"label": label, "new_msgs": new_msgs})
+        core.log("scheduler", "ERROR", "定时总结失败: %s" % e)
 
 
 def main(argv=None) -> int:
@@ -84,6 +103,14 @@ def main(argv=None) -> int:
     core.log("scheduler", "INFO", "调度器启动 (version %s)" % core.VERSION)
     print("[scheduler] started", flush=True)
     store = core.Store()
+    # 框架装配: 调度进程只跑 tasks 角色(插件的定时任务在这里执行)
+    try:
+        app = QQOpsApp(name="scheduler", roles=("tasks",), cfg=core.Config(),
+                       store=store).setup().start()
+    except Exception as e:                       # noqa: BLE001
+        errors.record("scheduler.app", exc=e, kind="setup_failed")
+        app = None
+        core.log("scheduler", "ERROR", "框架装配失败(只跑内置定时): %s" % e)
 
     while True:
         try:
@@ -104,13 +131,15 @@ def main(argv=None) -> int:
                     store.run_finish(rid, "skipped", "无新消息可总结(%d 条 < %d 条)" % (new_msgs, need))
                 else:
                     core.log("scheduler", "INFO", "到点触发总结: %s(新消息 %d 条)" % (label, new_msgs))
-                    res = summarizer.run(job="schedule:%s" % label)
-                    core.state_set("last_summary_ts", core.now())
-                    core.log("scheduler", "INFO", "定时总结结束: %s" % res.get("detail", res.get("status")))
+                    _run_summary(cfg, store, label, new_msgs)
             if now_str == MAINT_AT and _last_run("ran_maint") != _today():
                 _mark("ran_maint")
                 _do_maintenance(cfg, store)
+            # 插件的定时任务(到点才跑, 失败只记账)
+            if app is not None:
+                app.run_due_tasks()
         except Exception as e:
+            errors.record("scheduler.loop", exc=e, kind="loop_error")
             core.log("scheduler", "ERROR", "循环异常: %s" % e)
         time.sleep(TICK)
 

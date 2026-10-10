@@ -18,7 +18,7 @@ import tarfile
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # 与 pack.sh 保持一致的清单(不含 data/ .testdata/ dist/ .git/)
-ITEMS = ["qqops", "bin", "tests", "tools", "VERSION", "README.md", "CHANGELOG.md",
+ITEMS = ["qqops", "bin", "tests", "tools", "docs", "VERSION", "README.md", "CHANGELOG.md",
          "LICENSE", "install.sh", "uninstall.sh", "pack.sh", "pack.py",
          "config.example.json"]
 SKIP_DIRS = {"__pycache__", ".testdata", "data", "run", ".git", "dist"}

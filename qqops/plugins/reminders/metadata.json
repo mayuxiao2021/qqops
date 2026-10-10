@@ -1,0 +1,10 @@
+{
+  "id": "reminders",
+  "name": "截止提醒",
+  "version": "1.0.0",
+  "author": "qqops",
+  "desc": "从群消息里识别带时间点的待办(如\"下周三交报告\"), 到点提醒你",
+  "priority": 30,
+  "enabled_by_default": true,
+  "depends": []
+}

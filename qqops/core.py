@@ -23,10 +23,15 @@ import urllib.error
 import urllib.request
 import secrets
 
-VERSION = "2.2.1"
+VERSION = "3.0.0"
 
+# 路径解析(踩过坑, 别改回 "靠 $HOME 猜"):
+#   曾经用 BASE = ~/qqops —— 但 $HOME 是环境给的, 从别的目录/cron/adb run-as 调用时
+#   $HOME 可能指向别处, 于是程序会在一个新位置**另建一套空数据**, 控制台看起来"消息 0 条"。
+#   现在按优先级: QQOPS_HOME > 代码所在仓库根目录 > ~/qqops。
+_HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))     # 仓库根目录
 HOME = os.path.expanduser("~")
-BASE = os.environ.get("QQOPS_HOME") or os.path.join(HOME, "qqops")
+BASE = os.environ.get("QQOPS_HOME") or _HERE or os.path.join(HOME, "qqops")
 DATA = os.environ.get("QQOPS_DATA") or os.path.join(BASE, "data")
 CONF_PATH = os.path.join(DATA, "config.json")
 DB_PATH = os.path.join(DATA, "messages.db")
@@ -263,8 +268,31 @@ class Config:
         self.save()
 
 
+def redact_text(text: str) -> str:
+    """密钥脱敏(日志/账本落盘前用)。只在可疑时才走正则, 避免给热路径添负担。"""
+    s = str(text or "")
+    low = s.lower()
+    if any(k in low for k in ("sk-", "token", "key", "bearer", "password", "secret")):
+        try:
+            from .framework.errors import redact
+            return redact(s)
+        except Exception:
+            return s
+    return s
+
+
 def log(name: str, level: str, msg: str, max_mb: float = 4.0) -> None:
-    """按名字写日志文件, 超过 max_mb 时轮转一次。"""
+    """按名字写日志文件, 超过 max_mb 时轮转一次。
+
+    同时广播给控制台的实时日志流(见 framework/log.py), 这样"运维→日志"页
+    可以按游标拉增量, 不用反复读文件。
+    """
+    msg = redact_text(msg)
+    try:
+        from .framework import log as _blog          # 延迟导入: 避免与框架层形成导入环
+        _blog.publish(name, level, msg)
+    except Exception:
+        pass
     try:
         ensure_dirs()
         path = os.path.join(LOG_DIR, "%s.log" % name)
@@ -352,9 +380,36 @@ class Store:
         try:
             con.execute("PRAGMA journal_mode=WAL")
             con.execute("PRAGMA synchronous=NORMAL")
+            con.execute("PRAGMA busy_timeout=5000")      # 多进程同时写时先等一会儿再报错
         except Exception:
             pass
         return con
+
+    def check_integrity(self) -> tuple:
+        """快速自检数据库(手机断电/被杀进程后有可能留下损坏页)。
+
+        返回 `(是否完好, 说明)`; 损坏时记账, 控制台能在异常账本里看到。
+        """
+        try:
+            con = self.conn()
+            try:
+                row = con.execute("PRAGMA quick_check").fetchone()
+                detail = row[0] if row else "?"
+            finally:
+                con.close()
+            ok = str(detail).lower() in ("ok", "1")
+            if not ok:
+                try:
+                    from .framework import errors
+                    errors.record("store.integrity", kind="db_corrupt",
+                                  message="数据库自检未通过: %s" % str(detail)[:200],
+                                  extra={"db": self.path})
+                except Exception:
+                    pass
+                log("core", "ERROR", "数据库自检未通过: %s" % str(detail)[:200])
+            return ok, str(detail)
+        except Exception as e:
+            return False, "自检失败: %s" % e
 
     def _init(self) -> None:
         con = self.conn()
@@ -401,6 +456,19 @@ class Store:
 
     # -- 消息
     def insert_message(self, ev: dict) -> bool:
+        """落库一条消息。遇到 SQLite 忙锁会退避重试, 避免偶发锁冲突丢消息。"""
+        last = None
+        for attempt in range(3):
+            try:
+                return self._insert_once(ev)
+            except sqlite3.OperationalError as e:
+                last = e
+                if "locked" not in str(e).lower() and "busy" not in str(e).lower():
+                    raise
+                time.sleep(0.2 * (attempt + 1))
+        raise last
+
+    def _insert_once(self, ev: dict) -> bool:
         mtype = ev.get("message_type")
         gid = int(ev.get("group_id") or 0)
         sd = ev.get("sender") or {}

@@ -7,6 +7,9 @@ set -uo pipefail
 BASE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/.." && pwd)"
 PY="$(command -v python3 || echo /data/data/com.termux/files/usr/bin/python3)"
 C_OK=$'\033[32m'; C_BAD=$'\033[31m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+# 固化安装位置: 从任何目录(或 cron / 别的 HOME)调用都必须用同一份数据,
+# 否则 core 会按 $HOME 另算一个数据目录, 控制台看起来"消息 0 条"(真踩过)。
+export QQOPS_HOME="${QQOPS_HOME:-$BASE}"
 mkdir -p "$BASE/data/logs" "$BASE/data/run" 2>/dev/null
 
 svc() { ( cd "$BASE" && exec "$PY" -m qqops.svc "$@" ); }

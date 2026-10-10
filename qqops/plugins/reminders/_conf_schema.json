@@ -1,0 +1,100 @@
+{
+  "basic": {
+    "description": "识别设置",
+    "type": "object",
+    "hint": "从群消息里识别\"几号要做什么\"。识别到的时间点会进入提醒列表, 到点由调度进程通知。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用识别",
+        "default": true,
+        "hint": "关闭后不再扫描新消息, 已有提醒仍会到点通知。"
+      },
+      "keywords": {
+        "type": "list",
+        "description": "触发关键词",
+        "default": ["提醒", "截止", "deadline", "ddl", "交", "提交", "记一下", "待办", "要做"],
+        "hint": "消息里出现其中任意一个词, 才会去解析时间。填得越准噪声越少。"
+      },
+      "max_days_ahead": {
+        "type": "int",
+        "description": "最多识别多少天内",
+        "default": 60,
+        "min": 1,
+        "max": 365,
+        "hint": "超过这个天数的日期会被忽略, 避免把\"明年见\"记成待办。"
+      },
+      "min_text_len": {
+        "type": "int",
+        "description": "最短消息长度",
+        "default": 4,
+        "min": 1,
+        "max": 200,
+        "hint": "太短的消息(如\"交\")通常是误报。"
+      }
+    }
+  },
+  "notify": {
+    "description": "提醒方式",
+    "type": "object",
+    "hint": "默认只写进控制台与日志, 需要发到 QQ 才开启推送。",
+    "items": {
+      "push": {
+        "type": "bool",
+        "description": "推送到 QQ",
+        "default": false,
+        "hint": "开启后会往目标会话发提醒消息。"
+      },
+      "lead_minutes": {
+        "type": "int",
+        "description": "提前多少分钟提醒",
+        "default": 60,
+        "min": 0,
+        "max": 10080,
+        "hint": "0 = 只在到点时提醒; 1440 = 提前一天。"
+      },
+      "target_session": {
+        "type": "string",
+        "description": "推送目标",
+        "default": "",
+        "hint": "留空 = 推回消息所在的群/私聊; 也可固定填 group:123456 或 private:10001。"
+      },
+      "quiet_start": {
+        "type": "int",
+        "description": "免打扰开始(小时)",
+        "default": 23,
+        "min": 0,
+        "max": 23,
+        "hint": "这段时间内不推送(仍会记录), 到免打扰结束后补推。"
+      },
+      "quiet_end": {
+        "type": "int",
+        "description": "免打扰结束(小时)",
+        "default": 7,
+        "min": 0,
+        "max": 23
+      }
+    }
+  },
+  "maintain": {
+    "description": "数据维护",
+    "type": "object",
+    "items": {
+      "max_items": {
+        "type": "int",
+        "description": "最多保留条数",
+        "default": 200,
+        "min": 10,
+        "max": 2000,
+        "hint": "超出后按时间顺序丢弃最旧的已完成提醒。"
+      },
+      "keep_days_after_done": {
+        "type": "int",
+        "description": "完成后保留天数",
+        "default": 14,
+        "min": 0,
+        "max": 365
+      }
+    }
+  }
+}

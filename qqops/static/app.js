@@ -130,11 +130,14 @@ function sparkline(series, w = 320, h = 46) {
 function svcPill(s) { return `<span class="pill ${s.running ? 'ok' : 'bad'}"><span class="dot ${s.running ? 'ok' : 'bad'}"></span>${s.running ? '运行中' : '已停止'}</span>`; }
 
 /* ------------------------------------------------------------------ 路由 */
+/* 9 个一级页面: 仪表盘 / 消息 / 总结 / 任务 / 插件 / 数据 / 运维 / 设置 / 帮助 */
 const NAV = [
-  ['overview', '概览', '◎'], ['plan', '计划', '📋'], ['messages', '消息', '☰'],
-  ['groups', '群组', '☷'], ['tasks', '任务', '⏱'], ['reports', '报告', '📄'],
-  ['logs', '日志', '⌨'], ['config', '配置', '⚙'], ['ops', '运维', '🛠'],
+  ['dashboard', '仪表盘', '📊'], ['messages', '消息', '💬'], ['reports', '总结', '📝'],
+  ['tasks', '任务', '⏱'], ['plugins', '插件', '🧩'], ['data', '数据', '🗂'],
+  ['ops', '运维', '🛠'], ['settings', '设置', '⚙'], ['help', '帮助', '❓'],
 ];
+/* 手机底部标签栏: 5 个高频页 + "更多" */
+const BOTTOM = ['dashboard', 'messages', 'reports', 'ops', 'plugins'];
 function dueTag(ts) {
   if (!ts) return '';
   const left = ts - Date.now() / 1000;
@@ -162,11 +165,22 @@ const statusName = (s) => STATUS_CN[s] || s || '';
 function buildNav() {
   q(document, '#nav').innerHTML = NAV.map(([k, t, i]) =>
     `<a href="#/${k}" data-k="${k}"><span class="ico">${i}</span>${t}</a>`).join('');
+  const bn = q(document, '#bottomnav');
+  if (bn) {
+    bn.innerHTML = BOTTOM.map(k => {
+      const n = NAV.find(x => x[0] === k) || [k, k, ''];
+      return `<a href="#/${k}" data-k="${k}"><span class="ico">${n[2]}</span>${n[1]}</a>`;
+    }).join('') + `<a href="#" id="bn-more" data-more="1"><span class="ico">⋯</span>更多</a>`;
+  }
+}
+function markNav(k) {
+  document.querySelectorAll('#nav a,#bottomnav a').forEach(a =>
+    a.classList.toggle('on', a.dataset.k === k));
 }
 function go(k) {
   currentView = k;
   q(document, '#page-title').textContent = (NAV.find(n => n[0] === k) || [, k])[1];
-  document.querySelectorAll('#nav a').forEach(a => a.classList.toggle('on', a.dataset.k === k));
+  markNav(k);
   q(document, '#sidebar').classList.remove('open');
   render();
 }
@@ -174,8 +188,9 @@ async function render() {
   const v = q(document, '#view');
   if (busy) return;
   busy = true;
+  if (logTimer) { clearInterval(logTimer); logTimer = null; }   /* 离开日志页就停掉轮询 */
   v.innerHTML = '<div class="card"><div class="skel" style="width:40%"></div><div class="skel" style="margin-top:10px"></div><div class="skel" style="margin-top:10px;width:70%"></div></div>';
-  try { await (VIEWS[currentView] || VIEWS.overview)(v); }
+  try { await (VIEWS[currentView] || VIEWS.dashboard)(v); }
   catch (e) {
     report('render', currentView + ': ' + (e && e.message), e && e.stack);
     v.innerHTML = `<div class="card"><div class="row"><b class="err">渲染失败: ${esc(currentView)}</b>
@@ -187,8 +202,340 @@ async function render() {
   finally { busy = false; }
 }
 
-/* ------------------------------------------------------------------ 概览 */
+/* ------------------------------------------------------------------ 视图注册表 */
 const VIEWS = {};
+
+/* ------------------------------------------------------- 通用组件(三态 + 卡片) */
+function card(title, body, sub, right) {
+  return `<div class="card">${title ? `<h3>${esc(title)}${sub ? ` <span class="muted">${esc(sub)}</span>` : ''}${right ? `<span class="right">${right}</span>` : ''}</h3>` : ''}${body}</div>`;
+}
+function kpi(label, val, sub) {
+  return `<div class="card kpi"><div class="l">${esc(label)}</div><div class="v">${val}</div><div class="sub">${sub || ''}</div></div>`;
+}
+function emptyState(text, hint) {
+  return `<div class="empty"><div class="e-ico">🗒</div><div>${esc(text)}</div>${hint ? `<div class="muted">${hint}</div>` : ''}</div>`;
+}
+function errState(msg, hint) {
+  return `<div class="card errcard"><b class="err">⚠ ${esc(msg)}</b>
+    <div class="muted">${hint || '这一块暂时取不到数据, 其它功能不受影响。'}</div>
+    <div class="row" style="margin-top:8px"><button data-retry="1">重试</button></div></div>`;
+}
+function tabsHtml(name, items, active) {
+  return `<div class="tabs" data-tabs="${name}">` + items.map(([k, t, badge]) =>
+    `<a href="#" data-tab="${k}" class="${k === active ? 'on' : ''}">${t}${badge ? ` <span class="badge">${badge}</span>` : ''}</a>`).join('') + `</div>`;
+}
+function wireTabs(root, name, cb) {
+  root.querySelectorAll(`[data-tabs="${name}"] a`).forEach(a => a.onclick = e => {
+    e.preventDefault(); cb(a.dataset.tab);
+  });
+}
+function wireRetry(root, fn) {
+  const b = root.querySelector('[data-retry]');
+  if (b) b.onclick = fn;
+}
+function setBanner(html, kind) {
+  const b = q(document, '#banner');
+  if (!b) return;
+  if (!html) { b.className = 'hidden'; b.innerHTML = ''; return; }
+  b.className = 'banner ' + (kind || 'warn');
+  b.innerHTML = html + '<button class="icon-btn right" onclick="this.parentNode.className=\'hidden\'">✕</button>';
+}
+function svcRow(name, s) {
+  const h = (s && s.health) || {};
+  const ok = s && s.running && h.ok !== false;
+  const cls = !s || !s.running ? 'bad' : (h.ok === false ? 'warn' : 'ok');
+  const txt = !s || !s.running ? '未运行' : (h.ok === false ? '假活' : '正常');
+  return `<div class="it"><b style="width:76px">${esc(svcName(name))}</b>
+    <span class="pill ${cls}"><span class="dot ${cls}"></span>${txt}</span>
+    <span class="muted">${s && s.pid ? '进程号 ' + s.pid : ''}${s && s.rss ? ' · ' + humanBytes(s.rss) : ''}${s && s.etime ? ' · ' + s.etime : ''}${s && s.port ? ' · 端口 ' + s.port : ''}</span>
+    <span class="muted right">${esc((h.why || '').slice(0, 40))}</span></div>`;
+}
+
+/* ------------------------------------------------------- 仪表盘 */
+const CRASH_KIND_CN = {stage_error: '阶段异常', handler_error: '插件处理异常', request_error: '请求异常',
+  load_failed: '插件加载失败', task_error: '任务异常', stage_failed: '阶段失败', uncaught: '未捕获异常',
+  retry_exhausted: '重试耗尽', crash_loop: '反复崩溃', summary_failed: '总结失败', bind_failed: '端口占用',
+  store_failed: '落库失败', config_invalid: '配置非法', crash_loop_stop: '已熔断', queue_full: '队列满'};
+const kindCn = (k) => CRASH_KIND_CN[k] || k || '';
+VIEWS.dashboard = async (v) => {
+  const d = await api('/api/ops/dashboard');
+  if (!d) { v.innerHTML = errState('仪表盘数据加载失败'); wireRetry(v, render); return; }
+  const svc = d.services || {}, st = d.stats || {}, cr = d.crashes || {}, pl = d.plugins || {};
+  const runs = d.runs || [], ev = d.events || {}, sch = d.schedule || {};
+  const up = Object.values(svc).filter(s => s && s.running).length;
+  const total = Object.keys(svc).length;
+  const bad = cr.total || 0;
+  if (bad > 0) {
+    setBanner(`最近有 <b>${bad}</b> 次异常记录 — <a href="#/ops">到运维页看异常账本</a>`, bad > 20 ? 'bad' : 'warn');
+  } else { setBanner(''); }
+  const head = `<div class="card hero">
+    <div class="row"><span class="hdot ${up === total && total ? 'ok' : (up ? 'warn' : 'bad')}"></span>
+      <b style="font-size:16px">${up}/${total} 个服务在运行</b>
+      <span class="muted">版本 ${esc(d.version)} · ${esc((pl.loaded || 0) + ' 个插件已加载')}${pl.failed ? ` · <span class="err">${pl.failed} 个失败</span>` : ''}</span>
+      <span class="right row">
+        <button class="primary" id="qa-sum">立即总结</button>
+        <button id="qa-reload">重载插件</button>
+        <button id="qa-restart">重启服务</button>
+      </span></div>
+    ${d.partial && d.partial.length ? `<div class="muted" style="margin-top:6px">部分数据降级: ${d.partial.map(p => esc(p.key)).join('、')}</div>` : ''}
+  </div>`;
+  const kpis = `<div class="grid k4">
+    ${kpi('近 24 小时消息', st.window || 0, `最近 1 小时 ${st.last_hour || 0} 条`)}
+    ${kpi('活跃群', st.groups || 0, `共 ${d.enabled_groups || 0} 个群开启总结`)}
+    ${kpi('待办 / 事件', ev.open || 0, `已完成 ${ev.done || 0}`)}
+    ${kpi('异常记录', bad, bad ? '点击运维页查看' : '一切正常 ✅')}
+  </div>`;
+  const trend = card('消息趋势(近 24 小时)', `<div class="spark">${sparkline(st.series || [], 520, 60)}</div>
+    <div class="row" style="margin-top:4px">${Object.entries(st.kinds || {}).slice(0, 6).map(([k, c]) =>
+      `<span class="pill">${esc(kindsText(k))} ${c}</span>`).join('') || '<span class="muted">暂无数据</span>'}</div>`);
+  const svcCard = card('服务', `<div class="list">${Object.entries(svc).map(([n, s]) => svcRow(n, s)).join('') || '<div class="muted">无</div>'}</div>`,
+    '进程号 / 内存 / 运行时长');
+  const sched = card('下次总结', `<div class="list">
+      <div class="it"><b>计划</b><span class="right">${esc(sch.label || '未启用')}</span></div>
+      <div class="it"><b>下次运行</b><span class="right">${sch.ts ? fmtTs(sch.ts, 'full') + ' (还有 ' + Math.max(0, Math.round((sch.in || 0) / 60)) + ' 分钟)' : '-'}</span></div>
+    </div><div class="row" style="margin-top:8px"><a class="btn" href="#/tasks">去调整计划</a></div>`);
+  const rep = card('最近报告', `<div class="list">${(d.reports || []).slice(0, 5).map(f =>
+    `<div class="it"><b class="ellip">${esc(String(f).replace(/^summary_/, '').replace(/\.md$/, ''))}</b>
+      <span class="right row"><a class="btn" href="#" data-report="${esc(f)}">查看</a></span></div>`).join('') || emptyState('还没有报告', '到「任务」页点“立即总结”即可生成第一份')}</div>`);
+  const crash = card('异常与崩溃', `<div class="list">${(cr.by_component ? Object.entries(cr.by_component).slice(0, 5) : []).map(([c, n]) =>
+    `<div class="it"><b>${esc(c)}</b><span class="right muted">${n} 次</span></div>`).join('') || '<div class="muted">无异常记录 ✅</div>'}</div>
+    <div class="row" style="margin-top:8px"><a class="btn" href="#/ops">打开异常账本</a></div>`);
+  const runsCard = card('最近运行', `<div class="list">${runs.slice(0, 5).map(r =>
+    `<div class="it"><b class="ellip">${esc(jobName(r.job))}</b><span class="pill ${r.status === 'ok' ? 'ok' : (r.status === 'skipped' ? '' : 'bad')}">${esc(runName(r.status))}</span>
+      <span class="right muted">${fmtTs(r.started, 'time')}</span></div>`).join('') || '<div class="muted">暂无运行记录</div>'}</div>`);
+  v.innerHTML = head + kpis + `<div class="grid k2">${trend}${svcCard}</div>
+    <div class="grid k3">${sched}${rep}${crash}</div>${runsCard}`;
+  q(v, '#qa-sum').onclick = async () => {
+    toast('已开始总结, 稍后到「总结」页查看…', 'warn');
+    const r = await api('/api/summarize', {method: 'POST', body: JSON.stringify({hours: 24})});
+    if (r && r.ok) toast('总结完成: ' + (r.result && (r.result.status || '')) , 'ok');
+  };
+  q(v, '#qa-reload').onclick = async () => {
+    const r = await api('/api/plugins/reload', {method: 'POST', body: '{}'});
+    if (r && r.ok) { toast('插件已全部重载', 'ok'); render(); }
+  };
+  q(v, '#qa-restart').onclick = () => { location.hash = '#/ops'; toast('到运维页可以逐个重启服务', 'warn'); };
+  v.querySelectorAll('[data-report]').forEach(a => a.onclick = async e => {
+    e.preventDefault();
+    const r = await api('/api/report?name=' + encodeURIComponent(a.dataset.report));
+    if (r && r.content) modal(a.dataset.report, `<pre class="md">${esc(r.content)}</pre>`);
+  });
+};
+
+/* ------------------------------------------------------- 插件 */
+const PLUGIN_STATUS_CN = {loaded: '已加载', failed: '加载失败', disabled: '已停用', discovered: '待加载'};
+VIEWS.plugins = async (v) => {
+  const d = await api('/api/plugins');
+  if (!d) { v.innerHTML = errState('插件列表加载失败'); wireRetry(v, render); return; }
+  const rows = d.plugins || [];
+  const cards = rows.map(p => {
+    const st = p.status || 'discovered';
+    const cls = st === 'loaded' ? 'ok' : (st === 'failed' ? 'bad' : '');
+    return `<div class="card plug">
+      <div class="row"><b>${esc(p.name)}</b><span class="pill">${esc(p.version)}</span>
+        <span class="pill ${cls}">${PLUGIN_STATUS_CN[st] || st}</span>
+        ${p.builtin ? '<span class="pill">内置</span>' : ''}
+        <span class="right row">
+          <button data-toggle="${esc(p.id)}" data-on="${p.enabled ? 0 : 1}">${p.enabled ? '停用' : '启用'}</button>
+          <button data-cfg="${esc(p.id)}">配置</button>
+          <button data-reload="${esc(p.id)}">重载</button>
+        </span></div>
+      <div class="muted" style="margin-top:4px">${esc(p.desc || '')}</div>
+      <div class="row" style="margin-top:6px">
+        <span class="muted">${esc(p.author || '')}</span>
+        <span class="muted">处理器 ${p.handlers || 0}</span>
+        <span class="muted">可配置项 ${p.config_fields || 0}</span>
+        ${(p.pages || []).length ? `<span class="muted">页面 ${(p.pages || []).map(x => esc(x.title)).join('/')}</span>` : ''}
+      </div>
+      ${st === 'failed' ? `<div class="err" style="margin-top:6px">失败原因: ${esc(p.error || '')}</div>` : ''}
+    </div>`;
+  }).join('');
+  const cmds = (d.commands || []).map(c => `<div class="it"><b>${esc(c.command)}</b>
+    <span class="muted">${esc(c.help || '')}</span>
+    <span class="right row"><button data-cmd="${esc(c.command)}">执行</button></span></div>`).join('');
+  const tasks = (d.tasks || []).map(t => `<div class="it"><b>${esc(t.task)}</b>
+    <span class="muted">${t.every ? '每 ' + t.every + ' 秒' : (t.cron ? 'cron ' + esc(t.cron) : '-')}</span>
+    <span class="right row"><button data-runtask="${esc(t.task)}">立即执行</button></span></div>`).join('');
+  v.innerHTML = `<div class="card"><div class="row"><b>插件系统</b>
+      <span class="muted">共 ${d.total || 0} 个 · 已加载 ${d.loaded || 0} · 停用 ${d.disabled || 0}
+      ${d.failed ? ` · <span class="err">失败 ${d.failed}</span>` : ''} · 角色 ${(d.roles || []).join('/')}</span>
+      <span class="right row"><button id="pl-reload-all">重载全部</button></span></div>
+    <div class="muted" style="margin-top:6px">插件目录: ${(d.dirs || []).map(esc).join(' · ')}</div></div>
+    ${cards || emptyState('还没有插件')}
+    <div class="grid k2">
+      ${card('插件命令', `<div class="list">${cmds || '<div class="muted">无</div>'}</div>`)}
+      ${card('插件定时任务', `<div class="list">${tasks || '<div class="muted">无</div>'}</div>`)}
+    </div>
+    ${(d.pages || []).length ? card('插件页面', `<div class="row">${d.pages.map(p =>
+      `<a class="btn" href="#/plugins" data-page="${esc(p.id)}">${esc(p.icon || '🧩')} ${esc(p.title)}</a>`).join('')}</div>`) : ''}`;
+  q(v, '#pl-reload-all').onclick = async () => {
+    const r = await api('/api/plugins/reload', {method: 'POST', body: '{}'});
+    toast(r && r.ok ? '已重载全部插件' : '重载失败', r && r.ok ? 'ok' : 'bad');
+    render();
+  };
+  v.querySelectorAll('[data-toggle]').forEach(b => b.onclick = async () => {
+    const r = await api('/api/plugins/toggle', {method: 'POST',
+      body: JSON.stringify({id: b.dataset.toggle, enabled: b.dataset.on === '1'})});
+    toast(r && r.ok ? '已' + (b.dataset.on === '1' ? '启用' : '停用') : ('失败: ' + ((r && r.error) || '')),
+      r && r.ok ? 'ok' : 'bad');
+    render();
+  });
+  v.querySelectorAll('[data-reload]').forEach(b => b.onclick = async () => {
+    const r = await api('/api/plugins/reload', {method: 'POST', body: JSON.stringify({id: b.dataset.reload})});
+    toast(r && r.ok ? '已重载 ' + b.dataset.reload + ' (' + r.status + ')' : '重载失败', r && r.ok ? 'ok' : 'bad');
+    render();
+  });
+  v.querySelectorAll('[data-cm]').forEach(b => b.onclick = async () => {
+    const r = await api('/api/plugins/command', {method: 'POST', body: JSON.stringify({name: b.dataset.cm})});
+    modal('命令结果: ' + b.dataset.cm, `<pre>${esc(JSON.stringify(r && (r.result !== undefined ? r.result : r), null, 2))}</pre>`);
+  });
+  v.querySelectorAll('[data-runtask]').forEach(b => b.onclick = async () => {
+    const r = await api('/api/ops/tasks/run', {method: 'POST', body: JSON.stringify({task: b.dataset.runtask})});
+    toast(r && r.ok ? '任务完成' : ('任务失败: ' + ((r && r.error) || '')), r && r.ok ? 'ok' : 'bad');
+    if (r) modal('任务结果: ' + b.dataset.runtask, `<pre>${esc(JSON.stringify(r, null, 2))}</pre>`);
+  });
+  v.querySelectorAll('[data-cfg]').forEach(b => b.onclick = () => openPluginConfig(b.dataset.cfg));
+};
+async function openPluginConfig(pid) {
+  const d = await api('/api/plugins/config?id=' + encodeURIComponent(pid));
+  if (!d || !d.fields) return toast('读取配置失败', 'bad');
+  const groups = {};
+  d.fields.forEach(f => { (groups[f.group_label || '设置'] = groups[f.group_label || '设置'] || []).push(f); });
+  const field = f => {
+    const id = 'cf-' + f.path.replace(/\./g, '_');
+    let input;
+    if (f.type === 'bool') input = `<label class="switch"><input type="checkbox" id="${id}" ${f.value ? 'checked' : ''}><span></span></label>`;
+    else if (f.options && f.options.length) input = `<select id="${id}">${f.options.map(o =>
+      `<option ${String(f.value) === String(o) ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
+    else if (f.type === 'int' || f.type === 'float') input = `<input id="${id}" type="number" value="${esc(f.value)}" ${f.min != null ? `min="${f.min}"` : ''} ${f.max != null ? `max="${f.max}"` : ''}>`;
+    else if (f.type === 'list') input = `<input id="${id}" value="${esc((f.value || []).join(', '))}" placeholder="逗号分隔">`;
+    else input = `<input id="${id}" type="${f.secret ? 'password' : 'text'}" value="${esc(f.secret ? '' : f.value)}" ${f.secret && f.configured ? 'placeholder="已配置(留空则不修改)"' : ''}>`;
+    return `<div class="field"><label for="${id}">${esc(f.label)}${f.secret ? ' 🔑' : ''}</label>${input}
+      <div class="muted">${esc(f.hint || '')}${f.default != null && f.default !== '' ? ` (默认: ${esc(JSON.stringify(f.default))})` : ''}</div></div>`;
+  };
+  const html = Object.entries(groups).map(([g, fs]) =>
+    `<div class="cfg-group"><h4>${esc(g)}</h4>${fs.map(field).join('')}</div>`).join('');
+  modal('插件配置 · ' + pid, `${html}<div class="row" style="margin-top:10px">
+    <button class="primary" id="cf-save">保存</button>
+    <span class="muted">${esc(d.path || '')}</span></div>`);
+  q(document, '#cf-save').onclick = async () => {
+    const patch = {};
+    d.fields.forEach(f => {
+      const el = document.getElementById('cf-' + f.path.replace(/\./g, '_'));
+      if (!el) return;
+      let val;
+      if (f.type === 'bool') val = el.checked;
+      else if (f.type === 'int') val = parseInt(el.value, 10);
+      else if (f.type === 'float') val = parseFloat(el.value);
+      else if (f.type === 'list') val = el.value.split(/[,，]/).map(s => s.trim()).filter(Boolean);
+      else val = el.value;
+      if (f.secret && !String(el.value || '').trim()) return;      // 密钥留空 = 不改
+      const parts = f.path.split('.');
+      let node = patch;
+      parts.forEach((p, i) => { if (i === parts.length - 1) node[p] = val; else node = (node[p] = node[p] || {}); });
+    });
+    const r = await api('/api/plugins/config/save', {method: 'POST', body: JSON.stringify({id: pid, config: patch})});
+    if (r && r.ok) { toast('已保存', 'ok'); closeModal(); render(); }
+    else {
+      const errs = (r && r.errors) || [];
+      toast('保存有问题: ' + (errs[0] || (r && r.error) || '未知'), 'warn');
+      if (errs.length) modal('配置校验提示', `<div class="muted">非法项已回退为默认值:</div><ul>${errs.map(e => `<li>${esc(e)}</li>`).join('')}</ul>`);
+    }
+  };
+}
+
+/* ------------------------------------------------------- 数据 */
+let dataTab = 'groups';
+VIEWS.data = async (v) => {
+  const T = [['groups', '群组'], ['events', '事件/待办'], ['memory', '记忆'], ['links', '链接'], ['media', '媒体']];
+  v.innerHTML = tabsHtml('data', T, dataTab) + '<div id="data-body"></div>';
+  wireTabs(v, 'data', t => { dataTab = t; VIEWS.data(v); });
+  const box = q(v, '#data-body');
+  if (dataTab === 'groups') {
+    const d = await api('/api/groups');
+    if (!d) { box.innerHTML = errState('群组加载失败'); wireRetry(box, () => VIEWS.data(v)); return; }
+    const gs = d.groups || [];
+    box.innerHTML = card(`群组(${d.enabled_count || 0}/${gs.length} 个开启)`,
+      `<div class="list">${gs.slice(0, 200).map(g => `<div class="it">
+        <label class="switch"><input type="checkbox" data-gid="${g.id}" ${g.enabled ? 'checked' : ''}><span></span></label>
+        <b class="ellip">${esc(g.name || g.id)}</b><span class="muted">${g.id}</span>
+        <span class="right muted">近 7 天 ${g.count} 条${g.in_napcat ? '' : ' · 已退群'}</span></div>`).join('') || emptyState('还没有群')}</div>`,
+      '勾选 = 参与总结', `<button id="g-all">全部开启</button>`);
+    box.querySelectorAll('[data-gid]').forEach(c => c.onchange = async () => {
+      await api('/api/groups', {method: 'POST', body: JSON.stringify({id: +c.dataset.gid, enabled: c.checked})});
+      toast('已' + (c.checked ? '开启' : '关闭') + ' ' + c.dataset.gid, 'ok');
+    });
+    q(box, '#g-all').onclick = async () => {
+      const ids = gs.map(g => g.id);
+      await api('/api/groups/bulk', {method: 'POST', body: JSON.stringify({ids, enabled: true})});
+      toast('已全部开启', 'ok'); VIEWS.data(v);
+    };
+  } else if (dataTab === 'events') {
+    const d = await api('/api/events?status=all&limit=200');
+    if (!d) { box.innerHTML = errState('事件加载失败'); wireRetry(box, () => VIEWS.data(v)); return; }
+    const ev = d.events || [];
+    box.innerHTML = card(`事件与待办(${ev.length})`, `<div class="list">${ev.map(e => `<div class="it">
+      ${dueTag(e.due_ts)}<b class="ellip">${esc(e.title || '')}</b>
+      <span class="pill">${esc(KIND_CN[e.kind] || e.kind || '')}</span>
+      <span class="muted">${esc(e.group_id || '')}</span>
+      <span class="right row"><button data-done="${e.id}" data-st="${e.status}">${e.status === 'done' ? '恢复' : '完成'}</button></span></div>`).join('') || emptyState('还没有事件', '总结后会自动抽取; 也可以手动新建')}</div>`);
+    box.querySelectorAll('[data-done]').forEach(b => b.onclick = async () => {
+      await api('/api/events', {method: 'POST', body: JSON.stringify({id: +b.dataset.done,
+        status: b.dataset.st === 'done' ? 'open' : 'done'})});
+      toast('已更新', 'ok'); VIEWS.data(v);
+    });
+  } else if (dataTab === 'memory') {
+    const d = await api('/api/memory');
+    if (!d) { box.innerHTML = errState('记忆加载失败'); wireRetry(box, () => VIEWS.data(v)); return; }
+    box.innerHTML = card('长期记忆', `<div class="list">${(d.memories || []).map(m =>
+      `<div class="it"><b>${esc(m.scope || m.key || '')}</b><span class="muted ellip">${esc((m.content || '').slice(0, 120))}</span>
+       <span class="right muted">${fmtTs(m.updated, 'time')}</span></div>`).join('') || emptyState('还没有记忆', '总结会逐步沉淀群里的共识')}</div>`)
+      + card('个人档案(profile.md)', `<pre class="md">${esc(d.profile || '(空)')}</pre>`);
+  } else if (dataTab === 'links') {
+    const d = await api('/api/links');
+    if (!d) { box.innerHTML = errState('链接加载失败'); wireRetry(box, () => VIEWS.data(v)); return; }
+    box.innerHTML = card(`链接(${(d.links || []).length})`, `<div class="list">${(d.links || []).map(l =>
+      `<div class="it"><a href="${esc(l.url)}" target="_blank" rel="noopener" class="ellip">${esc(l.title || l.url)}</a>
+       <span class="right muted">${esc(l.group_id || '')} ${fmtTs(l.ts, 'time')}</span></div>`).join('') || emptyState('还没有链接')}</div>`);
+  } else {
+    const d = await api('/api/media?limit=60');
+    if (!d) { box.innerHTML = errState('媒体加载失败'); wireRetry(box, () => VIEWS.data(v)); return; }
+    const ms = d.media || [];
+    box.innerHTML = card(`媒体(${ms.length})`, `<div class="mgrid">${ms.map(m =>
+      `<figure class="mcell">${m.kind === 'image' || !m.kind ? `<img loading="lazy" src="/api/media/raw?key=${encodeURIComponent(m.key)}" alt="">` : `<div class="mfile">🎵</div>`}
+        <figcaption class="muted">${esc((m.caption || '').slice(0, 40) || m.status || '')}</figcaption></figure>`).join('') || emptyState('还没有媒体', '群里发的图片会在总结时被抓取')}</div>`);
+  }
+};
+
+/* ------------------------------------------------------- 帮助 */
+VIEWS.help = async (v) => {
+  v.innerHTML = card('快速上手', `<ol class="ol">
+      <li>手机浏览器打开本页(带 token 的链接), 加到桌面即可当 App 用。</li>
+      <li><b>仪表盘</b> 看整体健康; 红色横幅说明有异常, 点进「运维」看账本。</li>
+      <li><b>数据 → 群组</b> 勾选要参与总结的群。</li>
+      <li><b>任务</b> 设置总结时间(每天/每隔/每周), 点「立即执行」可先手动跑一次。</li>
+      <li><b>插件</b> 里可以启停插件、改配置; 改了配置立刻生效, 不用重启。</li>
+    </ol>`)
+    + card('常见问题', `<div class="list">
+      <div class="it"><b>收不到消息</b><span class="muted right">看「运维→服务」里 NapCat 是否在线、采集器是否运行</span></div>
+      <div class="it"><b>报告没生成</b><span class="muted right">「任务」看运行历史; 若无新消息会按配置跳过</span></div>
+      <div class="it"><b>推送失败</b><span class="muted right">报告已落盘, 到「总结」页可手动推送</span></div>
+      <div class="it"><b>服务老是被杀</b><span class="muted right">看「运维→自检」的保活项; 电脑上跑 tools/android-keepalive.sh</span></div>
+      <div class="it"><b>界面显示异常</b><span class="muted right">浏览器控制台会把错误自动上报到 data/logs/client.log</span></div>
+    </div>`)
+    + card('命令行速查', `<pre class="md">bin/qqops start|stop|restart|status   启停与状态
+bin/qqops doctor                    一键体检(含手机保活)
+bin/qqops summary --hours 24        手动总结
+bin/qqops backup|prune              备份 / 清理
+bin/qqops napcat start|stop         旁路服务
+bin/qqops watchdog --once           看门狗体检一轮
+python tests/smoke.py               自测(改代码后跑)</pre>`)
+    + card('关于', `<div class="list">
+      <div class="it"><b>版本</b><span class="right">${esc(VER)}</span></div>
+      <div class="it"><b>架构</b><span class="right muted">事件总线 + 阶段化管线 + 插件体系(见 docs/ARCHITECTURE.md)</span></div>
+      <div class="it"><b>异常账本</b><span class="right"><a class="btn" href="#/ops">打开</a></span></div>
+    </div>`);
+};
 VIEWS.overview = async (v) => {
   const d = await api('/api/overview'); if (!d || !d.stats) return;
   const s = d.stats, st = d.services, np = d.napcat || {};
@@ -753,7 +1100,8 @@ VIEWS.config = async (v) => {
 };
 
 /* ------------------------------------------------------------------ 运维 */
-VIEWS.ops = async (v) => {
+const OPS_TABS = [['svc', '服务'], ['crash', '异常账本'], ['log', '实时日志'], ['self', '自检'], ['backup', '备份与维护']];
+const _opsLegacy = async (v) => {
   const d = await api('/api/overview?hours=1'); if (!d) return;
   v.innerHTML = `
     <div class="grid k2">
@@ -848,6 +1196,176 @@ VIEWS.ops = async (v) => {
 };
 function core_count(d) { return (d.stats && d.stats.total) + ' 条消息'; }
 
+/* --------------------------------------------- 运维: 分页签(服务/账本/日志/自检/备份) */
+let opsTab = 'svc', logCursor = 0, logTimer = null, logPaused = false;
+const LOG_LEVEL_CN = {DEBUG: '调试', INFO: '信息', WARN: '警告', ERROR: '错误'};
+VIEWS.ops = async (v) => {
+  let crashBadge = '';
+  try {
+    const c = await api('/api/app/crashes?limit=1');
+    if (c && c.stats && c.stats.total) crashBadge = c.stats.total;
+  } catch (e) { /* 徽标取不到不影响页面 */ }
+  v.innerHTML = tabsHtml('ops', OPS_TABS.map(([k, t]) => [k, t, k === 'crash' ? crashBadge : '']), opsTab)
+    + '<div id="ops-body"></div>';
+  wireTabs(v, 'ops', t => {
+    opsTab = t;
+    if (logTimer) { clearInterval(logTimer); logTimer = null; }
+    VIEWS.ops(v);
+  });
+  const box = q(v, '#ops-body');
+  if (opsTab === 'svc') return _opsLegacy(box);
+  if (opsTab === 'crash') return _opsCrash(box);
+  if (opsTab === 'log') return _opsLog(box);
+  if (opsTab === 'self') return _opsSelf(box);
+  return _opsBackup(box);
+};
+async function _opsCrash(box) {
+  const d = await api('/api/app/crashes?limit=80');
+  if (!d) { box.innerHTML = errState('异常账本读取失败'); wireRetry(box, render); return; }
+  const st = d.stats || {}, items = d.items || [];
+  const comps = Object.entries(st.by_component || {});
+  const excs = Object.entries(st.by_exception || {});
+  box.innerHTML = `<div class="grid k2">
+    ${card('总览', `<div class="list">
+      <div class="it"><b>异常次数(含重复)</b><span class="right">${st.total || 0}</span></div>
+      <div class="it"><b>去重记录</b><span class="right">${st.records || 0}</span></div>
+      <div class="it"><b>最近一条</b><span class="right muted">${esc(st.last || '无')}</span></div>
+      <div class="it"><b>账本文件</b><span class="right muted ellip">${esc(st.file || '')}</span></div>
+    </div><div class="row" style="margin-top:8px"><button class="danger" id="cr-clear">清空账本</button>
+      <span class="muted">清空前建议先复制排查</span></div>`)}
+    ${card('按组件 / 按异常', `<div class="list">
+      ${comps.map(([c, n]) => `<div class="it"><b>${esc(c)}</b><span class="right muted">${n} 次</span></div>`).join('') || '<div class="muted">无</div>'}
+      <div class="it" style="border-top:1px solid var(--line)"><b class="muted">异常类型</b></div>
+      ${excs.map(([c, n]) => `<div class="it"><b>${esc(c)}</b><span class="right muted">${n} 次</span></div>`).join('')}
+    </div>`)}
+  </div>
+  ${card(`最近记录(${items.length})`, `<div class="list">${items.map(r => `<div class="it crash">
+      <span class="pill ${r.kind === 'crash_loop' ? 'bad' : ''}">${esc(kindCn(r.kind))}</span>
+      <b class="ellip">${esc(r.component)}</b>
+      <span class="muted ellip">${esc((r.message || '').slice(0, 90))}</span>
+      <span class="right muted">${esc(r.time || '')}${r.count > 1 ? ' ×' + r.count : ''}</span>
+      <button class="right" data-detail="${esc(r.ts)}">详情</button></div>`).join('') || emptyState('没有异常记录 ✅', '这说明最近一切正常')}</div>`)}
+  ${items.length ? `<div class="card"><h3>详情(选中一条)</h3><pre class="md" id="cr-detail">点上面的「详情」查看堆栈</pre></div>` : ''}`;
+  q(box, '#cr-clear').onclick = async () => {
+    if (!confirm('确定清空异常账本? 清空后无法恢复。')) return;
+    const r = await api('/api/app/crashes/clear', {method: 'POST', body: '{}'});
+    toast(r && r.ok ? '已清空 ' + r.cleared + ' 条' : '清空失败', r && r.ok ? 'ok' : 'bad');
+    render();
+  };
+  box.querySelectorAll('[data-detail]').forEach(b => b.onclick = () => {
+    const row = items.find(x => String(x.ts) === b.dataset.detail) || {};
+    q(box, '#cr-detail').textContent = `[${row.time}] ${row.component} / ${row.kind} / ${row.exc}
+消息: ${row.message || ''}
+线程: ${row.thread || ''}  进程: ${row.pid || ''}
+额外: ${JSON.stringify(row.extra || {}, null, 1)}
+
+${row.traceback || '(无堆栈)'}`;
+  });
+}
+async function _opsLog(box) {
+  const mods = ['', 'collector', 'scheduler', 'web', 'watchdog', 'plugins', 'app', 'client'];
+  const cur = lsGet('qqops_log_mod', ''), lvl = lsGet('qqops_log_lvl', '');
+  box.innerHTML = card('实时日志', `<div class="row">
+      <select id="lg-mod">${mods.map(m => `<option value="${m}" ${m === cur ? 'selected' : ''}>${m ? logName(m) : '全部模块'}</option>`).join('')}</select>
+      <select id="lg-lvl">${['', 'DEBUG', 'INFO', 'WARN', 'ERROR'].map(l =>
+        `<option value="${l}" ${l === lvl ? 'selected' : ''}>${l ? LOG_LEVEL_CN[l] + '及以上' : '全部级别'}</option>`).join('')}</select>
+      <button id="lg-pause">${logPaused ? '继续' : '暂停'}</button>
+      <button id="lg-clear">清屏</button>
+      <a class="btn" href="/api/logs?name=collector&lines=500" target="_blank">看采集器日志文件</a>
+      <span class="muted" id="lg-state">已收到 ${logCursor} 条</span>
+    </div>
+    <pre class="log" id="lg-out"></pre>`, '按游标增量拉取, 不刷整页');
+  q(box, '#lg-mod').onchange = e => { lsSet('qqops_log_mod', e.target.value); logCursor = 0; VIEWS.ops(document.getElementById('view')); };
+  q(box, '#lg-lvl').onchange = e => { lsSet('qqops_log_lvl', e.target.value); logCursor = 0; VIEWS.ops(document.getElementById('view')); };
+  q(box, '#lg-pause').onclick = () => { logPaused = !logPaused; toast(logPaused ? '已暂停' : '继续接收', 'ok'); VIEWS.ops(document.getElementById('view')); };
+  q(box, '#lg-clear').onclick = () => { logCursor = 0; q(box, '#lg-out').textContent = ''; };
+  const out = q(box, '#lg-out');
+  const pull = async () => {
+    if (logPaused) return;
+    const d = await api(`/api/app/log?since=${logCursor}&module=${encodeURIComponent(cur)}&level=${encodeURIComponent(lvl)}&limit=200`);
+    if (!d || !d.entries) return;
+    if (d.dropped) out.textContent += `…(${d.dropped} 条因缓冲已丢弃)\n`;
+    d.entries.forEach(e => {
+      out.textContent += `${e.time} [${e.level}] ${logName(e.module)}: ${e.msg}\n`;
+    });
+    logCursor = d.next || logCursor;
+    q(box, '#lg-state').textContent = `已收到 ${logCursor} 条`;
+    if (out.textContent.length > 60000) out.textContent = out.textContent.slice(-40000);
+    out.scrollTop = out.scrollHeight;
+  };
+  await pull();
+  if (logTimer) clearInterval(logTimer);
+  logTimer = setInterval(pull, 3000);
+  return undefined;
+}
+async function _opsSelf(box) {
+  const d = await api('/api/app/selftest');
+  const fw = await api('/api/app/status');
+  const pipe = await api('/api/app/pipeline');
+  if (!d) { box.innerHTML = errState('自检失败'); wireRetry(box, render); return; }
+  const bus = (fw && fw.bus) || {};
+  const busLine = `已发布 ${bus.published || 0} · 已分发 ${bus.dispatched || 0}`
+    + (bus.queue ? ` · 队列 ${bus.queue.size}/${bus.queue.max}` : '')
+    + (bus.running ? ' · 运行中' : ' · 未启动');
+  box.innerHTML = `<div class="grid k2">
+    ${card('一键自检', `<div class="list">${(d.items || []).map(i =>
+      `<div class="it"><span class="pill ${i.ok ? 'ok' : 'bad'}">${i.ok ? '通过' : '异常'}</span>
+       <b>${esc(i.name)}</b><span class="right muted ellip">${esc(i.detail || '')}</span></div>`).join('')}</div>
+      <div class="row" style="margin-top:8px"><b>${d.ok ? '结论: 全部通过 ✅' : '结论: 有项目异常 ⚠'}</b>
+      <button class="right" id="st-again">重新自检</button></div>`, '环境 / 服务 / 数据库 / 插件 / 账本')}
+    ${card('框架', `<div class="list">
+      <div class="it"><b>版本</b><span class="right">${esc((fw && fw.version) || VER)}</span></div>
+      <div class="it"><b>进程号</b><span class="right">${(fw && fw.pid) || '-'}</span></div>
+      <div class="it"><b>角色</b><span class="right">${esc(((fw && fw.roles) || []).join('/'))}</span></div>
+      <div class="it"><b>处理器</b><span class="right muted">${esc(JSON.stringify((fw && fw.handlers) || {}))}</span></div>
+      <div class="it"><b>接口数</b><span class="right">${(fw && fw.routes) || 0}</span></div>
+      <div class="it"><b>事件总线</b><span class="right muted">${busLine}</span></div>
+    </div>`)}
+  </div>
+  ${card('管线阶段', `<div class="list">${((pipe && pipe.stages) || []).map(s =>
+    `<div class="it"><b style="width:120px">${esc(s.label || s.stage)}</b><span class="pill">序号 ${s.order}</span>
+     <span class="muted">${esc(s.plugin || '框架')} · ${esc(s.handler)}${s.critical ? ' · 关键阶段' : ''}</span></div>`).join('') || '<div class="muted">无阶段</div>'}</div>`)}
+  ${card('插件', `<div class="list">${(((fw && fw.plugins && fw.plugins.plugins) || [])).map(p =>
+    `<div class="it"><b>${esc(p.name)}</b><span class="pill ${p.status === 'loaded' ? 'ok' : (p.status === 'failed' ? 'bad' : '')}">${PLUGIN_STATUS_CN[p.status] || p.status}</span>
+     <span class="right muted">处理器 ${p.handlers || 0} · ${esc(p.version || '')}</span></div>`).join('')}</div>`)}`;
+  q(box, '#st-again').onclick = () => VIEWS.ops(document.getElementById('view'));
+}
+async function _opsBackup(box) {
+  const d = await api('/api/overview?hours=1');
+  if (!d) { box.innerHTML = errState('数据信息读取失败'); wireRetry(box, render); return; }
+  box.innerHTML = `<div class="grid k2">
+    ${card('存储', `<div class="list">
+      <div class="it"><b>数据库</b><span class="right muted">${humanBytes(d.db_size)} · ${core_count(d)}</span></div>
+      <div class="it"><b>全文索引</b><span class="right muted">${d.fts && d.fts.available ? '已建立 · ' + d.fts.rows + ' 条' : '不可用'}</span></div>
+      <div class="it"><b>数据目录</b><span class="right muted">${humanBytes(d.data_size)}</span></div>
+      <div class="it"><b>磁盘剩余</b><span class="right muted">${humanBytes(d.disk.free)} / ${humanBytes(d.disk.total)}</span></div>
+      <div class="it"><b>报告 / 备份</b><span class="right muted">${d.storage.reports} / ${d.storage.backups}</span></div>
+    </div>`)}
+    ${card('操作', `<div class="row">
+      <button class="primary" id="bk">立即备份</button>
+      <button id="reidx">重建全文索引</button>
+      <a class="btn" href="/api/export.xlsx" target="_blank">导出事件/链接 xlsx</a>
+      <a class="btn" href="/api/export.docx" target="_blank">导出最近报告 docx</a>
+      <a class="btn" href="/api/export.csv?hours=168" target="_blank">导出近 7 天 CSV</a>
+    </div><div class="muted" style="margin-top:8px">备份落在 data/backups; 恢复请用命令行(避免误操作覆盖数据)</div>`)}
+  </div>
+  ${card('采集指标', `<div class="list">
+    <div class="it"><b>收下</b><span class="right">${(d.counters || {}).ingested || 0} 条</span></div>
+    <div class="it"><b>跳过</b><span class="right">${(d.counters || {}).skipped || 0} 条</span></div>
+    <div class="it"><b>拒绝</b><span class="right">${(d.counters || {}).rejected || 0} 条</span></div>
+    <div class="it"><b>错误</b><span class="right">${(d.counters || {}).errors || 0} 条</span></div>
+  </div>`, '采集器自启动以来的累计')}`;
+  q(box, '#bk').onclick = async () => {
+    const r = await api('/api/backup', {method: 'POST', body: '{}'});
+    if (r && r.ok) toast('备份完成: ' + r.file, 'ok');
+  };
+  q(box, '#reidx').onclick = async () => {
+    const r = await api('/api/reindex', {method: 'POST', body: '{}'});
+    if (r && r.ok) toast('索引已重建: ' + r.rows + ' 条', 'ok');
+  };
+}
+VIEWS.settings = VIEWS.config;      /* 设置页 = 原有配置视图(字段说明+校验已在其中) */
+
 /* ------------------------------------------------------------------ 顶部状态条 */
 async function pollStatus() {
   const dot = q(document, '#health-dot'), tx = q(document, '#health-text');
@@ -880,12 +1398,18 @@ async function pollStatus() {
 /* ------------------------------------------------------------------ 启动 */
 function boot() {
   buildNav();
-  const hash = location.hash.replace(/^#\/?/, '') || 'overview';
-  const k = hash.split('?')[0] || 'overview';
-  currentView = NAV.some(n => n[0] === k) ? k : 'overview';
-  q(document, '#page-title').textContent = (NAV.find(n => n[0] === currentView) || [, '概览'])[1];
-  document.querySelectorAll('#nav a').forEach(a => a.classList.toggle('on', a.dataset.k === currentView));
-  document.querySelectorAll('#nav a').forEach(a => a.onclick = e => { e.preventDefault(); location.hash = '#/' + a.dataset.k; });
+  const hash = location.hash.replace(/^#\/?/, '') || 'dashboard';
+  const k = hash.split('?')[0] || 'dashboard';
+  currentView = NAV.some(n => n[0] === k) ? k : 'dashboard';
+  q(document, '#page-title').textContent = (NAV.find(n => n[0] === currentView) || [, '仪表盘'])[1];
+  markNav(currentView);
+  document.querySelectorAll('#nav a,#bottomnav a').forEach(a => {
+    if (a.id === 'bn-more') {
+      a.onclick = e => { e.preventDefault(); q(document, '#sidebar').classList.toggle('open'); };
+      return;
+    }
+    a.onclick = e => { e.preventDefault(); location.hash = '#/' + a.dataset.k; };
+  });
   q(document, '#menu-btn').onclick = () => q(document, '#sidebar').classList.toggle('open');
   q(document, '#refresh-btn').onclick = () => render();
   q(document, '#modal-close').onclick = closeModal;

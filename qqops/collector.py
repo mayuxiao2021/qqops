@@ -17,7 +17,11 @@ import signal
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
 from . import core
+from .framework import errors
+from .framework.app import QQOpsApp
+from .framework.event import Event
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -26,6 +30,7 @@ class Handler(BaseHTTPRequestHandler):
 
     cfg: core.Config = None      # type: ignore
     store: core.Store = None     # type: ignore
+    app: QQOpsApp = None         # type: ignore
     counters = {"ingested": 0, "skipped": 0, "rejected": 0, "errors": 0, "started": 0}
 
     # ------------------------------------------------------------ 工具
@@ -107,8 +112,16 @@ class Handler(BaseHTTPRequestHandler):
                             ev.get("message_type"), ev.get("group_id"),
                             (ev.get("sender") or {}).get("nickname"),
                             (ev.get("raw_message") or "")[:60]))
+                    # 落库之后把事件交给总线(插件/阶段在后台处理, 不阻塞采集)
+                    if self.app is not None:
+                        try:
+                            self.app.publish(Event.message(ev), wait=False)
+                        except Exception as e:                  # noqa: BLE001
+                            errors.record("collector.publish", exc=e, kind="publish_failed")
                 except Exception as e:
                     c["errors"] += 1
+                    errors.record("collector.store", exc=e, kind="store_failed",
+                                  extra={"group": ev.get("group_id")})
                     core.log("collector", "ERROR", "落库失败: %s" % e)
             else:
                 c["skipped"] += 1
@@ -143,10 +156,26 @@ def main(argv=None) -> int:
     Handler.cfg, Handler.store = cfg, store
     Handler.counters["started"] = core.now()
 
+    # 框架装配: 采集进程只跑 ingest 角色(管线阶段 + 事件处理器)
+    try:
+        Handler.app = QQOpsApp(name="collector", roles=("ingest",), cfg=cfg,
+                               store=store).setup().start()
+    except Exception as e:                       # noqa: BLE001 —— 框架装配失败也要能收消息
+        errors.record("collector.app", exc=e, kind="setup_failed")
+        core.log("collector", "ERROR", "框架装配失败(继续以裸采集模式运行): %s" % e)
+
     host = args.host or cfg.data["collector"].get("host", "127.0.0.1")
     port = args.port or int(cfg.data["collector"].get("port", 8080))
 
-    srv = ThreadingHTTPServer((host, port), Handler)
+    try:
+        srv = ThreadingHTTPServer((host, port), Handler)
+    except OSError as e:
+        # 端口被占: 明确记账并退出(否则会变成一个"看起来在跑"的空壳)
+        errors.record("collector.bind", exc=e, kind="bind_failed",
+                      message="端口 %s:%d 绑定失败" % (host, port))
+        core.log("collector", "ERROR", "绑定 %s:%d 失败: %s" % (host, port, e))
+        print("[collector] 绑定失败: %s" % e, flush=True)
+        return 1
     core.log("collector", "INFO", "监听 http://%s:%d (db=%s)" % (host, port, store.path))
     print("[collector] listening on http://%s:%d  db=%s" % (host, port, store.path), flush=True)
 
@@ -155,6 +184,11 @@ def main(argv=None) -> int:
         # 会死锁导致进程杀不掉并一直占着端口。这里落一次指标后立即退出。
         core.log("collector", "INFO", "收到退出信号, 正在关闭")
         core.state_set("collector_counters", dict(Handler.counters))
+        try:
+            if Handler.app:
+                Handler.app.stop()
+        except Exception:
+            pass
         sys.stdout.flush()
         os._exit(0)
 

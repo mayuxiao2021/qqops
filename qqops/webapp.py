@@ -19,8 +19,13 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import core, extract, fileread, linkfetch, media, render, summarizer
+from .console import pages as console_pages
+from .framework import errors
+from .framework.app import QQOpsApp
+from .framework.web import ROUTER, Request, Response
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+APP = None                    # QQOpsApp(框架装配后的实例, 由 main() 赋值)
 
 
 def _asset_ver() -> str:
@@ -80,15 +85,17 @@ SHELL = """<!doctype html>
   <main>
     <header id="topbar">
       <button id="menu-btn" class="icon-btn" title="菜单">☰</button>
-      <h1 id="page-title">概览</h1>
+      <h1 id="page-title">仪表盘</h1>
       <div id="status-strip"></div>
       <div class="spacer"></div>
       <label class="toggle"><input type="checkbox" id="auto-refresh" checked><span>自动刷新</span></label>
       <button class="icon-btn" id="refresh-btn" title="立即刷新">⟳</button>
       <a class="icon-btn" id="logout-btn" href="/logout" title="退出">⎋</a>
     </header>
+    <div id="banner" class="hidden"></div>
     <section id="view"></section>
   </main>
+  <nav id="bottomnav"></nav>
 </div>
 <div id="toasts"></div>
 <div id="modal" class="hidden"><div class="modal-box"><header><span id="modal-title"></span><button class="icon-btn" id="modal-close">✕</button></header><div id="modal-body"></div></div></div>
@@ -142,20 +149,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send(self, code: int, body: bytes, ctype: str = "application/json; charset=utf-8",
               extra: dict | None = None, cache: str = "no-store") -> None:
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Connection", "close")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        if cache:
-            # 关键: HTML 与接口一律禁缓存, 否则浏览器会启发式缓存旧页面(尤其是换版本后)
-            self.send_header("Cache-Control", cache)
-            self.send_header("Pragma", "no-cache")
-        for k, v in (extra or {}).items():
-            self.send_header(k, v)
-        self.end_headers()
-        self.wfile.write(body)
-        self.close_connection = True
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            if cache:
+                # 关键: HTML 与接口一律禁缓存, 否则浏览器会启发式缓存旧页面(尤其是换版本后)
+                self.send_header("Cache-Control", cache)
+                self.send_header("Pragma", "no-cache")
+            for k, v in (extra or {}).items():
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(body)
+            self.close_connection = True
+        except (BrokenPipeError, ConnectionResetError):
+            # 客户端提前断开(刷新页面/关标签/手机切后台)是常态, 不是错误, 别污染日志
+            self.close_connection = True
 
     def json(self, obj, code: int = 200, extra: dict | None = None) -> None:
         self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"), extra=extra)
@@ -186,6 +197,54 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
+    # ------------------------------------------------------------ 请求级守卫
+    def _route_plugin(self, method: str, path: str, qs: dict, body: bytes = b""):
+        """先看框架路由表(插件与 console 模块注册的接口); 未命中返回 None。"""
+        hit, params = ROUTER.match(method, path)
+        if not hit:
+            return None
+        rid = errors.request_id()
+        if hit.auth and not self._authed(qs):
+            return self.json({"ok": False, "error": "unauthorized", "rid": rid}, 401)
+        req = Request(method=method, path=path, query=qs, headers=dict(self.headers),
+                      body=body or b"", token=qs.get("token", [""])[0], rid=rid,
+                      client=self.client_address[0] if self.client_address else "",
+                      params=params)
+        try:
+            out = hit.fn(req, APP.ctx if APP else None)
+        except Exception as e:                       # noqa: BLE001 —— 插件接口异常只影响这个请求
+            errors.record("web.plugin_route", exc=e, kind="route_error",
+                          extra={"path": path, "plugin": hit.plugin_id, "rid": rid})
+            return self.json({"ok": False, "error": "接口异常: %s" % e, "rid": rid}, 500)
+        if isinstance(out, Response):
+            return self._send(out.status, out.body, out.ctype, out.headers)
+        if isinstance(out, bytes):
+            return self._send(200, out, "application/octet-stream")
+        if isinstance(out, (dict, list)):
+            return self.json(out)
+        return self.json({"ok": True, "data": out})
+
+    def _guard_request(self, method: str, fn):
+        """把一次请求整体包起来: 记录 request-id、异常进账本、慢请求留痕。"""
+        rid = errors.request_id()
+        t0 = time.time()
+        try:
+            return fn()
+        except (BrokenPipeError, ConnectionResetError):
+            return None                              # 浏览器提前断开, 不算错
+        except Exception as e:                       # noqa: BLE001 —— 单请求异常不能拖垮控制台
+            errors.record("web.request", exc=e, kind="request_error",
+                          extra={"rid": rid, "method": method, "path": self.path})
+            core.log("web", "ERROR", "[%s] %s %s 失败: %s" % (rid, method, self.path, e))
+            try:
+                return self.json({"ok": False, "error": "服务端异常: %s" % e, "rid": rid}, 500)
+            except Exception:
+                return None
+        finally:
+            dt = time.time() - t0
+            if dt > 2.0:
+                core.log("web", "WARN", "[%s] 慢请求 %.1fs %s %s" % (rid, dt, method, self.path))
+
     # ------------------------------------------------------------ HEAD
     def do_HEAD(self):
         """仅回头部(探活、缓存校验、curl -I 都会用到)。"""
@@ -206,6 +265,9 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------ GET
     def do_GET(self):
+        return self._guard_request("GET", self._do_GET)
+
+    def _do_GET(self):
         u = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(u.query)
         path = u.path
@@ -227,6 +289,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.html(LOGIN % {"ver": core.VERSION, "assets": ASSET_VER,
                                           "err": "<p class=err>令牌无效</p>"}, 401)
             return self._send(302, b"", "text/plain", {"Location": "/login"})
+        r = self._route_plugin("GET", path, qs)       # 框架/插件注册的接口优先
+        if r is not None:
+            return r
         if qs.get("token") == self._cfg().data["web"]["token"] and "qqops_session" not in self._cookies():
             sess = _new_session(self._cfg().data["web"]["session_hours"])
             return self.html(SHELL % {"ver": core.VERSION, "assets": ASSET_VER, "refresh": self._cfg().data["web"]["auto_refresh"]},
@@ -400,6 +465,9 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------ POST
     def do_POST(self):
+        return self._guard_request("POST", self._do_POST)
+
+    def _do_POST(self):
         u = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(u.query)
         path = u.path
@@ -423,8 +491,17 @@ class Handler(BaseHTTPRequestHandler):
             return self.json({"ok": True})
         if not self._authed(qs):
             return self.json({"error": "unauthorized"}, 401)
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(n) if n else b""
+        r = self._route_plugin("POST", path, qs, raw)   # 框架/插件注册的接口优先
+        if r is not None:
+            return r
         try:
-            return self.api_post(path, self.body_json())
+            body = json.loads(raw.decode("utf-8", "replace") or "{}") if raw else {}
+        except Exception:
+            body = {}
+        try:
+            return self.api_post(path, body)
         except Exception as e:
             core.log("web", "ERROR", "POST %s 失败: %s" % (path, e))
             return self.json({"error": str(e)}, 500)
@@ -667,9 +744,29 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     core.ensure_dirs()
     cfg = core.Config()
+
+    # 框架装配: 控制台进程只注册"路由/页面"角色, 插件的后台任务由调度进程跑
+    global APP
+    APP = QQOpsApp(name="console", roles=("console",), cfg=cfg,
+                   store=core.Store()).setup()
+    try:
+        n = len(console_pages.register(APP))
+        core.log("web", "INFO", "控制台接口注册 %d 个(含插件路由)" % n)
+    except Exception as e:                       # noqa: BLE001 —— 接口注册失败不该挡住控制台
+        errors.record("web.console_pages", exc=e, kind="register_failed")
+        core.log("web", "ERROR", "控制台接口注册失败: %s" % e)
+    APP.start()
+
     host = args.host or cfg.data["web"].get("host", "127.0.0.1")
     port = args.port or int(cfg.data["web"].get("port", 8091))
-    srv = ThreadingHTTPServer((host, port), Handler)
+    try:
+        srv = ThreadingHTTPServer((host, port), Handler)
+    except Exception as e:
+        errors.record("web.bind", exc=e, kind="bind_failed",
+                      message="端口 %s 绑定失败" % port)
+        core.log("web", "ERROR", "控制台启动失败: %s" % e)
+        print("[webapp] 启动失败: %s" % e, flush=True)
+        return 1
     url = "http://%s:%d/?token=%s" % (host, port, cfg.data["web"]["token"])
     core.log("web", "INFO", "控制台启动 %s" % url)
     print("[webapp] QQOps console: %s" % url, flush=True)
@@ -677,6 +774,11 @@ def main(argv=None) -> int:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        try:
+            APP.stop()
+        except Exception:
+            pass
     return 0
 
 
