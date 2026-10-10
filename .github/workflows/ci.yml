@@ -54,7 +54,20 @@ jobs:
       - name: 语法检查
         run: python -m compileall -q qqops
       - name: 冒烟测试(纯标准库, 不需要网络)
-        run: python tests/smoke.py
+        shell: bash
+        run: |
+          set +e
+          python tests/smoke.py > smoke.log 2>&1
+          rc=$?
+          cat smoke.log
+          if [ $rc -ne 0 ]; then
+            # 把失败测试名与原因发成 annotation: 日志要登录才能看, annotation 是公开的
+            grep -E "^(FAIL|ERROR): |^(AssertionError|TypeError|ValueError|KeyError|OSError|FileNotFoundError|PermissionError|Unicode[A-Za-z]*Error|RuntimeError|TimeoutError)" \
+              smoke.log | head -12 | while IFS= read -r line; do
+              echo "::error title=冒烟测试失败::$line"
+            done
+          fi
+          exit $rc
       - name: 确认没有第三方依赖
         run: python -c "import sys; sys.path.insert(0,'.'); import qqops, qqops.core, qqops.collector, qqops.summarizer, qqops.webapp, qqops.runner; print('import ok')"
 
