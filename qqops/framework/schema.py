@@ -22,7 +22,31 @@
 """
 from __future__ import annotations
 
-__all__ = ["defaults", "validate", "flatten", "schema_keys", "TYPE_ALIASES"]
+__all__ = ["defaults", "validate", "flatten", "schema_keys", "TYPE_ALIASES",
+           "opt_value", "opt_label", "norm_options"]
+
+
+def opt_value(o):
+    """选项的取值: 支持 `"a"` 和 `{"value": "a", "label": "甲"}` 两种写法。"""
+    return o.get("value") if isinstance(o, dict) else o
+
+
+def opt_label(o):
+    """选项的显示名(前端用; 没有 label 就用 value)。"""
+    if isinstance(o, dict):
+        return o.get("label") or o.get("value") or ""
+    return o
+
+
+def norm_options(opts) -> list:
+    """统一成 `[{value, label}]`, 前端只认这一种形状, 免得两处各写一套兼容。"""
+    out = []
+    for o in (opts or []):
+        v = opt_value(o)
+        if v is None or v == "":
+            continue
+        out.append({"value": str(v), "label": str(opt_label(o))})
+    return out
 
 TYPE_ALIASES = {
     "bool": "bool", "boolean": "bool", "switch": "bool",
@@ -118,8 +142,10 @@ def _coerce(node: dict, value, path: str, errors: list):
         else:
             v = "" if value is None else str(value)
             opts = node.get("options") or node.get("enum")
-            if opts and v not in [str(o) for o in opts]:
-                raise ValueError("只能是 %s 之一" % "/".join(str(o) for o in opts))
+            values_ok = [str(opt_value(o)) for o in (opts or [])]
+            if values_ok and v not in values_ok:
+                raise ValueError("只能是 %s 之一" % "/".join(
+                    str(opt_label(o)) for o in opts))
         return v, None
     except Exception as e:
         return node.get("default"), "%s: %s(已回退默认值 %r)" % (label, e, node.get("default"))
@@ -190,7 +216,7 @@ def flatten(schema: dict) -> list:
                     "label": item.get("description") or key,
                     "hint": item.get("hint") or "",
                     "default": item.get("default"),
-                    "options": item.get("options") or item.get("enum") or [],
+                    "options": norm_options(item.get("options") or item.get("enum")),
                     "min": item.get("min"), "max": item.get("max"),
                     "secret": bool(item.get("secret")),
                     "placeholder": item.get("placeholder") or "",

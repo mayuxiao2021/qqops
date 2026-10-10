@@ -86,5 +86,70 @@
       "show_tokens": {"type": "bool", "description": "显示 token 与成本", "default": true},
       "suggest_count": {"type": "int", "description": "推荐问题条数", "default": 4, "min": 0, "max": 8}
     }
+  },
+  "reply": {
+    "description": "在 QQ 里直接问",
+    "type": "object",
+    "hint": "在聊天窗口里发一句话就能查记录, 答案直接回在聊天里。**私聊默认开启**(仅限下面的白名单), 群聊默认关闭(怕打扰)。",
+    "items": {
+      "enable": {
+        "type": "bool",
+        "description": "启用聊天内问答",
+        "default": true,
+        "hint": "关掉后只有控制台「对话」页能问。"
+      },
+      "allow_users": {
+        "type": "list",
+        "description": "允许提问的 QQ 号",
+        "default": [],
+        "hint": "留空 = 只有「推送」里配置的主人 QQ 能用。别人发消息不会花额度。"
+      },
+      "prefix": {
+        "type": "list",
+        "description": "群里的触发前缀",
+        "default": ["问", "ai", "/ai", "?"],
+        "hint": "群聊必须带前缀才回应(不带前缀=机器人乱插话); 私聊不需要前缀。"
+      },
+      "group_enable": {
+        "type": "bool",
+        "description": "允许在群里问",
+        "default": false,
+        "hint": "打开后只有下面列出的群会回应; 群里回答会公开, 注意隐私。"
+      },
+      "groups": {
+        "type": "list",
+        "description": "允许提问的群号",
+        "default": [],
+        "hint": "需要先打开「允许在群里问」。"
+      },
+      "reply_mode": {
+        "type": "select",
+        "description": "回答形态",
+        "default": "text",
+        "options": [
+          {"value": "text", "label": "纯文本(最稳)"},
+          {"value": "forward", "label": "合并转发卡片(聊天记录样式)"},
+          {"value": "card", "label": "签名卡片 + 文本(需 QQ 版本支持)"}
+        ],
+        "hint": "卡片实测: 合并转发各种 QQ 版本都能渲染; 小程序卡片要 PacketBackend 支持当前 QQ 版本, 否则会显示\"卡片版本过低\"。"
+      },
+      "card_template": {
+        "type": "select",
+        "description": "卡片模板",
+        "default": "bili",
+        "options": [{"value": "bili", "label": "bilibili 风格"}, {"value": "weibo", "label": "微博风格"}]
+      },
+      "quote": {"type": "bool", "description": "引用提问再回答", "default": true,
+                "hint": "回答时引用你的问题, 上下文更清楚。"},
+      "show_sources": {"type": "bool", "description": "附来源编号", "default": true},
+      "cooldown": {"type": "int", "description": "同一人最短提问间隔(秒)", "default": 5,
+                   "min": 0, "max": 600, "hint": "防止连发刷屏。"},
+      "hours": {"type": "int", "description": "默认时间范围(小时, 0=用上面的默认)", "default": 0,
+                "min": 0, "max": 8760},
+      "max_chars": {"type": "int", "description": "单条回复上限(字符)", "default": 900,
+                    "min": 200, "max": 4000},
+      "reply_errors": {"type": "bool", "description": "失败时回一句原因", "default": true,
+                       "hint": "例如额度用完、模型不可用; 关掉则失败时静默。"}
+    }
   }
 }

@@ -446,6 +446,64 @@ class TestWebAndNapcat(unittest.TestCase):
         self.assertIn("next", snap["scheduler"])
         self.assertIn("collector", snap["services"])
 
+    def test_napcat_card_and_forward_payloads(self):
+        """卡片/转发/签名卡片的载荷必须符合 OneBot v11 结构, 且失败要能退回文本。"""
+        nc = core.NapCat(port=3000, token="t")
+        sent = []
+
+        def fake_call(action, payload=None, timeout=None):
+            sent.append((action, payload or {}))
+            return {"status": "ok", "retcode": 0, "data": {"message_id": 1}}
+
+        nc.call = fake_call
+        # 1) 合并转发: 节点结构 + 走 send_private_forward_msg
+        node = core.forward_node("QQOps", 10001, "正文", title="【标题】")
+        self.assertEqual(node["type"], "node")
+        self.assertEqual(node["data"]["uin"], "10001")
+        self.assertIn("【标题】", node["data"]["content"][0]["data"]["text"])
+        self.assertEqual(nc.send_forward([node], user_id=777).get("retcode"), 0)
+        self.assertEqual(sent[-1][0], "send_private_forward_msg")
+        self.assertTrue(sent[-1][1]["messages"])
+        # 2) 裸 JSON 卡片: 成功时只发一条卡片; 失败时退回纯文本
+        sent.clear()
+        self.assertEqual(nc.send_card(core.qq_card("t", "d"), user_id=777).get("retcode"), 0)
+        self.assertEqual([a for a, _ in sent], ["send_private_msg"])
+        self.assertIn('"type": "json"', json.dumps(sent[0][1], ensure_ascii=False))
+        sent.clear()
+
+        def fail_call(action, payload=None, timeout=None):
+            sent.append((action, payload or {}))
+            return {"status": "failed", "retcode": 1200, "message": "卡片版本过低"}
+
+        nc.call = fail_call
+        nc.send_card(core.qq_card("t", "d"), user_id=777, fallback_text="兜底文本")
+        self.assertEqual([a for a, _ in sent], ["send_private_msg", "send_private_msg"])
+        self.assertIn("兜底文本", json.dumps(sent[1][1], ensure_ascii=False))
+        nc.call = fake_call
+        # 3) 签名卡片: 拿不到签名 → 退回文本, 并把原因说出来
+        sent.clear()
+        nc.call = lambda action, payload=None, timeout=None: (
+            {"status": "failed", "retcode": 400, "message": "packetBackend不可用"}
+            if action == "get_mini_app_ark" else
+            sent.append((action, payload)) or {"status": "ok", "retcode": 0})
+        res = nc.send_miniapp_card("标题", "摘要", user_id=777, fallback_text="退文本")
+        self.assertEqual(res.get("retcode"), 0, res)
+        self.assertEqual(sent[-1][0], "send_private_msg")
+        ark, err = nc.miniapp_ark("标题", "摘要")
+        self.assertEqual(ark, "")
+        self.assertIn("packetBackend", err)
+        # 4) 官方分享卡片: 从 arkMsg 取出即可发
+        nc.call = lambda action, payload=None, timeout=None: (
+            {"status": "ok", "retcode": 0,
+             "data": {"errCode": 0, "arkMsg": '{"app":"com.tencent.contact.lua"}'}}
+            if action == "ArkSharePeer" else {"status": "ok", "retcode": 0})
+        ark2, err2 = nc.ark_share_peer(user_id=777)
+        self.assertIn("contact.lua", ark2)
+        self.assertEqual(err2, "")
+        # 5) CQ 码转人话(聊天里提问要先把原始消息洗干净)
+        self.assertEqual(core.cq_plain("[CQ:image,file=a.jpg] 问 谁交报告 [CQ:at,qq=1]"),
+                         "[图片] 问 谁交报告")
+
     def test_napcat_client_builds(self):
         nc = core.NapCat(port=3000, token="t")
         self.assertEqual(nc.base, "http://127.0.0.1:3000")
@@ -2057,6 +2115,43 @@ class TestIngestSpec(unittest.TestCase):
         with urllib.request.urlopen("http://127.0.0.1:%d/" % self.port, timeout=8) as r:
             return json.loads(r.read().decode())["counters"]
 
+    def test_09_private_published_but_not_stored(self):
+        """私聊默认**不入库**(隐私), 但仍要交给插件 —— 否则"在 QQ 里问 AI"收不到消息。
+
+        这是"聊天内智能查询"的入口条件: 采集器不能因为"不存私聊"就把事件一起丢掉。
+        """
+        from qqops import collector
+
+        published = []
+
+        class FakeApp:
+            def publish(self, event, wait=True):
+                published.append((event.kind, dict(event.payload)))
+
+        def handle(ev, cfg):
+            h = object.__new__(collector.Handler)
+            h.cfg, h.store, h.app = cfg, core.Store(), FakeApp()
+            h.counters = dict(collector.Handler.counters)
+            h._on_message(ev, "message")
+
+        ev = {"post_type": "message", "message_type": "private", "user_id": 5,
+              "message_id": 555001, "time": int(time.time()), "raw_message": "问 谁要交报告",
+              "message": [{"type": "text", "data": {"text": "问 谁要交报告"}}],
+              "sender": {"nickname": "我"}}
+        handle(dict(ev), core.Config())
+        self.assertEqual(len(published), 1, "私聊消息必须发到总线上(供插件响应)")
+        self.assertEqual(published[0][0], "message.received")
+        self.assertTrue(published[0][1].get("_not_stored"), "要标记未入库, 下游才不会再存一次")
+        rows = core.Store().messages(hours=24, size=200)["rows"]
+        self.assertEqual([r for r in rows if int(r.get("message_id") or 0) == 555001], [],
+                         "私聊默认不应入库")
+        # 关掉开关后, 私聊事件也不再交给插件(省内存/省事)
+        published.clear()
+        cfg2 = core.Config()
+        cfg2.set_values({"collector": {"command_private": False}})
+        handle(dict(ev), cfg2)
+        self.assertEqual(published, [], "command_private=false 时不应发布私聊事件")
+
     def test_01_message_ingested_and_deduped(self):
         """正常消息入库; 同一条(重连补发)必须被去重拦住。"""
         ev = {"post_type": "message", "message_type": "group", "group_id": 9001,
@@ -2474,6 +2569,112 @@ class TestAssistantPlugin(unittest.TestCase):
             d = src("Y", 1)
             self.assertFalse(d["ok"], d)
             self.assertIn("记忆", d["error"])
+        finally:
+            app.stop()
+
+    def test_reply_in_chat_private_query(self):
+        """在 QQ 私聊里发一句话就能查记录: 允许的人能收到回答, 别人/自己/冷却期不发。
+
+        这条链路横跨采集器 → 管线阶段 → 模型 → NapCat 发送, 之前完全没有, 也是
+        "推送的聊天里能不能智能查询"的落地验收。
+        """
+        app = self._app()
+        sent = []
+        try:
+            self._seed()
+            inst, _ = self._inst(app, texts=["小明要交实验报告 [#M1]"])
+            # 假 NapCat: 记录发送内容, 不真的连网
+            class FakeNap:
+                def __init__(self):
+                    self.texts, self.forwards = [], []
+
+                def send_text(self, text, user_id=0, group_id=0, max_chars=1200, reply_to=0):
+                    self.texts.append({"text": text, "user_id": user_id,
+                                       "group_id": group_id, "reply_to": reply_to})
+                    return 1
+
+                def send_forward(self, nodes, user_id=0, group_id=0, timeout=40):
+                    self.forwards.append({"nodes": nodes, "user_id": user_id, "group_id": group_id})
+                    return {"status": "ok", "retcode": 0}
+
+                def send_miniapp_card(self, *a, **kw):
+                    return {"status": "failed", "error": "no packet backend"}
+
+            fake = FakeNap()
+            real_nap = core.napcat_from_config
+            core.napcat_from_config = lambda cfg: fake
+            try:
+                app.plugins.set_config("assistant", {"reply": {"enable": True, "allow_users": [777],
+                                                               "reply_mode": "text", "cooldown": 0,
+                                                               "quote": True, "show_sources": True}})
+                app.ctx.invalidate_plugin_cfg("assistant")
+
+                def evt(uid, text, **kw):
+                    d = {"post_type": "message", "message_type": "private", "user_id": uid,
+                         "message_id": 90001, "time": int(time.time()), "raw_message": text,
+                         "message": [{"type": "text", "data": {"text": text}}],
+                         "sender": {"nickname": "我"}}
+                    d.update(kw)
+                    return d
+
+                # 1) 白名单内的人私聊提问 → 有回答, 且引用了提问
+                r = inst._maybe_reply(evt(777, "谁要交实验报告?"))
+                self.assertEqual(r.get("reply"), "sent", r)
+                self.assertEqual(len(fake.texts), 1, fake.texts)
+                self.assertIn("实验报告", fake.texts[0]["text"])
+                self.assertEqual(fake.texts[0]["reply_to"], 90001)
+                self.assertEqual(fake.texts[0]["user_id"], 777)
+                # 2) 不在白名单 → 一条都不发
+                fake.texts.clear()
+                r = inst._maybe_reply(evt(888, "谁要交实验报告?"))
+                self.assertEqual(r.get("reply"), "skipped(not_allowed)", r)
+                self.assertEqual(fake.texts, [])
+                # 3) 机器人自己发的消息不回应(否则自己跟自己聊)
+                self.assertIsNone(inst._maybe_reply(evt(777, "谁要交实验报告?", self=1)))
+                self.assertEqual(fake.texts, [])
+                # 4) 冷却期内的第二条被挡
+                app.plugins.set_config("assistant", {"reply": {"enable": True, "allow_users": [777], "cooldown": 60, "reply_mode": "text"}})
+                app.ctx.invalidate_plugin_cfg("assistant")
+                inst._maybe_reply(evt(777, "再问一次"))
+                fake.texts.clear()
+                r = inst._maybe_reply(evt(777, "又来一条"))
+                self.assertEqual(r.get("reply"), "skipped(cooldown)", r)
+                self.assertEqual(fake.texts, [])
+                # 5) 群里默认不回应; 开了群问答但没带前缀也不回应
+                self.assertIsNone(inst._maybe_reply(evt(777, "谁要交报告", message_type="group",
+                                                        group_id=6666)))
+                app.plugins.set_config("assistant", {"reply": {
+                    "enable": True, "allow_users": [777], "cooldown": 0, "reply_mode": "text",
+                    "group_enable": True, "groups": [6666]}})
+                app.ctx.invalidate_plugin_cfg("assistant")
+                self.assertIsNone(inst._maybe_reply(evt(777, "谁要交报告", message_type="group",
+                                                        group_id=6666)))
+                r = inst._maybe_reply(evt(777, "问 谁要交报告", message_type="group", group_id=6666))
+                self.assertEqual(r.get("reply"), "sent", r)
+                self.assertEqual(fake.texts[-1]["group_id"], 6666)
+                # 6) 别的群即使开了群问答也不理
+                self.assertIsNone(inst._maybe_reply(evt(777, "问 谁要交报告", message_type="group",
+                                                        group_id=9999)))
+                # 7) 合并转发卡片模式: 发的是转发而不是文本
+                app.plugins.set_config("assistant", {"reply": {
+                    "enable": True, "allow_users": [777], "cooldown": 0,
+                    "reply_mode": "forward", "group_enable": True, "groups": [6666]}})
+                app.ctx.invalidate_plugin_cfg("assistant")
+                fake.texts.clear()
+                fake.forwards.clear()
+                r = inst._maybe_reply(evt(777, "谁要交实验报告?", message_type="private"))
+                self.assertEqual(r.get("reply"), "sent", r)
+                self.assertTrue(fake.forwards, "forward 模式应该发合并转发")
+                self.assertEqual(fake.texts, [])
+                node_text = json.dumps(fake.forwards[0]["nodes"], ensure_ascii=False)
+                self.assertIn("提问", node_text)
+                self.assertIn("回答", node_text)
+                # 8) 统计: 控制台能看到"QQ 里问了几次"
+                st = core.state_get("assistant_reply_stats", {}) or {}
+                self.assertGreaterEqual(int(st.get("answered") or 0), 2, st)
+                self.assertGreaterEqual(int(st.get("skipped") or 0), 2, st)
+            finally:
+                core.napcat_from_config = real_nap
         finally:
             app.stop()
 

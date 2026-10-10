@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 import secrets
 
-VERSION = "3.2.1"
+VERSION = "3.3.0"
 
 # 路径解析(踩过坑, 别改回 "靠 $HOME 猜"):
 #   曾经用 BASE = ~/qqops —— 但 $HOME 是环境给的, 从别的目录/cron/adb run-as 调用时
@@ -51,6 +51,8 @@ DEFAULT_CONFIG = {
     "collector": {
         "host": "127.0.0.1", "port": 8080, "secret": "", "require_signature": False,
         "groups": [], "kinds": [], "store_private": False, "debug": False,
+        # 私聊不入库, 但仍交给插件处理(聊天里问 AI 要用); 关掉它私聊提问就没反应
+        "command_private": True,
     },
     "summarizer": {
         "base_url": "https://api.deepseek.com/v1", "api_key": "", "model": "deepseek-chat",
@@ -1275,14 +1277,161 @@ class NapCat:
         return self.call("send_group_msg", {"group_id": int(group_id),
                                             "message": [{"type": "text", "data": {"text": text}}]}, 30)
 
-    def send_text(self, text: str, user_id: int = 0, group_id: int = 0, max_chars: int = 1200) -> int:
+    # ------------------------------------------------------------ 通用/卡片
+    def send_message(self, message: list, user_id: int = 0, group_id: int = 0,
+                     timeout: int = 30) -> dict:
+        """发任意消息段数组(OneBot v11 message 数组)。"""
+        action = "send_group_msg" if group_id else "send_private_msg"
+        payload = {"message": list(message or [])}
+        payload["group_id" if group_id else "user_id"] = int(group_id or user_id)
+        return self.call(action, payload, timeout)
+
+    def send_card(self, card: dict, user_id: int = 0, group_id: int = 0,
+                  fallback_text: str = "", reply_to: int = 0) -> dict:
+        """发自定义 JSON 卡片(mini-app 卡片)。失败或 retcode!=0 时自动退回纯文本。
+
+        ⚠️ 现实约束(2026-10 实测): 新版 QQ 要求卡片数据**带签名**, 自己拼的
+        `com.tencent.miniapp_01` / `com.tencent.structmsg` 会被客户端判为
+        "卡片版本过低" 而不渲染。签名卡片的官方接口是 NapCat 的 `get_mini_app_ark`
+        (见 `send_miniapp_card`), 而它依赖 PacketBackend, 只支持特定 QQ 版本区间。
+        所以这里永远给一份 fallback_text, 并把失败原因记进日志。
+        """
+        segs = []
+        if reply_to:
+            segs.append({"type": "reply", "data": {"id": str(reply_to)}})
+        segs.append({"type": "json", "data": {"data": json.dumps(card or {}, ensure_ascii=False)}})
+        try:
+            res = self.send_message(segs, user_id=user_id, group_id=group_id)
+        except Exception as e:                       # noqa: BLE001
+            res = {"status": "error", "error": str(e)}
+        if str(res.get("status")) == "ok" and int(res.get("retcode") or 0) == 0:
+            return res
+        log("core", "WARN", "JSON 卡片发送失败(客户端可能提示卡片版本过低): %s"
+            % str(res.get("message") or res.get("error") or res)[:120])
+        if fallback_text:
+            try:
+                if group_id:
+                    return self.send_group(group_id, fallback_text)
+                return self.send_private(user_id, fallback_text)
+            except Exception as e:                   # noqa: BLE001
+                return {"status": "error", "error": str(e), "card_failed": res}
+        return res
+
+    # ------------------------------------------------------------ 签名卡片/分享卡片
+    def miniapp_ark(self, title: str, desc: str = "", pic_url: str = "", jump_url: str = "",
+                    template: str = "bili", web_url: str = "") -> tuple:
+        """用 NapCat 官方接口生成**带签名**的小程序卡片数据。
+
+        返回 `(ark, error)`: 成功时 ark 是可直接发的 JSON 字符串。
+        失败原因通常是 PacketBackend 不可用(QQ 版本超出支持区间)——
+        原文照抄, 便于在控制台上直接看到"为什么卡片发不出去"。
+        """
+        payload = {"type": template, "title": title or "", "desc": desc or "",
+                   "picUrl": pic_url or "", "jumpUrl": jump_url or "https://qq.com"}
+        if web_url:
+            payload["webUrl"] = web_url
+        try:
+            res = self.call("get_mini_app_ark", payload, 40)
+        except Exception as e:                       # noqa: BLE001
+            return "", "%s: %s" % (type(e).__name__, e)
+        if str(res.get("status")) != "ok" or int(res.get("retcode") or 0) != 0:
+            return "", str(res.get("message") or res.get("wording") or res)[:300]
+        data = res.get("data")
+        ark = data.get("ark") if isinstance(data, dict) else data
+        if isinstance(ark, (dict, list)):
+            ark = json.dumps(ark, ensure_ascii=False)
+        return (ark or ""), ("" if ark else "接口没有返回 ark 数据")
+
+    def send_miniapp_card(self, title: str, desc: str = "", pic_url: str = "", jump_url: str = "",
+                          user_id: int = 0, group_id: int = 0, fallback_text: str = "",
+                          template: str = "bili") -> dict:
+        """发**签名**小程序卡片; 拿不到签名就自动退回 `fallback_text`。"""
+        ark, err = self.miniapp_ark(title, desc, pic_url, jump_url, template)
+        if not ark:
+            log("core", "WARN", "签名卡片不可用, 已退回文本: %s" % err)
+            if fallback_text:
+                try:
+                    if group_id:
+                        return self.send_group(group_id, fallback_text)
+                    return self.send_private(user_id, fallback_text)
+                except Exception as e:               # noqa: BLE001
+                    return {"status": "error", "error": str(e), "ark_error": err}
+            return {"status": "failed", "error": err}
+        try:
+            return self.send_message([{"type": "json", "data": {"data": ark}}],
+                                     user_id=user_id, group_id=group_id)
+        except Exception as e:                       # noqa: BLE001
+            if fallback_text:
+                return self.send_private(user_id, fallback_text)
+            return {"status": "error", "error": str(e)}
+
+    def ark_share_peer(self, user_id: int = 0, group_id: int = 0) -> tuple:
+        """官方**分享**卡片(联系人/群): 走 NTQQ 原生分享, 自带签名, 不依赖 PacketBackend。
+
+        返回 `(ark, error)`。实测 NapCat 4.18.33 可用(retcode 0, app=com.tencent.contact.lua)。
+        """
+        payload = {"group_id": int(group_id)} if group_id else {"user_id": int(user_id)}
+        try:
+            res = self.call("ArkSharePeer", payload, 30)
+        except Exception as e:                       # noqa: BLE001
+            return "", "%s: %s" % (type(e).__name__, e)
+        data = res.get("data") or {}
+        ark = data.get("arkMsg") or ""
+        if not ark:
+            return "", str(data.get("errMsg") or res.get("message") or "没有返回 arkMsg")[:200]
+        return ark, ""
+
+    def send_share_card(self, user_id: int = 0, group_id: int = 0, fallback_text: str = "") -> dict:
+        """发官方分享卡片(联系人/群), 失败退回文本。"""
+        ark, err = self.ark_share_peer(user_id=user_id, group_id=group_id)
+        if not ark:
+            log("core", "WARN", "分享卡片不可用: %s" % err)
+            if fallback_text:
+                return (self.send_group(group_id, fallback_text) if group_id
+                        else self.send_private(user_id, fallback_text))
+            return {"status": "failed", "error": err}
+        target = {"group_id": int(group_id)} if group_id else {"user_id": int(user_id)}
+        return self.send_message([{"type": "json", "data": {"data": ark}}], **target)
+
+    def send_forward(self, nodes: list, user_id: int = 0, group_id: int = 0,
+                     timeout: int = 40) -> dict:
+        """发**合并转发**(客户端显示为"聊天记录"卡片): 内容任意, 不需要签名。
+
+        `nodes` 用 `core.forward_node()` 构造。实测 `send_private_forward_msg` /
+        `send_forward_msg` 在 NapCat 4.18.33 上均可用。
+        """
+        action = "send_group_forward_msg" if group_id else "send_private_forward_msg"
+        payload = {"messages": list(nodes or [])}
+        payload["group_id" if group_id else "user_id"] = int(group_id or user_id)
+        try:
+            res = self.call(action, payload, timeout)
+        except Exception as e:                       # noqa: BLE001
+            return {"status": "error", "error": str(e)}
+        if str(res.get("status")) != "ok" or int(res.get("retcode") or 0) != 0:
+            # 退回通用 send_forward_msg(部分版本只实现了一个)
+            try:
+                payload2 = {"message": list(nodes or []),
+                            "group_id" if group_id else "user_id": int(group_id or user_id)}
+                res2 = self.call("send_forward_msg", payload2, timeout)
+                if str(res2.get("status")) == "ok" and int(res2.get("retcode") or 0) == 0:
+                    return res2
+            except Exception:
+                pass
+        return res
+
+    def send_text(self, text: str, user_id: int = 0, group_id: int = 0, max_chars: int = 1200,
+                  reply_to: int = 0) -> int:
         chunks = [text[i:i + max_chars] for i in range(0, len(text), max_chars)] or [""]
         sent = 0
-        for c in chunks:
+        for i, c in enumerate(chunks):
+            segs = []
+            if reply_to and i == 0:                  # 引用只挂在第一段, 免得刷屏
+                segs.append({"type": "reply", "data": {"id": str(reply_to)}})
+            segs.append({"type": "text", "data": {"text": c}})
             if group_id:
-                self.send_group(group_id, c)
+                self.send_message(segs, group_id=group_id)
             else:
-                self.send_private(user_id, c)
+                self.send_message(segs, user_id=user_id)
             sent += 1
             time.sleep(0.4)
         return sent
@@ -1300,6 +1449,59 @@ class NapCat:
 def napcat_from_config(cfg: Config) -> NapCat:
     p = cfg.data.get("push", {})
     return NapCat(port=int(p.get("napcat_api_port", 3000)), token=p.get("token", ""))
+
+
+def forward_node(name: str, uin: int, text: str, title: str = "") -> dict:
+    """构造一个合并转发节点(客户端显示为聊天记录卡片里的一条)。
+
+    `uin` 只能是真实存在的 QQ 号或 0(部分版本对伪造 uin 有限制);
+    标题类内容建议用 `title` 放在第一行, 免得 QQ 把昵称当成标题显示错。
+    """
+    body = ("%s\n%s" % (title, text)) if title else str(text or "")
+    return {"type": "node", "data": {
+        "uin": str(int(uin or 0)),
+        "name": name or "QQOps",
+        "content": [{"type": "text", "data": {"text": body[:4000]}}]}}
+
+
+def qq_card(title: str, desc: str = "", tag: str = "QQOps", url: str = "",
+            preview: str = "", icon: str = "") -> dict:
+    """构造 QQ 小程序卡片(JSON 卡片)的载荷, 交给 `NapCat.send_card` 发出去。
+
+    这是 QQ 客户端认的 ark/mini-app 结构: `meta.detail_1` 是卡片正文。
+    卡片只在 QQ 里好看, 内容要**自包含**(客户端不一定会渲染长文本),
+    所以调用方同时准备一份纯文本兜底。
+    """
+    url = url or "https://qq.com"
+    return {
+        "app": "com.tencent.miniapp_01",
+        "desc": tag,
+        "view": "news",
+        "ver": "0.0.0.1",
+        "prompt": "[%s] %s" % (tag, (title or "")[:40]),
+        "config": {"forward": 1, "type": "normal", "autosize": True},
+        "meta": {"detail_1": {
+            "appid": "1109937557",
+            "title": (title or "")[:60],
+            "desc": (desc or "")[:120],
+            "icon": icon or preview or "https://q1.qlogo.cn/g?b=qq&nk=10000&s=100",
+            "preview": preview or icon or "https://q1.qlogo.cn/g?b=qq&nk=10000&s=100",
+            "qqdocurl": url,
+            "url": url,
+        }},
+    }
+
+
+def cq_plain(raw: str) -> str:
+    """把带 CQ 码的原始消息变成人话: 去 CQ 码、图片/卡片换成占位、压空白。"""
+    t = str(raw or "")
+    t = re.sub(r"\[CQ:json[^\n]*", "[卡片]", t)
+    t = re.sub(r"\[CQ:(?:xml|forward)[^\n]*", "[转发]", t)
+    t = re.sub(r"\[CQ:image[^\]]*\]", "[图片]", t)
+    t = re.sub(r"\[CQ:record[^\]]*\]", "[语音]", t)
+    t = re.sub(r"\[CQ:file[^\]]*\]", "[文件]", t)
+    t = re.sub(r"\[CQ:([a-zA-Z_]+)(?:[^\[\]]|\[[^\[\]]*\])*\]", "", t)
+    return re.sub(r"\s+", " ", t).strip()
 
 
 # ---------------------------------------------------------------- 进程/服务

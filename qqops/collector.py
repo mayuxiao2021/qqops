@@ -147,6 +147,14 @@ class Handler(BaseHTTPRequestHandler):
     def _on_message(self, ev: dict, ptype: str) -> None:
         c = self.counters
         if not self._keep(ev, ptype):
+            # 私聊默认**不入库**(隐私), 但"在聊天里提问"要靠它 —— 只发事件、不落库,
+            # 并打上 `_not_stored` 标记, 下游不会把它当成已采集的消息。
+            col = self.cfg.data["collector"]
+            mtype = str(ev.get("message_type") or "group")
+            if ptype == "message" and mtype != "group" and col.get("command_private", True):
+                c["skipped"] += 1
+                self._publish_message(ev, ptype, stored=False)
+                return
             c["skipped"] += 1
             return
         try:
@@ -175,16 +183,22 @@ class Handler(BaseHTTPRequestHandler):
                 ev.get("group_id"), (ev.get("sender") or {}).get("nickname"),
                 (ev.get("raw_message") or "")[:60]))
         # 落库之后把事件交给总线(插件/阶段在后台处理, 不阻塞采集, 保证 NapCat 快速拿到 200)
-        if self.app is not None:
-            try:
-                kind = "message.sent" if ptype == "message_sent" else "message.received"
-                session = ("group:%s" % (ev.get("group_id") or 0)
-                           if (ev.get("message_type") or "group") == "group"
-                           else "private:%s" % (ev.get("user_id") or 0))
-                self.app.publish(Event(kind, payload=ev, source="onebot", session=session),
-                                 wait=False)
-            except Exception as e:                   # noqa: BLE001
-                errors.record("collector.publish", exc=e, kind="publish_failed")
+        self._publish_message(ev, ptype)
+
+    def _publish_message(self, ev: dict, ptype: str, stored: bool = True) -> None:
+        """把消息事件交给总线。`stored=False` 表示"只在内存里过一遍, 没入库"。"""
+        if self.app is None:
+            return
+        try:
+            payload = ev if stored else dict(ev, _not_stored=True)
+            kind = "message.sent" if ptype == "message_sent" else "message.received"
+            session = ("group:%s" % (ev.get("group_id") or 0)
+                       if (ev.get("message_type") or "group") == "group"
+                       else "private:%s" % (ev.get("user_id") or 0))
+            self.app.publish(Event(kind, payload=payload, source="onebot", session=session),
+                             wait=False)
+        except Exception as e:                       # noqa: BLE001
+            errors.record("collector.publish", exc=e, kind="publish_failed")
 
     def _keep(self, ev: dict, ptype: str = "message") -> bool:
         cfg = self.cfg.data["collector"]

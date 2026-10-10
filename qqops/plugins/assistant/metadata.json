@@ -1,9 +1,9 @@
 {
   "id": "assistant",
   "name": "智能查询",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "qqops",
-  "desc": "用自然语言问你的群记录: 谁说了什么、有什么待办、链接和图片里是什么",
+  "desc": "用自然语言问你的群记录: 控制台「对话」页提问, 或在 QQ 里直接发消息问(私聊默认开启)",
   "priority": 20,
   "enabled_by_default": true,
   "depends": []

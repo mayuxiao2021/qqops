@@ -418,8 +418,11 @@ async function openPluginConfig(pid) {
     const id = 'cf-' + f.path.replace(/\./g, '_');
     let input;
     if (f.type === 'bool') input = `<label class="switch"><input type="checkbox" id="${id}" ${f.value ? 'checked' : ''}><span></span></label>`;
-    else if (f.options && f.options.length) input = `<select id="${id}">${f.options.map(o =>
-      `<option ${String(f.value) === String(o) ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
+    else if (f.options && f.options.length) input = `<select id="${id}">${f.options.map(o => {
+      const v = (o && typeof o === 'object') ? o.value : o;
+      const t = (o && typeof o === 'object') ? (o.label || o.value) : o;
+      return `<option value="${esc(v)}" ${String(f.value) === String(v) ? 'selected' : ''}>${esc(t)}</option>`;
+    }).join('')}</select>`;
     else if (f.type === 'int' || f.type === 'float') input = `<input id="${id}" type="number" value="${esc(f.value)}" ${f.min != null ? `min="${f.min}"` : ''} ${f.max != null ? `max="${f.max}"` : ''}>`;
     else if (f.type === 'list') input = `<input id="${id}" value="${esc((f.value || []).join(', '))}" placeholder="逗号分隔">`;
     else input = `<input id="${id}" type="${f.secret ? 'password' : 'text'}" value="${esc(f.secret ? '' : f.value)}" ${f.secret && f.configured ? 'placeholder="已配置(留空则不修改)"' : ''}>`;
@@ -500,6 +503,19 @@ VIEWS.chat = async (v) => {
         模型: ${llm.configured ? esc(llm.model || '已配置') : '<span class="err">未配置</span>'}
         ${llm.configured ? '' : '<br>到「设置」填 API Key, 或让 summarizer 有 key'}
       </div>
+      <div class="card" style="margin-top:10px">
+        <h3>QQ 里也能问 <span class="muted">不用打开控制台</span></h3>
+        <div class="muted" style="font-size:12px;line-height:1.7">
+          私聊机器人直接发问题即可(仅限白名单, 默认只有你自己);<br>
+          群里要带前缀「问」, 且需在插件配置里放行该群。
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button id="chat-cardtest">测试卡片渲染</button>
+        </div>
+        <div class="muted" style="font-size:12px;margin-top:6px">
+          会往你的 QQ 发几种卡片; 哪种能正常显示, 就在插件配置里选哪种回答形态。
+        </div>
+      </div>
     </aside>
     <section class="chatmain">
       <div class="chatturns" id="chat-turns">
@@ -551,6 +567,29 @@ VIEWS.chat = async (v) => {
   };
   q(v, '#chat-new').onclick = () => { chatSession = ''; render(); };
   q(v, '#chat-clear').onclick = () => { chatSession = ''; render(); };
+  q(v, '#chat-cardtest').onclick = async () => {
+    const b = q(v, '#chat-cardtest');
+    b.disabled = true; b.textContent = '发送中…';
+    const r = await api('/api/assistant/reply/test', {method: 'POST', body: '{}'});
+    b.disabled = false; b.textContent = '测试卡片渲染';
+    if (!r || !r.ok) return toast((r && r.error) || '发送失败', 'bad');
+    const rows = Object.entries(r.results || {}).map(([k, v]) => {
+      const ok = v && (v.status === 'ok' || v.ark);
+      const why = !v ? '无结果'
+        : (v.status === 'ok' ? '已发送' : (v.error || v.message || JSON.stringify(v)));
+      return `<div class="it"><span class="pill ${ok ? 'ok' : 'bad'}">${ok ? '成功' : '失败'}</span>
+        <b style="width:88px">${esc(CARD_CN[k] || k)}</b>
+        <span class="right muted ellip">${esc(String(why).slice(0, 90))}</span></div>`;
+    }).join('');
+    modal('卡片测试', `<div class="muted">已发到 QQ ${esc(String(r.user_id || ''))}, 去聊天窗口看哪种卡片能正常显示:</div>
+      <div class="list" style="margin-top:8px">${rows}</div>
+      <div class="muted" style="margin-top:10px;line-height:1.7">
+        · <b>合并转发卡片</b>: 显示成"聊天记录", 各版本 QQ 都能渲染, 内容任意;<br>
+        · <b>官方分享卡片</b>: QQ 原生联系人/群卡片, 带签名, 但内容由 QQ 模板决定;<br>
+        · <b>小程序卡片</b>: 需要 NapCat 的 PacketBackend 支持当前 QQ 版本, 否则会提示"卡片版本过低";<br>
+        · <b>裸 JSON 卡片</b>: 不带签名, 现在的 QQ 基本不渲染(仅作对照)。
+      </div>`);
+  };
   v.querySelectorAll('[data-ask]').forEach(b => b.onclick = () => send(b.dataset.ask));
   v.querySelectorAll('[data-sid]').forEach(el => el.onclick = e => {
     if (e.target.dataset.del) return;
@@ -1162,7 +1201,8 @@ const CFG_CN = {
               require_signature: ['强制校验签名', '开启后没有正确签名的上报一律拒绝'],
               groups: ['采集过滤: 只收这些群', '填群号, 逗号分隔; 留空=全部都收(总结哪些群在「群组」页勾选)'],
               kinds: ['采集过滤: 只收这些类型', '如 text,image; 留空=全部都收'],
-              store_private: ['也保存私聊消息', '默认只存群消息'],
+              store_private: ['也保存私聊消息', '默认只存群消息; 想连私聊内容一起进总结就打开'],
+              command_private: ['私聊不入库也交给插件', '关掉后「在 QQ 里问 AI」不再响应私聊(隐私换功能)'],
               debug: ['记录每条消息到日志', '排错用, 平时建议关闭']},
   summarizer: {base_url: ['模型接口地址', 'OpenAI 兼容接口, 例如 https://api.deepseek.com/v1'],
                api_key: ['模型密钥', '留空表示不修改'], model: ['模型名', '例如 deepseek-chat'],
@@ -1424,6 +1464,7 @@ VIEWS.ops = async (v) => {
   return _opsBackup(box);
 };
 /* --------------------------------------------- 运维: 资源与功耗(进程合并/低功耗) */
+const CARD_CN = {forward: '合并转发卡片', share: '官方分享卡片', miniapp: '小程序卡片', json: '裸 JSON 卡片'};
 const MODE_CN = {single: '单进程(省内存)', multi: '多进程(隔离好)', auto: '自动'};
 const POWER_CN = {performance: '性能', balanced: '均衡', saver: '省电'};
 async function _opsRes(box) {

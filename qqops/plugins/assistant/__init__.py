@@ -15,7 +15,8 @@ import json
 import re
 import time
 
-from qqops.framework.api import Plugin, command, page, register, route
+from qqops import core
+from qqops.framework.api import Plugin, command, on_stage, page, register, route
 from qqops.framework import llm as llm_mod
 
 # 提问里的时间线索 → 小时数
@@ -308,8 +309,8 @@ class AssistantPlugin(Plugin):
             except Exception:
                 scope["group_name"] = ""
         sid = session_id or self.ctx.store.chat_session_create(question[:40])
-        if not session_id:
-            self.ctx.store.chat_session_touch(sid, title=question[:40])
+        # 已有会话(QQ 里追问 / 控制台继续问)也要 touch —— 否则"轮次"永远是 0
+        self.ctx.store.chat_session_touch(sid, title="" if session_id else question[:40])
         self.ctx.store.chat_append(sid, "user", question)
 
         bundle = self._retrieve(question, scope)
@@ -383,6 +384,211 @@ class AssistantPlugin(Plugin):
                   % (question[:30], len(answer), len(sources), rounds, cost))
         out["ms"] = int((time.time() - t_start) * 1000)
         return out
+
+    # ================================================================== 聊天里直接问
+    # 在 QQ 里(私聊默认, 群需显式开启)发一句话就能查记录: 采集阶段触发, 答案发回聊天。
+    # 为什么要做成管线阶段: 事件级/阶段级 guard 会兜住异常, 单条消息出问题不影响采集。
+    @on_stage("assistant_reply", order=45)
+    def reply_stage(self, event, ctx):
+        if event.kind != "message.received":
+            return None
+        try:
+            out = self._maybe_reply(event.payload or {})
+        except Exception as e:                       # noqa: BLE001 —— 回答失败不能影响采集
+            from qqops.framework import errors as _errors
+            _errors.record("assistant.reply", exc=e, kind="reply_failed")
+            self._bump_stat("failed", str(e)[:120])
+            return {"reply": "failed"}
+        return out
+
+    def _cfg_reply(self) -> dict:
+        return self._cfg("reply")
+
+    def _owner_id(self) -> int:
+        try:
+            return int((self.ctx.cfg.data.get("push") or {}).get("user_id") or 0)
+        except Exception:
+            return 0
+
+    def _allowed_users(self, cfg: dict) -> list:
+        users = [int(u) for u in (cfg.get("allow_users") or []) if str(u).strip().lstrip("-").isdigit()]
+        if not users and self._owner_id():           # 默认只有主人能用(避免陌生人烧额度)
+            users = [self._owner_id()]
+        return users
+
+    def _question_of(self, ev: dict, is_group: bool, cfg: dict) -> str:
+        text = core.cq_plain(ev.get("raw_message") or ev.get("message") or "")
+        if not text:
+            return ""
+        prefixes = [str(p) for p in (cfg.get("prefix") or []) if str(p).strip()] or ["问", "ai", "/ai", "?"]
+        hit = ""
+        low = text.lower()
+        for p in prefixes:
+            if low.startswith(p.lower()):
+                hit = p
+                break
+        if hit:
+            text = text[len(hit):].lstrip(" :：,，、")
+            return text
+        if is_group and cfg.get("group_need_prefix", True):
+            return ""                                # 群里必须带前缀, 否则等于机器人乱插话
+        return text if not is_group else ""
+
+    def _session_for(self, uid: int, nickname: str) -> str:
+        """每个 QQ(或群)一个会话, 这样在 QQ 里可以接着追问("那昨天呢")。"""
+        key = "assistant_reply_sessions"
+        m = core.state_get(key, {}) or {}
+        sid = str(m.get(str(uid)) or "")
+        if sid and self.ctx.store.chat_session(sid):
+            return sid
+        sid = self.ctx.store.chat_session_create("%s 的 QQ 提问" % (nickname or uid))
+        m[str(uid)] = sid
+        if len(m) > 200:                             # 别让 state 无限膨胀
+            m = dict(list(m.items())[-200:])
+        core.state_set(key, m)
+        return sid
+
+    def _cooling(self, uid: int, seconds: int) -> bool:
+        if seconds <= 0:
+            return False
+        last = float(core.state_get("assistant_cd_%d" % uid, 0) or 0)
+        if core.now() - last < seconds:
+            return True
+        core.state_set("assistant_cd_%d" % uid, core.now())
+        return False
+
+    def _bump_stat(self, field: str, note: str = "") -> dict:
+        st = core.state_get("assistant_reply_stats", {}) or {}
+        st[field] = int(st.get(field) or 0) + 1
+        st["last_ts"] = int(core.now())
+        if field == "answered":
+            st["last_question"] = note[:80]
+        elif note:
+            st["last_error"] = note[:200]
+        core.state_set("assistant_reply_stats", st)
+        return st
+
+    def _maybe_reply(self, ev: dict) -> dict:
+        cfg = self._cfg_reply()
+        if not cfg.get("enable", True):
+            return None
+        if ev.get("self") or ev.get("post_type") == "message_sent":
+            return None                              # 自己发的消息不回应(否则自己跟自己聊)
+        is_group = str(ev.get("message_type") or "group") == "group"
+        gid = int(ev.get("group_id") or 0) if is_group else 0
+        if is_group:
+            if not cfg.get("group_enable", False):
+                return None
+            if gid not in [int(g) for g in (cfg.get("groups") or []) if str(g).strip().lstrip("-").isdigit()]:
+                return None
+        uid = int(ev.get("user_id") or 0)
+        if not uid:
+            return None
+        users = self._allowed_users(cfg)
+        if not users:
+            # 既没配白名单、也没配主人 QQ → 一律不响应(否则任何陌生人都能烧你的额度)
+            self._bump_stat("skipped", "no_allowlist")
+            return {"reply": "skipped(no_allowlist)"}
+        if uid not in users:
+            self._bump_stat("skipped", "not_allowed")
+            return {"reply": "skipped(not_allowed)"}
+        question = self._question_of(ev, is_group, cfg)
+        if not question:
+            return None
+        cd = cfg.get("cooldown")
+        cd = 5 if cd is None else int(cd)            # 注意: 不能用 `or 5` —— 配 0 是"不冷却", 会被 falsy 吃掉
+        if self._cooling(uid, cd):
+            self._bump_stat("skipped", "cooldown")
+            return {"reply": "skipped(cooldown)"}
+        nickname = (ev.get("sender") or {}).get("nickname") or str(uid)
+        sid = self._session_for(gid or uid, nickname if not is_group else "群%s" % gid)
+        res = self.ask(question, session_id=sid, hours=int(cfg.get("hours") or 0), group=gid)
+        target = {"group_id": gid} if gid else {"user_id": uid}
+        if res.get("ok") is False:
+            self._bump_stat("failed", str(res.get("error")))
+            if cfg.get("reply_errors", True):
+                self._send(target, "查询失败: %s" % (res.get("error") or "未知原因"),
+                           question, int(ev.get("message_id") or 0), cfg)
+            return {"reply": "failed", "error": res.get("error")}
+        answer = str(res.get("answer") or "").strip() or "(没有取到回答)"
+        if res.get("degraded"):
+            answer += "\n(模型不可用或记录不足, 以上为检索到的记录)"
+        self._send(target, answer, question, int(ev.get("message_id") or 0), cfg,
+                   sources=res.get("sources") or [])
+        self._bump_stat("answered", question)
+        core.log("assistant", "INFO", "QQ 提问已回复(%s): %s" % (
+            "群%s" % gid if gid else "私聊 %s" % uid, question[:40]))
+        return {"reply": "sent", "chars": len(answer), "sources": len(res.get("sources") or [])}
+
+    def _send(self, target: dict, answer: str, question: str, reply_to: int, cfg: dict,
+              sources: list = None) -> dict:
+        """按配置的形态发回聊天: text(纯文本) / forward(合并转发卡片) / card(签名卡片+文本)。"""
+        napcat = core.napcat_from_config(self.ctx.cfg)
+        mode = str(cfg.get("reply_mode") or "text").lower()
+        sources = sources or []
+        tail = ""
+        if cfg.get("show_sources", True) and sources:
+            names = []
+            for s in sources[:6]:
+                names.append("[%s] %s" % (s.get("ref"), (s.get("label") or "")[:28]))
+            tail = "\n\n来源: " + " · ".join(names)
+        if mode == "forward":
+            nodes = [core.forward_node("QQOps", self._owner_id(), question, title="【提问】"),
+                     core.forward_node("QQOps", self._owner_id(), answer, title="【回答】")]
+            if tail:
+                nodes.append(core.forward_node("QQOps", self._owner_id(), tail.strip(), title="【来源】"))
+            res = napcat.send_forward(nodes, **target)
+            if str(res.get("status")) == "ok":
+                return res
+            mode = "text"                            # 转发失败就退回文本
+        if mode == "card":
+            title = "QQOps 智能查询"
+            res = napcat.send_miniapp_card(title, answer[:110], user_id=target.get("user_id", 0),
+                                          group_id=target.get("group_id", 0),
+                                          fallback_text="", template=str(cfg.get("card_template") or "bili"))
+            if str(res.get("status")) == "ok":
+                napcat.send_text(answer + tail, max_chars=int(cfg.get("max_chars") or 900), **target)
+                return res
+            # 卡片不可用(QQ 版本/PacketBackend) → 文本兜底, 并把原因留给日志
+            core.log("assistant", "WARN", "签名卡片不可用, 改用文本回复: %s"
+                     % str(res.get("error") or res)[:120])
+        napcat.send_text(answer + tail, max_chars=int(cfg.get("max_chars") or 900),
+                         reply_to=reply_to if cfg.get("quote", True) else 0, **target)
+        return {"status": "ok", "mode": "text"}
+
+    # ================================================================== 控制台接口
+    @route("/api/assistant/reply/test", methods=("POST",))
+    def api_reply_test(self, req, ctx):
+        """把三种"卡片"各发一条到主人 QQ, 用来确认哪种在你这版 QQ 上真的能渲染。"""
+        body = req.json() or {}
+        kinds = body.get("kinds") or ["forward", "share", "miniapp"]
+        uid = int(body.get("user_id") or self._owner_id() or 0)
+        if not uid:
+            return {"ok": False, "error": "还没配置 push.user_id, 不知道发给谁"}
+        napcat = core.napcat_from_config(self.ctx.cfg)
+        out = {"ok": True, "user_id": uid, "results": {}}
+        for k in kinds:
+            if k == "forward":
+                nodes = [core.forward_node("QQOps", uid, "这是合并转发卡片: 内容任意, 不需要签名。",
+                                           title="【卡片测试 A】聊天记录卡片"),
+                         core.forward_node("QQOps", uid, "报告与长回答适合用它。", title="【说明】")]
+                out["results"]["forward"] = napcat.send_forward(nodes, user_id=uid)
+            elif k == "share":
+                out["results"]["share"] = napcat.send_share_card(user_id=uid)
+            elif k == "miniapp":
+                ark, err = napcat.miniapp_ark("QQOps 签名卡片", "NapCat get_mini_app_ark 生成",
+                                             self._owner_avatar(), "https://qq.com")
+                out["results"]["miniapp"] = ({"status": "ok", "ark": ark[:120]}
+                                             if ark else {"status": "failed", "error": err})
+            elif k == "json":
+                card = core.qq_card("QQOps 裸 JSON 卡片", "客户端可能提示卡片版本过低")
+                out["results"]["json"] = napcat.send_card(card, user_id=uid,
+                                                          fallback_text="[卡片测试] 裸 JSON 卡片(已退回文本)")
+        return out
+
+    def _owner_avatar(self) -> str:
+        uid = self._owner_id()
+        return ("https://q1.qlogo.cn/g?b=qq&nk=%d&s=640" % uid) if uid else ""
 
     @staticmethod
     def _parse_need(text: str) -> dict:
@@ -576,6 +782,11 @@ class AssistantPlugin(Plugin):
                 "cost": round(sum(float(r.get("cost") or 0) for r in rows), 6),
                 "today_used": self._today_used(time.strftime("%Y-%m-%d")),
                 "quota": int(self._cfg_basic().get("daily_quota") or 100),
+                "reply": core.state_get("assistant_reply_stats", {}) or {},
+                "reply_cfg": {"enable": self._cfg_reply().get("enable", True),
+                              "group_enable": self._cfg_reply().get("group_enable", False),
+                              "mode": self._cfg_reply().get("reply_mode") or "text",
+                              "users": self._allowed_users(self._cfg_reply())},
                 "llm": self.llm.describe()}
 
     @command("assistant.ask", help="直接用一句话问记录(命令行/控制台)")
