@@ -22,7 +22,7 @@ jobs:
     name: 隐私与密钥扫描
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0          # --history 需要完整历史
       - uses: actions/setup-python@v5
@@ -58,7 +58,7 @@ jobs:
             python: "3.13"
             experimental: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
@@ -83,7 +83,7 @@ jobs:
     name: 控制台前端探针
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -95,7 +95,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [privacy, test]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0            # 需要 tag 才能做"包 == 已提交 == tag"的一致性检查
           fetch-tags: true
