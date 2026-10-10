@@ -82,6 +82,7 @@ class Runner:
                 return False
             t.start()
             self.threads[name] = t
+            core.beat(name)          # 线程已起 → 立刻有心跳(别等主管首轮体检, 它可能被别的活饿住)
             return True
         except Exception as e:                       # noqa: BLE001 —— 单个服务起不来不影响其它
             errors.record("runner.spawn.%s" % name, exc=e, kind="spawn_failed",
@@ -106,6 +107,7 @@ class Runner:
             self.restarts[name] = 0
             if not self._spawn(name):
                 self.restarts[name] = 1
+        core.beat("watchdog")        # 主管(主线程)此刻已经在跑
         core.runtime_write("single", list(self.services))
         core.log("runner", "INFO", "单进程模式启动: %s | 档位 %s(调度 %ds / 主管 %ds)"
                  % (",".join(self.services), self.profile["power_mode"], self.tick, self.interval))

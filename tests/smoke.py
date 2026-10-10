@@ -37,6 +37,20 @@ os.environ["QQOPS_DATA"] = TMP
 os.environ["TZ"] = "Asia/Shanghai"
 sys.path.insert(0, ROOT)
 
+
+def ci_note(text: str, title: str = "诊断") -> str:
+    """把诊断信息打成 CI annotation + 返回给断言消息。
+
+    为什么: GitHub 的 job 日志要登录才能下载, 而 `::error::` 生成的 annotation 是公开的;
+    排查只在 CI 上出现的问题(跨平台/macOS/慢机器)时, 这是唯一可靠的"看到真相"通道。
+    """
+    text = str(text or "")
+    if os.environ.get("GITHUB_ACTIONS"):
+        for line in text.splitlines()[:25]:
+            if line.strip():
+                print("::error title=%s::%s" % (title, line.replace("%", "%25")), flush=True)
+    return text
+
 from qqops import (collector, core, extract, fileread, linkfetch, media, render,  # noqa: E402
                    summarizer, svc, tools, watchdog, webapp)
 core.ensure_utf8_console()   # 非 UTF-8 控制台(如西文 Windows)下打印中文不能崩
@@ -787,14 +801,14 @@ class TestLifecycle(unittest.TestCase):
             self.skipTest("依赖 pgrep 与 /proc")
         cfg = core.Config()
         cfg.set_values({"watchdog": {"enabled": False, "interval": 15}})   # 只测心跳, 不拉起服务
-        core.state_set("watchdog_beat", 0)
+        core.beat("watchdog", 0)                 # 心跳归零(心跳现在是独立文件)
         p = subprocess.Popen([sys.executable, "-m", "qqops.watchdog"], cwd=ROOT,
                              env=self._env(), stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL)
         try:
             h = core.service_health("watchdog", timeout=20)
             self.assertTrue(h["ok"], h)
-            self.assertGreater(int(core.state_get("watchdog_beat", 0) or 0), 0)
+            self.assertGreater(int(core.last_beat("watchdog") or 0), 0)
         finally:
             p.kill()
             p.wait(timeout=10)
@@ -929,6 +943,40 @@ class TestConsistency(unittest.TestCase):
             "x.py", 'api_key = "%s..."  # 示例\n' % "sk-", []) if f[0] == "hard"], [])
         self.assertEqual(cs.scan_text(
             "x.py", 'token = "%s"  # secret-scan: allow\n' % ("abcdefgh" + "12345678"), []), [])
+
+    def test_beats_are_separate_files_and_state_writes_locked(self):
+        """心跳各写各的文件(多进程不再互相覆盖), state_set 拿锁(残留锁能被抢回)。
+
+        背景: 四个服务同时读改写 state.json —— Windows 上报 WinError 32 直接把启动搞失败,
+        其它平台上则是"后写的把先写的整份覆盖",表现为心跳/计数忽然回退(CI 偶发就是它)。
+        """
+        core.ensure_dirs()
+        # 1) 心跳: 每个服务一个文件, 互不干扰
+        core.beat("collector", 111)
+        core.beat("web", 222)
+        self.assertEqual(int(open(core.beat_path("collector"), encoding="utf-8").read()), 111)
+        self.assertEqual(int(open(core.beat_path("web"), encoding="utf-8").read()), 222)
+        self.assertGreaterEqual(core.last_beat("collector"), 111)
+        self.assertNotEqual(core.beat_path("collector"), core.beat_path("web"))
+        # 2) state_set 写完后不该留下锁文件
+        core.state_set("unit_test_key", {"n": 1})
+        self.assertEqual(core.state_get("unit_test_key"), {"n": 1})
+        self.assertFalse(os.path.exists(os.path.join(core.RUN_DIR, ".state.lock")),
+                         "锁文件没被清掉")
+        # 3) 残留锁(进程崩了留下)要能被抢回, 不能死等
+        lockp = os.path.join(core.RUN_DIR, ".state.lock")
+        with open(lockp, "w", encoding="utf-8") as f:
+            f.write("999999")
+        old = time.time() - 60
+        os.utime(lockp, (old, old))
+        t0 = time.time()
+        core.state_set("unit_test_key", {"n": 2})          # 超时/抢锁都该很快返回
+        self.assertLess(time.time() - t0, 6.0, "残留锁把自己锁死了")
+        self.assertEqual(core.state_get("unit_test_key"), {"n": 2})
+        try:
+            os.remove(lockp)
+        except OSError:
+            pass
 
     def test_ci_annotate_extracts_failures(self):
         """CI 的失败整理工具本身要有测试 —— 它坏了会让"看不到失败原因"雪上加霜。
@@ -1559,7 +1607,9 @@ class TestIntegration(unittest.TestCase):
             if not wait_port(port):
                 proc.kill()
                 out = (proc.stdout.read() if proc.stdout else "")[-1500:]
-                self.fail("采集器未在超时内监听\n%s" % self._why_not_listening(proc, "collector"))
+                self.fail("采集器未在超时内监听\n%s"
+                          % ci_note(self._why_not_listening(proc, "collector"),
+                                          "采集器未启动"))
             ev = {"post_type": "message", "message_type": "group", "group_id": 4242,
                   "user_id": 7, "message_id": 4242001, "time": int(time.time()),
                   "raw_message": "集成测试 头像 讨论", "sender": {"nickname": "集成"},
@@ -1598,7 +1648,9 @@ class TestIntegration(unittest.TestCase):
             if not wait_port(port):
                 proc.kill()
                 out = (proc.stdout.read() if proc.stdout else "")[-1500:]
-                self.fail("控制台未在超时内监听\n%s" % self._why_not_listening(proc, "web"))
+                self.fail("控制台未在超时内监听\n%s"
+                          % ci_note(self._why_not_listening(proc, "web"),
+                                          "控制台未启动"))
             base = "http://127.0.0.1:%d" % port
             opener = urllib.request.build_opener(_NoRedirect)
 
@@ -3088,8 +3140,15 @@ class TestRuntimePower(unittest.TestCase):
             time.sleep(1)
             self.assertTrue(core.service_health("scheduler", core.Config(), timeout=10)["ok"],
                             "单进程模式下调度线程应有新鲜心跳")
-            self.assertTrue(core.service_health("watchdog", core.Config(), timeout=10)["ok"],
-                            "单进程模式下主管(看门狗角色)应有心跳")
+            wd = core.service_health("watchdog", core.Config(), timeout=10)
+            self.assertTrue(wd["ok"], "单进程模式下主管(看门狗角色)应有心跳 | %s | %s"
+                            % (wd, ci_note(
+                                "beats=%s\nruntime=%s\nrunner log 末尾:\n%s"
+                                % (core.beats(), core.runtime_state(),
+                                   (core._run(["tail", "-n", "20",
+                                               os.path.join(core.DATA, "logs", "runner.log")], 5)
+                                    if os.name != "nt" else "")[:1200]),
+                                "看门狗心跳缺失")))
             # 端到端: 往采集口发一条消息, 必须落库
             ev = {"post_type": "message", "message_type": "group", "group_id": 7777,
                   "user_id": 5, "message_id": 700001, "time": int(time.time()),

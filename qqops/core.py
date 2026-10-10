@@ -11,6 +11,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import contextlib
 import json
 import os
 import re
@@ -23,7 +24,7 @@ import urllib.error
 import urllib.request
 import secrets
 
-VERSION = "3.3.7"
+VERSION = "3.3.8"
 
 # 路径解析(踩过坑, 别改回 "靠 $HOME 猜"):
 #   曾经用 BASE = ~/qqops —— 但 $HOME 是环境给的, 从别的目录/cron/adb run-as 调用时
@@ -158,6 +159,44 @@ def _clean_legacy_pidfiles() -> None:
         pass
 
 
+@contextlib.contextmanager
+def _file_lock(path: str, timeout: float = 3.0):
+    """跨进程互斥(基于 O_CREAT|O_EXCL 的锁文件, 不依赖 fcntl, Windows 也能用)。
+
+    锁文件超过 10 秒没更新视为残留(进程崩了没清) → 直接抢过来, 避免死锁。
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    end = time.time() + max(0.1, timeout)
+    got = False
+    while True:
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, b"%d" % os.getpid())
+            os.close(fd)
+            got = True
+            break
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(path) > 10:
+                    os.remove(path)
+                    continue
+            except Exception:
+                pass
+            if time.time() >= end:
+                break
+            time.sleep(0.02)
+        except Exception:
+            break
+    try:
+        yield got
+    finally:
+        if got:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+
 def atomic_write(path: str, text: str) -> None:
     d = os.path.dirname(path) or "."
     os.makedirs(d, exist_ok=True)
@@ -166,7 +205,19 @@ def atomic_write(path: str, text: str) -> None:
         f.write(text)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, path)
+    # Windows 上另一个进程正在读/写目标文件时 os.replace 会报 WinError 32(共享冲突),
+    # 重试几次基本都能过;实在过不去就退化成直接写(总比整个操作失败好)。
+    for i in range(6):
+        try:
+            os.replace(tmp, path)
+            return
+        except OSError:
+            time.sleep(0.05 * (i + 1))
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
 
 
 def deep_merge(base: dict, override: dict) -> dict:
@@ -1762,6 +1813,11 @@ def should_enrich_now(cfg: Config = None, ts: float = None) -> bool:
     return cur >= start or cur < end        # 跨零点窗口
 
 
+def beat_path(name: str) -> str:
+    """单个心跳文件路径(每个服务一个, 避免多进程读改写同一个 JSON)。"""
+    return os.path.join(RUN_DIR, "beat_%s" % name)
+
+
 def beat(name: str, ts: float = None) -> None:
     """服务/线程心跳(单进程模式下靠它判断每个服务是否活着)。
 
@@ -1769,15 +1825,35 @@ def beat(name: str, ts: float = None) -> None:
     这样两种模式的读者看到的是同一次心跳, 不会出现"单进程里调度显示超时"。
     """
     t = int(ts or now())
-    state_set("beat_%s" % name, t)
-    if name in ("scheduler", "watchdog"):
-        state_set("%s_beat" % name, t)
+    try:
+        os.makedirs(RUN_DIR, exist_ok=True)
+        atomic_write(beat_path(name), str(t))
+    except Exception as e:                       # noqa: BLE001 —— 心跳写不进去不能影响服务
+        log("core", "WARN", "写心跳失败(%s): %s" % (name, e))
+        try:
+            state_set("beat_%s" % name, t)        # 退路: 写共享 state(可能丢, 但聊胜于无)
+        except Exception:
+            pass
 
 
 def last_beat(name: str) -> int:
-    """某服务最近一次心跳: 新键(`beat_x`)与老键(`x_beat`)取较新。"""
-    return max(int(state_get("beat_%s" % name, 0) or 0),
-               int(state_get("%s_beat" % name, 0) or 0))
+    """某服务最近一次心跳。
+
+    读取顺序: 独立心跳文件(新) → state.json 的 `beat_x` → 老键 `x_beat`;取最新值。
+    这样多进程并发写也不会互相覆盖, 升级后老数据仍能读到。
+    """
+    best = 0
+    try:
+        with open(beat_path(name), encoding="utf-8") as f:
+            best = int((f.read() or "0").strip() or 0)
+    except Exception:
+        pass
+    for key in ("beat_%s" % name, "%s_beat" % name):
+        try:
+            best = max(best, int(state_get(key, 0) or 0))
+        except Exception:
+            continue
+    return best
 
 
 def beats() -> dict:
@@ -2257,16 +2333,16 @@ def check_port_free(port: int, mod: str = "") -> dict:
         except Exception:
             same_data = False
     cands = _own_pids(mod) if mod else []
-    ours = bool(mod and mod in cmd and same_data)
-    if pid and pid in cands:
-        # 占用者就在"我们自己的候选集"里(pid 文件记录 / 环境变量一致)→ 自己人。
-        # 不能只认命令行: macOS 的 lsof 只给出命令名(如 `Python`), 拿它比对模块名必然失败。
-        ours = True
     if pid:
+        # 先把命令行补全: macOS 的 lsof 只给命令名(如 `Python`), 拿它比对模块名必然失败
         full = _cmdline(pid)
         if full:
             cmd = full
-    elif cands:                                 # 手机: 反查不到占用者, 但确实有本套实例在跑
+    ours = bool(mod and mod in cmd and same_data)
+    if pid and pid in cands:
+        # 占用者在"我们自己的候选集"里(pid 文件记录 / 环境变量一致)→ 自己人
+        ours = True
+    if not pid and cands:                       # 手机: 反查不到占用者, 但确实有本套实例在跑
         ours, pid, cmd = True, cands[0], _cmdline(cands[0])
     if pid:
         who = "(pid %s %s)" % (pid, cmd[:70])
@@ -2974,14 +3050,20 @@ def state_get(key: str, default=None):
 
 
 def state_set(key: str, value) -> None:
-    cur = {}
-    try:
-        with open(STATE_PATH, encoding="utf-8") as f:
-            cur = json.load(f) or {}
-    except Exception:
-        pass
-    cur[key] = value
-    atomic_write(STATE_PATH, json.dumps(cur, ensure_ascii=False, indent=2) + "\n")
+    """写一个键到共享 state.json。
+
+    这是个**读改写**操作, 多进程并发会互相覆盖(踩过: 心跳/计数忽然回退), 所以先拿锁;
+    拿不到锁也不要卡住服务 —— 超时后照写, 顶多丢这一次更新。
+    """
+    with _file_lock(os.path.join(RUN_DIR, ".state.lock"), timeout=3.0):
+        cur = {}
+        try:
+            with open(STATE_PATH, encoding="utf-8") as f:
+                cur = json.load(f) or {}
+        except Exception:
+            pass
+        cur[key] = value
+        atomic_write(STATE_PATH, json.dumps(cur, ensure_ascii=False, indent=2) + "\n")
 
 
 def human_bytes(n: float) -> str:
