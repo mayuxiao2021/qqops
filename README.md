@@ -140,6 +140,15 @@ QQ ──▶ NapCat ──HTTP 上报──▶ collector ──▶ SQLite(消息
 
 发现安全问题请按 [SECURITY.md](SECURITY.md) 的方式私下报告,不要开公开 issue。
 
+## 平台支持
+
+| 平台 | 状态 | 说明 |
+|---|---|---|
+| **Android / Termux** | ✅ 主要目标 | 日常使用与 CI(Linux)覆盖;保活、功耗档、单进程模式都为此优化 |
+| **Linux** | ✅ 完整支持 | CI 覆盖 Python 3.10 / 3.12 / 3.13 |
+| **Windows** | ✅ 支持 | CI 覆盖 3.12 / 3.13;服务直接用 `python -m qqops.svc` 系列命令,不需要 bash |
+| **macOS** | ⚠️ 尽力支持 | 代码里已补 `ps`/`lsof` 兜底(没有 `/proc`),但 CI 上"独立启动 collector/webapp"的用例仍失败(子进程无任何输出,原因未查明);该 job 标为**实验性**,失败不阻塞。欢迎用 macOS 的人一起查 |
+
 ## 开发
 
 ```bash

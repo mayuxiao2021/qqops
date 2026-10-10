@@ -32,6 +32,10 @@ ITEMS = ["qqops", "bin", "tests", "tools", "docs", "VERSION", "README.md", "READ
          "CHANGELOG.md", "LICENSE", "SECURITY.md", "CONTRIBUTING.md", "CODE_OF_CONDUCT.md",
          "install.sh", "uninstall.sh", "pack.sh", "pack.py", "config.example.json"]
 SKIP_DIRS = {"__pycache__", ".testdata", "data", "run", ".git", "dist"}
+# 绝不进发布包的本机私有文件(真机上被抓到过一次: 禁词表随 tools/ 整目录被打进包)
+SKIP_FILES = {"secret_denylist.txt", ".secretscanignore", ".env", "config.json",
+              "state.json", "crashes.jsonl"}
+SKIP_SUFFIX = (".pem", ".key", ".db", ".log")
 
 
 def mode_for(rel: str) -> int:
@@ -61,10 +65,44 @@ def _dir_filter():
     return f
 
 
-def build(out_dir: str = None, verbose: bool = True) -> str:
+def verify_no_private(tar_path: str) -> list:
+    """检查发布包: 不得含私有文件名, 内容也不得命中本机禁词表。
+
+    为什么要在打包后**再查一遍**: 文件是按目录整批加的, 很容易"顺手"把不该带的带进去
+    (真机上就抓到过 tools/secret_denylist.txt 被打进包)。
+    """
+    bad = []
+    denylist = os.path.join(ROOT, "tools", "secret_denylist.txt")
+    words = []
+    if os.path.exists(denylist):
+        with open(denylist, encoding="utf-8") as f:
+            words = [x.strip() for x in f if x.strip() and not x.startswith("#")]
+    with tarfile.open(tar_path) as tf:
+        for ti in tf.getmembers():
+            if not ti.isfile():
+                continue
+            rel = ti.name.split("/", 1)[-1]
+            base = os.path.basename(rel)
+            if base in SKIP_FILES or base.endswith(SKIP_SUFFIX):
+                bad.append("私有文件: %s" % rel)
+                continue
+            if not words:
+                continue
+            try:
+                data = tf.extractfile(ti).read().decode("utf-8", "replace")
+            except Exception:
+                continue
+            for w in words:
+                if w in data:
+                    bad.append("内容命中禁词: %s (%s)" % (rel, w[:4] + "…"))
+                    break
+    return bad
+
+
+def build(out_dir: str = None, verbose: bool = True, scan: bool = True) -> str:
     # 打包前的隐私门禁: 包是要发出去的, 里面绝不能有本机隐私/密钥
     scanner = os.path.join(ROOT, "tools", "check_secrets.py")
-    if os.path.exists(scanner):
+    if scan and os.path.exists(scanner):
         import subprocess
         p = subprocess.run([sys.executable, scanner, "--quiet"], cwd=ROOT)
         if p.returncode != 0:
@@ -93,12 +131,17 @@ def build(out_dir: str = None, verbose: bool = True) -> str:
                     tf.add(dfull, arcname="%s/%s" % (name, drel), recursive=False,
                            filter=_dir_filter())
                 for f in sorted(files):
-                    if f.endswith(".pyc"):
+                    if f.endswith(".pyc") or f in SKIP_FILES or f.endswith(SKIP_SUFFIX):
                         continue
                     full = os.path.join(cur, f)
                     rel = os.path.relpath(full, ROOT).replace(os.sep, "/")
                     tf.add(full, arcname="%s/%s" % (name, rel), filter=_filter(rel))
                     count += 1
+    if scan:
+        bad = verify_no_private(out)
+        if bad:
+            os.remove(out)
+            raise SystemExit("✘ 发布包里出现隐私文件/内容, 已删除该包: %s" % bad)
     if verbose:
         print("已生成: %s" % out)
         print("  版本 %s, %d 个文件, %.1f KB" % (ver, count, os.path.getsize(out) / 1024.0))

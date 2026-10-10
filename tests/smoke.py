@@ -841,6 +841,29 @@ class TestPackaging(unittest.TestCase):
         for rel in ("qqops/core.py", "VERSION", "config.example.json", "README.md"):
             self.assertEqual(m.mode_for(rel), 0o644, rel)
 
+    def test_package_contains_no_private_files(self):
+        """发布包不得含本机禁词表等私有文件(真机被抓到过一次: tools/ 整目录打包带上了禁词表)。
+
+        这是**发布路径**的红线检查: 仓库干净不代表打包干净 —— 文件是按目录整批加的。
+        """
+        sys.path.insert(0, ROOT)
+        import pack as pack_mod                                      # noqa: E402
+        out_dir = os.path.join(TMP, "packcheck")
+        path = pack_mod.build(out_dir, verbose=False, scan=False)
+        try:
+            bad = pack_mod.verify_no_private(path)
+            self.assertEqual(bad, [], "发布包里有隐私: %s" % bad)
+            with tarfile.open(path) as tf:
+                names = [n.split("/", 1)[-1] for n in tf.getnames() if "/" in n]
+            for rel in names:                                        # 私有文件名一律不许出现
+                base = os.path.basename(rel)
+                self.assertNotIn(base, pack_mod.SKIP_FILES, "发布了私有文件: %s" % rel)
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
     def test_items_all_exist(self):
         m = self._packer()
         for item in m.ITEMS:
@@ -853,7 +876,7 @@ class TestPackaging(unittest.TestCase):
         m = self._packer()
         out_dir = os.path.join(TMP, "packout")       # 不用 mkdtemp: 本机沙箱会拒绝
         try:
-            path = m.build(out_dir, verbose=False)
+            path = m.build(out_dir, verbose=False, scan=False)
             with tarfile.open(path) as tf:
                 modes = {ti.name.split("/", 1)[1]: ti.mode for ti in tf.getmembers()
                          if "/" in ti.name and ti.isfile()}
@@ -918,6 +941,8 @@ class TestConsistency(unittest.TestCase):
         为什么写进测试而不是只靠 review: 这个项目天然贴着 QQ 号/群号/令牌/设备号,
         人肉看迟早漏。这里跑一遍扫描器, 保证"任何一次提交都不可能把隐私带进仓库"。
         """
+        if not os.path.isdir(os.path.join(ROOT, ".git")):
+            self.skipTest("不是 git 检出(部署安装): 仓库级隐私门禁在 CI/开发机上跑")
         sys.path.insert(0, os.path.join(ROOT, "tools"))
         import check_secrets as cs                                   # noqa: E402
 
@@ -1087,7 +1112,10 @@ class TestConsistency(unittest.TestCase):
                 "CODE_OF_CONDUCT.md", "CHANGELOG.md", "docs/DEPLOY.md", "docs/FAQ.md",
                 "docs/ARCHITECTURE.md", "docs/CONSOLE.md", "docs/INGEST.md", "docs/POWER.md",
                 "docs/CHAT.md", "tools/check_secrets.py", "tools/verify_package.py",
-                "tools/console_probe.js", ".github/workflows/ci.yml", "config.example.json"]
+                "tools/console_probe.js", "config.example.json"]
+        if os.path.isdir(os.path.join(ROOT, ".git")):
+            # .github/ 只在开发检出里(发布包不带 CI 配置)
+            need.append(".github/workflows/ci.yml")
         for rel in need:
             self.assertTrue(os.path.exists(os.path.join(ROOT, rel)), "缺少 %s" % rel)
         # README 里指向仓库内的链接必须真实存在
