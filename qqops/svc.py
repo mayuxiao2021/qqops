@@ -64,21 +64,34 @@ def main(argv=None) -> int:
         for n in names:
             s = st.get(n, {})
             port = ("  端口 %s" % s["port"]) if s.get("port") else ""
-            pid = ("  PID %s" % s["pid"]) if s.get("pid") else ""
-            print("  %s %-10s%s%s" % ("●" if s.get("running") else "○", n, port, pid))
+            pid = ("  进程号 %s" % s["pid"]) if s.get("pid") else ""
+            h = core.service_health(n, cfg, timeout=3) if s.get("running") else {"why": "未运行"}
+            mark = "●" if (s.get("running") and h.get("ok")) else ("◐" if s.get("running") else "○")
+            print("  %s %-10s%s%s  %s" % (mark, n, port, pid, h.get("why", "")))
         return 0
 
     rc = 0
+    if a.action == "restart":
+        # 先全停(看门狗最先停, 否则它会把你正在停的服务又拉起来), 再全起(看门狗最后起)
+        stop_order = [n for n in names if n == "watchdog"] + [n for n in names if n != "watchdog"]
+        for n in stop_order:
+            print("  ○ %s" % core.stop_service(n))
+        time.sleep(1)
+        start_order = [n for n in names if n != "watchdog"] + [n for n in names if n == "watchdog"]
+        for n in start_order:
+            msg = core.start_service(n)
+            ok = "失败" not in msg and "异常" not in msg
+            rc = rc or (0 if ok else 1)
+            print("  %s %s" % ("●" if ok else "○", msg))
+        return rc
+    if a.action == "stop":
+        names = [n for n in names if n == "watchdog"] + [n for n in names if n != "watchdog"]
     for n in names:
         if a.action == "start":
             msg = core.start_service(n)
-        elif a.action == "stop":
-            msg = core.stop_service(n)
         else:
-            core.stop_service(n)
-            time.sleep(1)
-            msg = core.start_service(n)
-        ok = "失败" not in msg
+            msg = core.stop_service(n)
+        ok = "失败" not in msg and "异常" not in msg
         rc = rc or (0 if ok else 1)
         print("  %s %s" % ("●" if ok else "○", msg))
     return rc

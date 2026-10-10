@@ -46,7 +46,7 @@ command -v termux-wake-lock >/dev/null && { termux-wake-lock 2>/dev/null && ok "
 step "2/7 复制程序"
 mkdir -p "$DEST"
 if [ "$SRC" != "$DEST" ]; then
-  for item in qqops bin static tests VERSION README.md CHANGELOG.md install.sh uninstall.sh pack.sh config.example.json; do
+  for item in qqops bin tests tools VERSION README.md CHANGELOG.md LICENSE .gitignore install.sh uninstall.sh pack.sh config.example.json; do
     [ -e "$SRC/$item" ] && cp -rf "$SRC/$item" "$DEST/" 2>/dev/null
   done
   ok "已复制到 $DEST"
@@ -86,6 +86,21 @@ if [ "$NO_START" = "1" ]; then
 else
   "$DEST/bin/qqops" start || warn "部分服务未启动, 请执行 qqops doctor 检查"
 fi
+
+step "6.5/7 开机自启与保活"
+command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock 2>/dev/null && ok "已获取唤醒锁" \
+  || warn "未获取唤醒锁(建议 pkg install termux-api)"
+BOOT_DIR="$HOME/.termux/boot"
+mkdir -p "$BOOT_DIR" 2>/dev/null && cat > "$BOOT_DIR/qqops.sh" <<BOOTEOF
+#!/data/data/com.termux/files/usr/bin/sh
+# QQOps 开机自启(需要安装 Termux:Boot 应用才会被系统调用)
+termux-wake-lock 2>/dev/null
+sleep 8
+bash "$DEST/bin/qqops" start >>"$DEST/data/logs/boot.log" 2>&1
+BOOTEOF
+chmod +x "$BOOT_DIR/qqops.sh" 2>/dev/null \
+  && ok "已写开机自启脚本: $BOOT_DIR/qqops.sh(安装 Termux:Boot 后生效)" \
+  || warn "写开机自启脚本失败, 可手动运行 qqops start"
 
 step "7/7 完成"
 $PY -m qqops.tools doctor 2>/dev/null | sed 's/^/  /' || true

@@ -8,7 +8,7 @@ NAME="qqops-$VER"
 mkdir -p "$OUT"
 TMP="$(mktemp -d)"
 mkdir -p "$TMP/$NAME"
-for item in qqops bin tests VERSION README.md CHANGELOG.md install.sh uninstall.sh pack.sh config.example.json; do
+for item in qqops bin tests tools VERSION README.md CHANGELOG.md LICENSE install.sh uninstall.sh pack.sh config.example.json; do
   [ -e "$SRC/$item" ] && cp -rf "$SRC/$item" "$TMP/$NAME/"
 done
 find "$TMP/$NAME" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true

@@ -34,6 +34,51 @@ def cmd_init(_a) -> int:
     return 0
 
 
+def _device_keepalive() -> list:
+    """手机保活体检: 幽灵进程查杀 / 电池优化 / 后台权限 / 唤醒锁 / 开机自启。"""
+    rows = []
+
+    def sh(cmd) -> str:
+        return core._run(cmd, 8).strip()
+
+    v = sh(["settings", "get", "global", "settings_enable_monitor_phantom_procs"])
+    if v in ("0", "false"):
+        rows.append(("OK ", "幽灵进程查杀", "已关闭 —— 不会因为后台进程数超限被杀"))
+    elif not v or "Exception" in v or "Permission" in v:
+        rows.append(("?? ", "幽灵进程查杀", "读不到(无权限); PC 上执行: adb shell settings get global settings_enable_monitor_phantom_procs"))
+    else:
+        rows.append(("!! ", "幽灵进程查杀", "启用中(%s), Android 12+ 会杀后台进程 → PC 上执行: "
+                                       "adb shell settings put global settings_enable_monitor_phantom_procs false" % v))
+
+    wl = sh(["dumpsys", "deviceidle", "whitelist"])
+    if "com.termux" in wl:
+        rows.append(("OK ", "电池优化白名单", "com.termux 已加入"))
+    elif wl:
+        rows.append(("!! ", "电池优化白名单", "com.termux 未加入 → PC 上执行: "
+                                             "adb shell dumpsys deviceidle whitelist +com.termux"))
+    else:
+        rows.append(("?? ", "电池优化白名单", "读不到; 建议 PC 上执行: adb shell dumpsys deviceidle whitelist +com.termux"))
+
+    ops = sh(["cmd", "appops", "get", "com.termux", "RUN_ANY_IN_BACKGROUND"])
+    if "allow" in ops:
+        rows.append(("OK ", "后台运行权限", "允许"))
+    else:
+        rows.append(("?? ", "后台运行权限", "PC 上执行: adb shell cmd appops set com.termux RUN_ANY_IN_BACKGROUND allow"))
+
+    if shutil.which("termux-wake-lock"):
+        core._run(["termux-wake-lock"], 8)
+        rows.append(("OK ", "唤醒锁", "已尝试获取(termux-wake-lock)"))
+    else:
+        rows.append(("!! ", "唤醒锁", "缺少 termux-wake-lock(需安装 Termux:API)"))
+
+    boot = os.path.join(os.path.expanduser("~"), ".termux", "boot")
+    if os.path.isdir(boot) and any(f.endswith(".sh") for f in os.listdir(boot)):
+        rows.append(("OK ", "开机自启", "已写 %s 下的脚本(需安装 Termux:Boot 才会生效)" % boot))
+    else:
+        rows.append(("!! ", "开机自启", "未配置 —— 安装 Termux:Boot 后重跑 install.sh 即可自动写入"))
+    return rows
+
+
 def cmd_doctor(_a) -> int:
     core.ensure_dirs()
     cfg = core.Config()
@@ -72,6 +117,9 @@ def cmd_doctor(_a) -> int:
     sc = cfg.data["summarizer"]
     chk("BaseURL", str(sc["base_url"]).startswith("http"), sc["base_url"])
     chk("API Key", bool(sc.get("api_key")), "已配置" if sc.get("api_key") else "未配置(只能出统计块)")
+    print("手机保活(进程为什么会被杀)")
+    for tag, name, detail in _device_keepalive():
+        print("  [%s] %-16s %s" % (tag.strip(), name, detail))
     print("\n结论: %s" % ("全部通过 ✅" if ok else "存在问题 ⚠️ (见上面 !!)"))
     return 0 if ok else 1
 

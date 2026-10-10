@@ -71,6 +71,37 @@ bash ~/qqops/install.sh
 重启 NapCat(`bash /root/_napcat_run.sh`),然后在控制台「配置」页把 `push.napcat_api_port`
 与 `push.token` 填成一致。用 `qqops doctor` 验证:采集口与 NapCat API 都应为 OK。
 
+## 保活:进程为什么会被杀, 怎么防
+
+Android 12+ 的 **幽灵进程查杀**(后台进程数超限时杀掉 Termux 的子进程)、**Doze/电池优化**(冻结后台)、
+以及**重启后没有自启**, 是"进程老是被杀"的三个主因。本程序有三层防护:
+
+1. **看门狗**(`qqops/watchdog.py`, 随服务一起启动):每 60 秒体检采集器/调度器/控制台;
+   进程不在 → 立刻拉起;进程在但**端口不响应/心跳停了**(假活)→ 先清掉再拉起。心跳写在 `data/state.json`,
+   控制台「概览/运维」能看到看门狗是否存活。
+   ```bash
+   qqops watchdog          # 体检一轮(只报告, 不重启)
+   qqops restart watchdog  # 重启看门狗本身
+   ```
+2. **开机自启**:`install.sh` 会写 `~/.termux/boot/qqops.sh`(安装 **Termux:Boot** 后, 重启会自动 `qqops start`);
+   文件里同时会获取唤醒锁。
+3. **设备级设置**(需要电脑 + adb, 一次性, 最有效):
+   ```bash
+   bash tools/android-keepalive.sh        # 一键执行下面这些
+   # 或手动:
+   adb shell settings put global settings_enable_monitor_phantom_procs false
+   adb shell dumpsys deviceidle whitelist +com.termux
+   adb shell cmd appops set com.termux RUN_ANY_IN_BACKGROUND allow
+   adb shell am set-standby-bucket com.termux active
+   ```
+   手机端再手动一次:设置 → 应用 → Termux → 电池 → **不受限制**。
+
+**诊断**:`qqops doctor` 会有一段「手机保活」逐项体检(幽灵进程/白名单/后台权限/唤醒锁/开机自启),
+缺哪项就打印出该执行的命令。
+
+**启动可靠性**:`qqops start` 不再只看"进程在不在", 而是**等到端口真的应答 / 心跳真的刷新**才报成功;
+进程秒退会直接告诉你日志尾部(`qqops start` / `qqops status` 都能看出 `◐` 表示"进程在但没响应")。
+
 ## 日常使用
 
 ```bash

@@ -45,6 +45,12 @@ print("  全文索引: %s" % ("可用 · %d 条" % store.fts_count() if store.ft
 PY
     ) ;;
   extras)  svc extras ;;
+  watchdog)
+    sub="${1:-once}"
+    case "$sub" in
+      once|check) ( cd "$BASE" && exec "$PY" -m qqops.watchdog --once ) ;;
+      *) svc restart watchdog ;;
+    esac ;;
   napcat|astrbot)
     sub="${1:-status}"
     case "$sub" in
@@ -88,6 +94,11 @@ QQOps 控制脚本 v$(cat "$BASE/VERSION" 2>/dev/null || echo '?')
   qqops extras                  查看 NapCat / AstrBot 状态
   qqops napcat {start|stop|restart}    NapCat(QQ 接入, 停掉就收发全断)
   qqops astrbot {start|stop|restart}   AstrBot(存档旁路, QQOps 不依赖)
+
+  保活:
+  qqops watchdog                体检一轮(不重启任何东西)
+  qqops restart watchdog        重启看门狗(它每 60 秒自动拉起被杀掉的服务)
+  qqops doctor                  含"手机保活体检"(幽灵进程查杀/电池优化/唤醒锁/开机自启)
 EOF
     ;;
 esac

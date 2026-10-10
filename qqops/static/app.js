@@ -600,7 +600,8 @@ VIEWS.logs = async (v) => {
 
 /* ------------------------------------------------------------------ 配置 */
 const CFG_SEC = {web: '控制台', collector: '采集器', summarizer: '总结器', push: '推送',
-  schedule: '定时', retention: '数据保留', extract: '整理规则', enrich: '补料(图片/文件/链接)'};
+  schedule: '定时', retention: '数据保留', extract: '整理规则', enrich: '补料(图片/文件/链接)',
+  watchdog: '看门狗(保活)'};
 /* [中文名, 说明] */
 const CFG_CN = {
   web: {host: ['监听地址', '默认 127.0.0.1 只允许本机访问, 更安全'],
@@ -651,6 +652,9 @@ const CFG_CN = {
   enrich: {vision: ['图片识别', '把群里图片交给多模态模型描述'],
            files: ['文件解析', '文档内容读进总结'],
            links: ['链接抓取', '抓取文章类链接的正文']},
+  watchdog: {enabled: ['启用看门狗', '每 60 秒体检一次, 服务死掉或假活就自动拉起'],
+             interval: ['体检间隔(秒)', '建议 30~120'],
+             manage_extras: ['同时守护旁路服务', '开启后 NapCat 不在也会尝试拉起(它会重新登录, 较慢)']},
 };
 const CFG_SUB = {
   vision: {enable: '启用', model: '专用模型(空=用上面的模型)', max_images: '每群最多识别几张',

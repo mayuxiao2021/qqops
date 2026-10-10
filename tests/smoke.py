@@ -36,7 +36,7 @@ os.environ["TZ"] = "Asia/Shanghai"
 sys.path.insert(0, ROOT)
 
 from qqops import (collector, core, extract, fileread, linkfetch, media, render,  # noqa: E402
-                   summarizer, svc, tools, webapp)
+                   summarizer, svc, tools, watchdog, webapp)
 
 POSIX = os.name != "nt"
 
@@ -392,8 +392,66 @@ class TestWebAndNapcat(unittest.TestCase):
         self.assertLessEqual(nxt["in"], 86400)
 
     def test_svc_module_exposes_actions(self):
-        self.assertEqual(set(core.SERVICE_MODULES), {"collector", "scheduler", "web"})
+        self.assertEqual(set(core.SERVICE_MODULES),
+                         {"collector", "scheduler", "web", "watchdog"})
+        self.assertEqual(set(core.WATCH_TARGETS), {"collector", "scheduler", "web"})
         self.assertTrue(callable(svc.main))
+
+
+class TestLifecycle(unittest.TestCase):
+    """启动/停止的可靠性: 秒退必须报失败, PID 校验不能杀错进程, 看门狗体检无副作用。"""
+
+    def test_health_rejects_unknown_and_dead(self):
+        self.assertFalse(core.service_health("nosuch")["ok"])
+        core.SERVICE_MODULES["zzz"] = "qqops.nothere"
+        try:
+            r = core.service_health("zzz", timeout=1)
+            self.assertFalse(r["ok"])
+            self.assertIn("进程不存在", r["why"])
+        finally:
+            core.SERVICE_MODULES.pop("zzz", None)
+
+    def test_start_service_reports_fast_exit(self):
+        """模块不存在时进程秒退 —— 必须报"启动失败"而不是"已启动"。"""
+        if not POSIX:
+            self.skipTest("依赖 /proc 与 pgrep")
+        orig = core.SERVICE_MODULES.get("web")
+        core.SERVICE_MODULES["web"] = "qqops.definitely_not_a_module"
+        try:
+            msg = core.start_service("web", wait=8)
+            self.assertIn("启动失败", msg, msg)
+            self.assertNotIn("已启动", msg)
+        finally:
+            if orig:
+                core.SERVICE_MODULES["web"] = orig
+
+    def test_pid_validation(self):
+        if not POSIX or not os.path.isdir("/proc"):
+            self.skipTest("需要 /proc")
+        self.assertFalse(core._pid_alive_and_matches(os.getpid(), "qqops.nonexistent"))
+        self.assertTrue(core._pid_alive_and_matches(os.getpid(), "python"))
+        self.assertFalse(core._pid_alive_and_matches(999999, "python"))
+
+    def test_watchdog_check_once_shape(self):
+        res = watchdog.check_once(core.Config(), auto_start=False)
+        self.assertGreaterEqual(len(res), 3)
+        for name, state, msg in res:
+            self.assertIn(name, core.WATCH_TARGETS)
+            self.assertIn(state, ("ok", "unhealthy", "dead"))
+            self.assertTrue(msg)
+
+    def test_watchdog_once_cli(self):
+        p = subprocess.run([sys.executable, "-m", "qqops.watchdog", "--once"], cwd=ROOT,
+                           env=self._env(), capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=60)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("collector", p.stdout or "")
+
+    def _env(self):
+        env = dict(os.environ)
+        env["QQOPS_DATA"] = TMP
+        env["TZ"] = "Asia/Shanghai"
+        return env
 
 
 class TestConsistency(unittest.TestCase):

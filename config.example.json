@@ -51,5 +51,10 @@
     "message_days": 0,
     "log_max_mb": 4,
     "backup_keep": 7
+  },
+  "watchdog": {
+    "enabled": true,
+    "interval": 60,
+    "manage_extras": false
   }
 }

@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 import secrets
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 HOME = os.path.expanduser("~")
 BASE = os.environ.get("QQOPS_HOME") or os.path.join(HOME, "qqops")
@@ -68,6 +68,7 @@ DEFAULT_CONFIG = {
         "min_new_messages": 5,       # 至少多少条新消息才值得跑
     },
     "retention": {"message_days": 0, "log_max_mb": 4, "backup_keep": 7},
+    "watchdog": {"enabled": True, "interval": 60, "manage_extras": False},
     "extract": {
         "structured": True,          # LLM 输出结构化 JSON(事件/待办/链接/事实/记忆)
         "max_events": 8, "max_todos": 8, "max_links": 6, "memory_chars": 600,
@@ -1017,7 +1018,13 @@ def _run(cmd: list, timeout: int = 20) -> str:
 
 
 def pgrep(pattern: str) -> bool:
-    return bool(_run(["pgrep", "-f", pattern], 8).strip())
+    """是否存在匹配的进程。
+
+    注意: 不能只看输出非空 —— pgrep 不存在时 _run 会返回"(执行失败: ...)" 文本,
+    那样会把"命令失败"误判成"匹配到了进程"(所有"是否运行"的判断都会变假真)。
+    """
+    out = _run(["pgrep", "-f", pattern], 8)
+    return any(line.strip().isdigit() for line in out.splitlines())
 
 
 def screen_list() -> list:
@@ -1033,7 +1040,9 @@ def screen_list() -> list:
 # ---------------------------------------------------------------- 服务进程管理
 RUN_DIR = os.path.join(DATA, "run")
 SERVICE_MODULES = {"collector": "qqops.collector", "scheduler": "qqops.scheduler",
-                   "web": "qqops.webapp"}
+                   "web": "qqops.webapp", "watchdog": "qqops.watchdog"}
+# 看门狗守护的对象(它自己不能被自己重启)
+WATCH_TARGETS = ("collector", "scheduler", "web")
 
 
 def _ancestor_pids() -> set:
@@ -1085,27 +1094,93 @@ def pid_path(name: str) -> str:
     return os.path.join(RUN_DIR, "%s.pid" % name)
 
 
-def start_service(name: str) -> str:
-    """nohup 后台启动一个服务(不依赖 screen, SSH 断线不受影响)。"""
+def service_health(name: str, cfg: Config | None = None, timeout: float = 12.0) -> dict:
+    """真实健康检查: 不只看进程在不在, 还要端口能应答 / 心跳是新的。
+
+    只判断 pgrep 会把"启动了但立刻崩掉"误报成成功 —— 手机上很常见。
+    """
+    cfg = cfg or Config()
+    mod = SERVICE_MODULES.get(name)
+    if not mod:
+        return {"ok": False, "why": "未知服务"}
+    if not pgrep("[-]m %s" % mod):
+        return {"ok": False, "why": "进程不存在"}
+    end = time.time() + timeout
+    if name == "watchdog":
+        beat = int(state_get("watchdog_beat", 0) or 0)
+        return {"ok": now() - beat < 180, "why": "心跳 %s" % (fmt_ts(beat) if beat else "无")}
+    if name == "scheduler":
+        while time.time() < end:
+            beat = int(state_get("scheduler_beat", 0) or 0)
+            if now() - beat < 60:
+                return {"ok": True, "why": "心跳正常"}
+            time.sleep(1)
+        return {"ok": False, "why": "心跳超时(60 秒内没有心跳)"}
+    port = int(cfg.data["collector" if name == "collector" else "web"]["port"])
+    path = "/health" if name == "web" else "/"
+    while time.time() < end:
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:%d%s" % (port, path), timeout=3) as r:
+                if r.status == 200:
+                    return {"ok": True, "why": "端口 %d 已应答" % port}
+        except Exception:
+            time.sleep(1)
+    return {"ok": False, "why": "进程在但端口 %d 无应答" % port}
+
+
+def _pid_alive_and_matches(pid: int, mod: str) -> bool:
+    """校验 PID 文件里的进程是否真的是我们的服务。
+
+    重启后 PID 会被复用 —— 不校验就可能杀掉别人的进程。
+    """
+    try:
+        with open("/proc/%d/cmdline" % int(pid), "rb") as f:
+            cmd = f.read().decode("utf-8", "replace")
+        return mod in cmd
+    except Exception:
+        return False
+
+
+def start_service(name: str, wait: float = 25.0) -> str:
+    """nohup 后台启动一个服务, 并且**等到它真的能干活**才报成功。"""
     mod = SERVICE_MODULES.get(name)
     if not mod:
         return "未知服务: %s" % name
     if pgrep("[-]m %s" % mod):
-        return "%s 已在运行" % name
+        h = service_health(name, timeout=6)
+        if h["ok"]:
+            return "%s 已在运行(%s)" % (name, h["why"])
+        return "%s 进程在但状态异常: %s(可用 qqops restart %s 修)" % (name, h["why"], name)
     ensure_dirs()
     os.makedirs(RUN_DIR, exist_ok=True)
     logf = os.path.join(LOG_DIR, "%s.log" % mod.split(".")[-1])
-    with open(logf, "ab") as out:
-        p = subprocess.Popen([sys.executable, "-m", mod], cwd=_base_dir(),
-                             stdout=out, stderr=out, stdin=subprocess.DEVNULL,
-                             start_new_session=True)
-    with open(pid_path(name), "w") as f:
-        f.write(str(p.pid))
-    for _ in range(8):
+    t0 = time.time()
+    try:
+        with open(logf, "ab") as out:
+            p = subprocess.Popen([sys.executable, "-m", mod], cwd=_base_dir(),
+                                 stdout=out, stderr=out, stdin=subprocess.DEVNULL,
+                                 start_new_session=True)
+    except Exception as e:
+        return "%s 启动失败(无法创建进程): %s" % (name, e)
+    try:
+        with open(pid_path(name), "w") as f:
+            f.write(str(p.pid))
+    except Exception:
+        pass
+    while time.time() - t0 < wait:
+        if p.poll() is not None:                      # 进程自己退了 → 明确报失败
+            return "%s 启动失败(进程秒退, 退出码 %s)。日志尾部: %s" % (
+                name, p.returncode, tail(logf, 3).replace("\n", " | ")[-300:])
         if pgrep("[-]m %s" % mod):
-            return "%s 已启动 (pid %d)" % (name, p.pid)
-        time.sleep(1)
-    return "%s 启动失败, 见 %s" % (name, logf)
+            break
+        time.sleep(0.5)
+    else:
+        return "%s 启动失败(%.0f 秒内没起来)。日志尾部: %s" % (
+            name, wait, tail(logf, 3).replace("\n", " | ")[-300:])
+    h = service_health(name, timeout=max(4.0, wait - (time.time() - t0)))
+    if h["ok"]:
+        return "%s 已启动 (pid %s, %s)" % (name, p.pid, h["why"])
+    return "%s 启动异常: %s。日志尾部: %s" % (name, h["why"], tail(logf, 4).replace("\n", " | ")[-300:])
 
 
 def stop_service(name: str) -> str:
@@ -1113,9 +1188,14 @@ def stop_service(name: str) -> str:
     pf = pid_path(name)
     if os.path.isfile(pf):
         try:
-            os.kill(int(open(pf).read().strip()), 15)
+            pid = int(open(pf).read().strip() or 0)
         except Exception:
-            pass
+            pid = 0
+        if pid and (not mod or _pid_alive_and_matches(pid, mod)):
+            try:
+                os.kill(pid, 15)
+            except Exception:
+                pass
         try:
             os.remove(pf)
         except Exception:
@@ -1239,6 +1319,7 @@ def service_status(cfg: Config) -> dict:
         "collector": one("collector", "[-]m qqops.collector", col_port),
         "scheduler": one("scheduler", "[-]m qqops.scheduler", 0),
         "web": one("web", "[-]m qqops.webapp", web_port),
+        "watchdog": one("watchdog", "[-]m qqops.watchdog", 0),
         "napcat": one("napcat", "[o]pt/QQ/qq", napcat_port),
     }
 
