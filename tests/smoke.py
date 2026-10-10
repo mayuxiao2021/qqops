@@ -818,7 +818,7 @@ class TestLifecycle(unittest.TestCase):
         env["QQOPS_DATA"] = TMP
         env["TZ"] = "Asia/Shanghai"
         env["PYTHONIOENCODING"] = "utf-8"      # 子进程打印中文不能崩(西文 Windows)
-        env["QQOPS_DEBUG_START"] = "25"        # 启动卡住就把线程栈打出来(CI 只能靠它看真相)
+        env["QQOPS_DEBUG_START"] = "7"         # 启动卡住就把线程栈打出来(CI 只能靠它看真相)
         return env
 
 
@@ -1572,7 +1572,7 @@ class TestIntegration(unittest.TestCase):
         env["QQOPS_DATA"] = TMP
         env["TZ"] = "Asia/Shanghai"
         env["PYTHONIOENCODING"] = "utf-8"      # 子进程打印中文不能崩(西文 Windows)
-        env["QQOPS_DEBUG_START"] = "25"        # 启动卡住就把线程栈打出来(CI 只能靠它看真相)
+        env["QQOPS_DEBUG_START"] = "7"         # 启动卡住就把线程栈打出来(CI 只能靠它看真相)
         return env
 
     @staticmethod
@@ -1582,10 +1582,20 @@ class TestIntegration(unittest.TestCase):
         try:
             if proc.poll() is not None:
                 parts.append("子进程已退出, 退出码 %s" % proc.returncode)
+            else:
+                parts.append("子进程仍在运行(pid %s): 多半卡住了, 线程栈见上面的 QQOPS_DEBUG_START 输出"
+                             % proc.pid)
         except Exception:
             pass
         try:
-            out = (proc.stdout.read() if proc.stdout else "")[-1500:]
+            # 进程还在跑时直接 read() 会阻塞 → 先终止, 再把管道里已有的内容读出来
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.kill()
+            out = (proc.stdout.read() if proc.stdout else "")[-2000:]
             parts.append("子进程输出:\n%s" % (out or "(空)"))
         except Exception as e:
             parts.append("读子进程输出失败: %s" % e)
@@ -2342,7 +2352,7 @@ class TestIngestSpec(unittest.TestCase):
         env["QQOPS_DATA"] = TMP
         env["TZ"] = "Asia/Shanghai"
         env["PYTHONIOENCODING"] = "utf-8"      # 子进程打印中文不能崩(西文 Windows)
-        env["QQOPS_DEBUG_START"] = "25"        # 启动卡住就把线程栈打出来(CI 只能靠它看真相)
+        env["QQOPS_DEBUG_START"] = "7"         # 启动卡住就把线程栈打出来(CI 只能靠它看真相)
         return env
 
     @classmethod

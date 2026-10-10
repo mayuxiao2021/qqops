@@ -24,7 +24,7 @@ import urllib.error
 import urllib.request
 import secrets
 
-VERSION = "3.3.9"
+VERSION = "3.3.10"
 
 # 路径解析(踩过坑, 别改回 "靠 $HOME 猜"):
 #   曾经用 BASE = ~/qqops —— 但 $HOME 是环境给的, 从别的目录/cron/adb run-as 调用时
@@ -370,7 +370,9 @@ def startup_debug() -> None:
         except ValueError:
             secs = 15.0
         faulthandler.enable()
-        faulthandler.dump_traceback_later(max(3.0, secs), exit=True)
+        # 只 dump, **不退出**: 退出会把"启动慢但正常"的服务直接干掉(踩过);
+        # 卡住的进程由调用方(测试/运维)自行超时终止, 我们要的只是那一份线程栈。
+        faulthandler.dump_traceback_later(max(3.0, secs))
     except Exception:
         pass
 
