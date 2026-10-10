@@ -1,0 +1,90 @@
+{
+  "basic": {
+    "description": "查询设置",
+    "type": "object",
+    "hint": "用自然语言提问, 程序先在你的记录里检索, 再让模型**只依据检索结果**作答并标注来源。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用智能查询",
+        "default": true,
+        "hint": "关闭后「对话」页不工作, 其余功能不受影响。"
+      },
+      "default_hours": {
+        "type": "int",
+        "description": "默认时间范围(小时)",
+        "default": 72,
+        "min": 1,
+        "max": 8760,
+        "hint": "问题里没说时间时用这个范围; 说\"昨天/本周\"等会自动覆盖。"
+      },
+      "max_sources": {
+        "type": "int",
+        "description": "最多送多少条记录给模型",
+        "default": 60,
+        "min": 5,
+        "max": 300,
+        "hint": "越多越全面, 但更慢也更费 token。"
+      },
+      "max_rounds": {
+        "type": "int",
+        "description": "最多检索轮次",
+        "default": 2,
+        "min": 1,
+        "max": 3,
+        "hint": "模型发现信息不够时可以要求再检索一轮(会多一次调用)。"
+      },
+      "daily_quota": {
+        "type": "int",
+        "description": "每天最多提问次数",
+        "default": 100,
+        "min": 1,
+        "max": 10000,
+        "hint": "防止误点刷爆额度; 达到上限会提示。"
+      },
+      "temperature": {
+        "type": "float",
+        "description": "模型温度",
+        "default": 0.2,
+        "min": 0,
+        "max": 1.5,
+        "hint": "查询场景建议低温度, 少发挥。"
+      },
+      "max_tokens": {
+        "type": "int",
+        "description": "单次回答上限(token)",
+        "default": 1500,
+        "min": 128,
+        "max": 8000
+      }
+    }
+  },
+  "prompt": {
+    "description": "提示词",
+    "type": "object",
+    "hint": "约束模型严格依据记录回答。改坏了可能会开始编造, 请谨慎。",
+    "items": {
+      "cite_required": {
+        "type": "bool",
+        "description": "强制标注来源",
+        "default": true,
+        "hint": "要求每条结论后标 [M1] 这类来源编号。"
+      },
+      "extra_instructions": {
+        "type": "string",
+        "description": "附加要求",
+        "default": "",
+        "hint": "例如\"用要点列出\"、\"只说时间、人和事\"。"
+      }
+    }
+  },
+  "display": {
+    "description": "展示",
+    "type": "object",
+    "items": {
+      "show_sources": {"type": "bool", "description": "显示来源列表", "default": true},
+      "show_tokens": {"type": "bool", "description": "显示 token 与成本", "default": true},
+      "suggest_count": {"type": "int", "description": "推荐问题条数", "default": 4, "min": 0, "max": 8}
+    }
+  }
+}

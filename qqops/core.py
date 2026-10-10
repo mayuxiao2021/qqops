@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 import secrets
 
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 
 # 路径解析(踩过坑, 别改回 "靠 $HOME 猜"):
 #   曾经用 BASE = ~/qqops —— 但 $HOME 是环境给的, 从别的目录/cron/adb run-as 调用时
@@ -74,6 +74,12 @@ DEFAULT_CONFIG = {
     },
     "retention": {"message_days": 0, "log_max_mb": 4, "backup_keep": 7},
     "watchdog": {"enabled": True, "interval": 60, "manage_extras": False},
+    # 智能查询用的模型配置: 留空则回落到上面的 summarizer(base_url/api_key/model 只维护一份)
+    "llm": {
+        "base_url": "", "api_key": "", "model": "", "temperature": 0.2,
+        "max_tokens": 1500, "timeout": 120, "retries": 2,
+        "input_price_per_mtok": 0.0, "output_price_per_mtok": 0.0,
+    },
     "extract": {
         "structured": True,          # LLM 输出结构化 JSON(事件/待办/链接/事实/记忆)
         "max_events": 8, "max_todos": 8, "max_links": 6, "memory_chars": 600,
@@ -325,7 +331,8 @@ SCHEMA = [
         message_type TEXT, group_id INTEGER, user_id INTEGER,
         nickname TEXT, card TEXT, message_id INTEGER,
         raw_message TEXT, segments TEXT, kinds TEXT,
-        platform TEXT DEFAULT 'aiocqhttp')""",
+        platform TEXT DEFAULT 'aiocqhttp',
+        self INTEGER DEFAULT 0, recalled INTEGER DEFAULT 0)""",
     "CREATE INDEX IF NOT EXISTS idx_msg_group_ts ON messages(group_id, ts)",
     "CREATE INDEX IF NOT EXISTS idx_msg_ts ON messages(ts)",
     "CREATE INDEX IF NOT EXISTS idx_msg_kinds ON messages(kinds)",
@@ -337,6 +344,17 @@ SCHEMA = [
         tokens_out INTEGER DEFAULT 0, cost REAL DEFAULT 0)""",
     "CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at)",
     "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)",
+    # ---- AI 对话(智能查询)的会话与轮次 ----
+    """CREATE TABLE IF NOT EXISTS chat_sessions(
+        id TEXT PRIMARY KEY, title TEXT, created INTEGER, updated INTEGER,
+        turns INTEGER DEFAULT 0, tokens_in INTEGER DEFAULT 0,
+        tokens_out INTEGER DEFAULT 0, cost REAL DEFAULT 0)""",
+    """CREATE TABLE IF NOT EXISTS chat_turns(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, content TEXT,
+        sources TEXT, meta TEXT, tokens_in INTEGER DEFAULT 0, tokens_out INTEGER DEFAULT 0,
+        cost REAL DEFAULT 0, ms INTEGER DEFAULT 0, created INTEGER)""",
+    "CREATE INDEX IF NOT EXISTS idx_chat_turns ON chat_turns(session_id, id)",
+    "CREATE INDEX IF NOT EXISTS idx_chat_sessions ON chat_sessions(updated)",
     # ---- 结构化产出: 事件 / 待办 / 链接 / 媒体 ----
     """CREATE TABLE IF NOT EXISTS events(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -359,6 +377,12 @@ SCHEMA = [
         name TEXT, url TEXT, path TEXT, size INTEGER DEFAULT 0,
         caption TEXT, caption_at INTEGER, status TEXT DEFAULT 'new', error TEXT,
         first_seen INTEGER)""",
+]
+
+# 老库升级: 全部幂等(重复执行只报错不抛), 失败只记日志
+MIGRATIONS = [
+    "ALTER TABLE messages ADD COLUMN self INTEGER DEFAULT 0",
+    "ALTER TABLE messages ADD COLUMN recalled INTEGER DEFAULT 0",
 ]
 
 # 独立(非 external-content)的 FTS5 表: 便于把群名一并索引; 数据由 Python 侧同步
@@ -425,8 +449,47 @@ class Store:
             con.commit()
         finally:
             con.close()
+        self._migrate()
         if self.fts_ok:
             self.fts_ensure(con_factory=self.conn)
+
+    def _migrate(self) -> None:
+        """老库升级: 补列 + 建去重唯一索引(幂等, 失败只记日志不挡启动)。
+
+        去重是硬要求 —— NapCat 断线重连会补发离线消息, 没有唯一约束就会重复入库。
+        历史库里可能已经有重复, 所以先清理再建唯一索引。
+        """
+        con = self.conn()
+        try:
+            for sql in MIGRATIONS:
+                try:
+                    con.execute(sql)
+                except Exception:
+                    pass                      # 列已存在
+            has_idx = con.execute("SELECT 1 FROM sqlite_master WHERE type='index' "
+                                  "AND name='idx_msg_dedup'").fetchone()
+            con.commit()
+        except Exception as e:
+            log("core", "WARN", "迁移失败: %s" % e)
+            return
+        finally:
+            con.close()
+        if has_idx:
+            return
+        try:
+            n = self.dedupe_messages()
+            if n:
+                log("core", "INFO", "清理历史重复消息 %d 条" % n)
+            con = self.conn()
+            try:
+                con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_dedup "
+                            "ON messages(group_id, message_id) WHERE message_id > 0")
+                con.commit()
+                log("core", "INFO", "已建立消息去重唯一索引(group_id, message_id)")
+            finally:
+                con.close()
+        except Exception as e:
+            log("core", "WARN", "去重索引建立失败(不影响使用): %s" % e)
 
     def fts_ensure(self, con_factory=None) -> int:
         """索引缺失/落后时重建(首次迁移或索引被清空)。返回补齐的条数。"""
@@ -455,8 +518,12 @@ class Store:
             con.close()
 
     # -- 消息
-    def insert_message(self, ev: dict) -> bool:
-        """落库一条消息。遇到 SQLite 忙锁会退避重试, 避免偶发锁冲突丢消息。"""
+    def insert_message(self, ev: dict) -> str:
+        """落库一条消息。返回 `"inserted"` / `"duplicate"` / `"empty"`。
+
+        去重是硬要求: NapCat 断线重连后会补发离线期间的消息, 没有唯一约束就会重复入库。
+        遇到 SQLite 忙锁会退避重试, 避免偶发锁冲突丢消息。
+        """
         last = None
         for attempt in range(3):
             try:
@@ -468,23 +535,35 @@ class Store:
                 time.sleep(0.2 * (attempt + 1))
         raise last
 
-    def _insert_once(self, ev: dict) -> bool:
-        mtype = ev.get("message_type")
+    def _insert_once(self, ev: dict) -> str:
+        mtype = ev.get("message_type") or "group"
         gid = int(ev.get("group_id") or 0)
         sd = ev.get("sender") or {}
         msg = ev.get("message")
-        kinds = kinds_of(msg)
         raw = ev.get("raw_message") or ""
+        if not raw and not msg:
+            return "empty"                      # 空消息(协议里的心跳式消息)不入库
+        kinds = kinds_of(msg)
         nick = sd.get("nickname") or ""
+        mid = int(ev.get("message_id") or 0)
+        ts = int(ev.get("time") or time.time())
+        now_ts = int(time.time())
+        if ts > now_ts + 86400:                 # 手机时钟回拨/未来时间: 以本地时间为准, 不污染时间线
+            ts = now_ts
+        is_self = 1 if (ev.get("post_type") == "message_sent" or ev.get("self_id") and
+                        int(ev.get("user_id") or 0) == int(ev.get("self_id") or 0)) else 0
         con = self.conn()
         try:
             cur = con.execute(
-                "INSERT INTO messages(ts,message_type,group_id,user_id,nickname,card,message_id,"
-                "raw_message,segments,kinds,platform) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (int(ev.get("time") or time.time()), mtype, gid, int(ev.get("user_id") or 0),
-                 nick, sd.get("card") or "", int(ev.get("message_id") or 0),
+                "INSERT OR IGNORE INTO messages(ts,message_type,group_id,user_id,nickname,card,"
+                "message_id,raw_message,segments,kinds,platform,self,recalled) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0)",
+                (ts, mtype, gid, int(ev.get("user_id") or 0),
+                 nick, sd.get("card") or "", mid,
                  raw, json.dumps(msg, ensure_ascii=False), kinds,
-                 ev.get("platform") or "aiocqhttp"))
+                 ev.get("platform") or "aiocqhttp", is_self))
+            if cur.rowcount == 0 and mid:       # 唯一索引拦下的重复消息
+                return "duplicate"
             if self.fts_ok:
                 row = con.execute("SELECT name FROM groups WHERE id=?", (gid,)).fetchone()
                 try:
@@ -495,7 +574,31 @@ class Store:
                 except Exception as e:
                     log("core", "WARN", "FTS 写入失败: %s" % e)
             con.commit()
-            return True
+            return "inserted"
+        finally:
+            con.close()
+
+    def mark_recalled(self, group_id: int, message_id: int) -> int:
+        """标记消息已被撤回(OneBot notice/group_recall)。返回受影响条数。"""
+        con = self.conn()
+        try:
+            cur = con.execute("UPDATE messages SET recalled=1 WHERE group_id=? AND message_id=?",
+                              (int(group_id or 0), int(message_id or 0)))
+            con.commit()
+            return cur.rowcount
+        finally:
+            con.close()
+
+    def dedupe_messages(self) -> int:
+        """清掉历史重复消息(同群同 message_id 只留最早一条), 为唯一索引铺路。"""
+        con = self.conn()
+        try:
+            cur = con.execute(
+                """DELETE FROM messages WHERE message_id>0 AND id NOT IN (
+                       SELECT MIN(id) FROM messages WHERE message_id>0
+                       GROUP BY group_id, message_id)""")
+            con.commit()
+            return cur.rowcount
         finally:
             con.close()
 
@@ -529,7 +632,8 @@ class Store:
             con.close()
 
     def messages(self, group: str = "", kind: str = "", q: str = "", hours: int = 24,
-                 page: int = 1, size: int = 50) -> dict:
+                 page: int = 1, size: int = 50, order: str = "desc",
+                 include_self: bool = True, exclude_recalled: bool = False) -> dict:
         size = max(1, min(500, int(size)))
         page = max(1, int(page))
         where, args = ["m.ts>=?"], [int(time.time()) - int(hours) * 3600]
@@ -540,6 +644,10 @@ class Store:
         if kind:
             where.append("m.kinds LIKE ?")
             args.append("%" + kind + "%")
+        if not include_self:
+            where.append("COALESCE(m.self,0)=0")
+        if exclude_recalled:
+            where.append("COALESCE(m.recalled,0)=0")
         if q:
             mq = fts_query(q) if self.fts_ok else ""
             if mq:
@@ -551,18 +659,101 @@ class Store:
                 args += ["%" + q + "%", "%" + q + "%"]
                 mode = "like"
         w = " AND ".join(where)
+        order_sql = "ASC" if str(order).lower() == "asc" else "DESC"
         con = self.conn()
         try:
             total = con.execute("SELECT COUNT(*) c FROM messages m WHERE " + w, args).fetchone()["c"]
             rows = [dict(r) for r in con.execute(
                 """SELECT m.id,m.ts,m.group_id,COALESCE(g.name,'') group_name,m.user_id,m.nickname,
-                          m.raw_message,m.kinds
+                          m.raw_message,m.kinds,COALESCE(m.self,0) self,COALESCE(m.recalled,0) recalled,
+                          m.message_id
                    FROM messages m LEFT JOIN groups g ON g.id=m.group_id
-                   WHERE %s ORDER BY m.ts DESC LIMIT ? OFFSET ?""" % w,
+                   WHERE %s ORDER BY m.ts %s LIMIT ? OFFSET ?""" % (w, order_sql),
                 args + [size, (page - 1) * size])]
             return {"rows": rows, "total": total, "page": page, "size": size,
                     "pages": max(1, (total + size - 1) // size),
                     "mode": mode, "fts_available": self.fts_ok}
+        finally:
+            con.close()
+
+    # -- 对话(AI 智能查询的会话记录)
+    def chat_session_create(self, title: str = "") -> str:
+        import uuid
+        sid = uuid.uuid4().hex[:12]
+        con = self.conn()
+        try:
+            con.execute("INSERT INTO chat_sessions(id,title,created,updated,turns) VALUES(?,?,?,?,0)",
+                        (sid, str(title or "")[:80], int(time.time()), int(time.time())))
+            con.commit()
+            return sid
+        finally:
+            con.close()
+
+    def chat_session_touch(self, sid: str, title: str = "") -> None:
+        con = self.conn()
+        try:
+            if title:
+                con.execute("UPDATE chat_sessions SET updated=?, turns=turns+1, title=? WHERE id=?",
+                            (int(time.time()), str(title)[:80], sid))
+            else:
+                con.execute("UPDATE chat_sessions SET updated=?, turns=turns+1 WHERE id=?", (int(time.time()), sid))
+            con.commit()
+        finally:
+            con.close()
+
+    def chat_append(self, sid: str, role: str, content: str, sources=None, meta=None,
+                    tokens_in: int = 0, tokens_out: int = 0, cost: float = 0.0, ms: int = 0) -> int:
+        con = self.conn()
+        try:
+            cur = con.execute(
+                "INSERT INTO chat_turns(session_id,role,content,sources,meta,tokens_in,tokens_out,"
+                "cost,ms,created) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (sid, str(role), str(content or ""),
+                 json.dumps(sources or [], ensure_ascii=False),
+                 json.dumps(meta or {}, ensure_ascii=False),
+                 int(tokens_in), int(tokens_out), float(cost), int(ms), int(time.time())))
+            con.execute("UPDATE chat_sessions SET updated=?, tokens_in=tokens_in+?, "
+                        "tokens_out=tokens_out+?, cost=cost+? WHERE id=?",
+                        (int(time.time()), int(tokens_in), int(tokens_out), float(cost), sid))
+            con.commit()
+            return int(cur.lastrowid or 0)
+        finally:
+            con.close()
+
+    def chat_session(self, sid: str, limit: int = 200) -> dict:
+        con = self.conn()
+        try:
+            s = con.execute("SELECT * FROM chat_sessions WHERE id=?", (sid,)).fetchone()
+            if not s:
+                return {}
+            turns = [dict(r) for r in con.execute(
+                "SELECT * FROM chat_turns WHERE session_id=? ORDER BY id ASC LIMIT ?", (sid, int(limit)))]
+            for t in turns:
+                for k in ("sources", "meta"):
+                    try:
+                        t[k] = json.loads(t.get(k) or "[]") if k == "sources" else json.loads(t.get(k) or "{}")
+                    except Exception:
+                        t[k] = [] if k == "sources" else {}
+            return {**dict(s), "turns": turns}
+        finally:
+            con.close()
+
+    def chat_sessions(self, limit: int = 50) -> list:
+        con = self.conn()
+        try:
+            return [dict(r) for r in con.execute(
+                "SELECT id,title,created,updated,turns,tokens_in,tokens_out,cost FROM chat_sessions "
+                "ORDER BY updated DESC LIMIT ?", (int(limit),))]
+        finally:
+            con.close()
+
+    def chat_session_delete(self, sid: str) -> int:
+        con = self.conn()
+        try:
+            n = con.execute("DELETE FROM chat_turns WHERE session_id=?", (sid,)).rowcount
+            con.execute("DELETE FROM chat_sessions WHERE id=?", (sid,))
+            con.commit()
+            return int(n or 0)
         finally:
             con.close()
 
@@ -1017,12 +1208,19 @@ def fts_query(q: str) -> str:
 
 
 def kinds_of(msg) -> str:
+    """把 OneBot 消息段类型归一成可统计的"类型串"。
+
+    归一化别名(与 CQ 码类型对齐): record→voice, mface/marketface→face,
+    node/forward→forward, flash→image。控制台与采集过滤都按这个串判断。
+    """
     if isinstance(msg, str):
         return "text"
+    alias = {"record": "voice", "mface": "face", "marketface": "face",
+             "node": "forward", "flash": "image"}
     ks = []
     for s in (msg or []):
         t = (s or {}).get("type") or "?"
-        t = {"record": "voice", "video": "video"}.get(t, t)
+        t = alias.get(t, t)
         if t not in ks:
             ks.append(t)
     return ",".join(ks)

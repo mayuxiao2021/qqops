@@ -130,14 +130,14 @@ function sparkline(series, w = 320, h = 46) {
 function svcPill(s) { return `<span class="pill ${s.running ? 'ok' : 'bad'}"><span class="dot ${s.running ? 'ok' : 'bad'}"></span>${s.running ? '运行中' : '已停止'}</span>`; }
 
 /* ------------------------------------------------------------------ 路由 */
-/* 9 个一级页面: 仪表盘 / 消息 / 总结 / 任务 / 插件 / 数据 / 运维 / 设置 / 帮助 */
+/* 10 个一级页面: 仪表盘 / 对话 / 消息 / 总结 / 任务 / 插件 / 数据 / 运维 / 设置 / 帮助 */
 const NAV = [
-  ['dashboard', '仪表盘', '📊'], ['messages', '消息', '💬'], ['reports', '总结', '📝'],
-  ['tasks', '任务', '⏱'], ['plugins', '插件', '🧩'], ['data', '数据', '🗂'],
-  ['ops', '运维', '🛠'], ['settings', '设置', '⚙'], ['help', '帮助', '❓'],
+  ['dashboard', '仪表盘', '📊'], ['chat', '对话', '💬'], ['messages', '消息', '🗂'],
+  ['reports', '总结', '📝'], ['tasks', '任务', '⏱'], ['plugins', '插件', '🧩'],
+  ['data', '数据', '🗃'], ['ops', '运维', '🛠'], ['settings', '设置', '⚙'], ['help', '帮助', '❓'],
 ];
 /* 手机底部标签栏: 5 个高频页 + "更多" */
-const BOTTOM = ['dashboard', 'messages', 'reports', 'ops', 'plugins'];
+const BOTTOM = ['dashboard', 'chat', 'messages', 'reports', 'ops'];
 function dueTag(ts) {
   if (!ts) return '';
   const left = ts - Date.now() / 1000;
@@ -442,6 +442,134 @@ async function openPluginConfig(pid) {
       if (errs.length) modal('配置校验提示', `<div class="muted">非法项已回退为默认值:</div><ul>${errs.map(e => `<li>${esc(e)}</li>`).join('')}</ul>`);
     }
   };
+}
+
+/* ------------------------------------------------------- 对话(AI 智能查询) */
+let chatSession = '', chatBusy = false;
+const SRC_ICON = {M: '💬', E: '📌', Y: '🧠', L: '🔗', P: '🖼'};
+VIEWS.chat = async (v) => {
+  const [sessions, sug] = await Promise.all([api('/api/assistant/sessions'), api('/api/assistant/suggest')]);
+  const sess = (sessions && sessions.sessions) || [];
+  const llm = (sessions && sessions.llm) || {};
+  const quota = (sessions && sessions.quota) || 0;
+  const used = (sessions && sessions.today_used) || 0;
+  let turns = [];
+  if (chatSession) {
+    const d = await api('/api/assistant/session?id=' + encodeURIComponent(chatSession));
+    turns = (d && d.turns) || [];
+  }
+  const bubbles = turns.map(t => {
+    if (t.role === 'user') return `<div class="bub user">${esc(t.content)}</div>`;
+    const srcs = (t.sources || []).map(s =>
+      `<a href="#" class="srcchip" data-src="${esc(s.kind)}" data-ref="${esc(String(s.ref).slice(1))}" data-url="${esc(s.url || '')}" title="${esc(s.text || '')}">${SRC_ICON[s.kind] || '•'} ${esc(s.label || s.ref)}</a>`).join(' ');
+    const meta = t.meta || {};
+    const info = [
+      meta.model ? esc(meta.model) : '',
+      t.tokens_in ? `${t.tokens_in}+${t.tokens_out} tokens` : '',
+      meta.rounds ? `${meta.rounds} 轮` : '',
+      t.ms ? (t.ms / 1000).toFixed(1) + 's' : '',
+      meta.degraded ? '<span class="err">降级</span>' : '',
+    ].filter(Boolean).join(' · ');
+    return `<div class="bub bot">${renderAnswer(t.content)}
+      ${srcs ? `<div class="srcs"><span class="muted">来源</span> ${srcs}</div>` : ''}
+      ${info ? `<div class="muted bub-meta">${info}</div>` : ''}</div>`;
+  }).join('');
+  v.innerHTML = `<div class="chatwrap">
+    <aside class="chatlist">
+      <div class="row"><b>会话</b><span class="right muted">今日 ${used}/${quota || '-'}</span></div>
+      <button class="primary" id="chat-new" style="width:100%;margin:8px 0">＋ 新对话</button>
+      <div class="list" id="chat-sessions">${sess.map(s =>
+        `<div class="it ${s.id === chatSession ? 'on' : ''}" data-sid="${esc(s.id)}">
+          <span class="ellip">${esc(s.title || '(无标题)')}</span>
+          <button class="right icon-btn" data-del="${esc(s.id)}" title="删除">✕</button></div>`).join('')
+        || '<div class="muted">还没有对话</div>'}</div>
+      <div class="muted" style="margin-top:10px;font-size:12px">
+        模型: ${llm.configured ? esc(llm.model || '已配置') : '<span class="err">未配置</span>'}
+        ${llm.configured ? '' : '<br>到「设置」填 API Key, 或让 summarizer 有 key'}
+      </div>
+    </aside>
+    <section class="chatmain">
+      <div class="chatturns" id="chat-turns">
+        ${bubbles || `<div class="card">${emptyState('问一句关于你聊天记录的话',
+          '例如: 昨天群里讨论了什么 / 谁提到过报告 / 有哪些快到期的待办')}
+          <div class="row" style="margin-top:10px">${((sug && sug.suggestions) || []).map(s =>
+            `<button class="chipbtn" data-ask="${esc(s)}">${esc(s)}</button>`).join('')}</div></div>`}
+      </div>
+      <div class="chatinput">
+        <textarea id="chat-q" rows="2" placeholder="问点什么…  (Enter 发送, Shift+Enter 换行)"></textarea>
+        <div class="row" style="margin-top:6px">
+          <label class="toggle">范围
+            <select id="chat-hours">
+              <option value="0">默认</option><option value="24">近 24 小时</option>
+              <option value="72">近 3 天</option><option value="168">近 7 天</option>
+              <option value="720">近 30 天</option><option value="8760">近一年</option>
+            </select></label>
+          <span id="chat-state" class="muted"></span>
+          <span class="right row">
+            <button id="chat-clear">清屏</button>
+            <button class="primary" id="chat-send">发送</button>
+          </span>
+        </div>
+      </div>
+    </section></div>`;
+  const send = async (text) => {
+    const q = (text || q(v, '#chat-q').value || '').trim();
+    if (!q || chatBusy) return;
+    chatBusy = true;
+    q(v, '#chat-state').textContent = '检索记录并思考中…';
+    q(v, '#chat-send').disabled = true;
+    q(v, '#chat-q').value = '';
+    const hours = parseInt(q(v, '#chat-hours').value, 10) || 0;
+    const r = await api('/api/assistant/ask', {method: 'POST',
+      body: JSON.stringify({question: q, session_id: chatSession, hours})});
+    chatBusy = false;
+    q(v, '#chat-send').disabled = false;
+    q(v, '#chat-state').textContent = '';
+    if (!r) return toast('查询失败', 'bad');
+    if (r.ok === false) { toast(r.error || '查询失败', 'bad'); return; }
+    chatSession = r.session_id || chatSession;
+    if (r.degraded) toast(r.error ? '模型不可用, 已降级显示记录' : '记录不足, 已如实说明', 'warn');
+    render();
+  };
+  q(v, '#chat-send').onclick = () => send();
+  q(v, '#chat-q').onkeydown = e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+  };
+  q(v, '#chat-new').onclick = () => { chatSession = ''; render(); };
+  q(v, '#chat-clear').onclick = () => { chatSession = ''; render(); };
+  v.querySelectorAll('[data-ask]').forEach(b => b.onclick = () => send(b.dataset.ask));
+  v.querySelectorAll('[data-sid]').forEach(el => el.onclick = e => {
+    if (e.target.dataset.del) return;
+    chatSession = el.dataset.sid; render();
+  });
+  v.querySelectorAll('[data-del]').forEach(b => b.onclick = async e => {
+    e.stopPropagation();
+    if (!confirm('删除这个会话?')) return;
+    await api('/api/assistant/delete', {method: 'POST', body: JSON.stringify({id: b.dataset.del})});
+    if (chatSession === b.dataset.del) chatSession = '';
+    toast('已删除', 'ok'); render();
+  });
+  v.querySelectorAll('[data-src]').forEach(a => a.onclick = async e => {
+    e.preventDefault();
+    const kind = a.dataset.src, ref = a.dataset.ref;
+    const d = await api(`/api/assistant/source/${kind}/${encodeURIComponent(ref)}`);
+    if (!d || !d.ok) return toast('取不到原文', 'bad');
+    const r = d.record || {};
+    const body = kind === 'M'
+      ? `<div class="muted">${esc(r.ts_text || '')} · ${esc(r.group_name || r.group_id || '')} · ${esc(r.nickname || '')}</div>
+         <pre>${esc(r.raw_message || '')}</pre>`
+      : `<pre>${esc(JSON.stringify(r, null, 2))}</pre>`;
+    modal('来源原文', body);
+  });
+  const box = q(v, '#chat-turns');
+  if (box.scrollHeight) box.scrollTop = box.scrollHeight;
+};
+/* 把回答里的 [#M1] / [M1] 变成可点的来源芯片(先转义再做替换, 防注入) */
+function renderAnswer(text) {
+  const safe = esc(text || '');
+  return safe.replace(/\n/g, '<br>')
+    .replace(/\[#?([MEYLP])(\d+)\]/g, (m, k, n) =>
+      `<a href="#" class="cite" data-src="${k}" data-ref="${n}">[${k}${n}]</a>`);
 }
 
 /* ------------------------------------------------------- 数据 */

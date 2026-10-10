@@ -164,13 +164,16 @@ class RemindersPlugin(Plugin):
 | 插件 | 职责 | 迁移自 |
 |---|---|---|
 | `collector` | OneBot 适配器 + ingest 阶段 + persist | `collector.py` |
+| `assistant` | **智能查询**:检索记录 → 模型作答(带来源编号)+ 会话落库 | 新增(v3.1) |
+| `reminders` | 截止提醒(从消息里识别时间点) | 新增(v3.0) |
 | `summarizer` | 总结任务 + 报告 + 推送 | `summarizer.py`/`extract.py`/`render.py` |
 | `scheduler` | 定时计划(灵活模式)+ 维护任务 | `scheduler.py` |
 | `watchdog` | 服务监督(退避/熔断) | `watchdog.py` |
 | `media` | 媒体抓取 + 多模态描述 | `media.py` |
 | `links` | 链接抓取 + 摘要 | `linkfetch.py` |
-| `reminders` | 截止提醒(新功能,验证插件体系) | — |
 | `archive` | 事件/记忆/链接归档浏览 | 部分 `core.Store` |
+
+> 消息接收的接口契约与审计结论见 **`docs/INGEST.md`**(含 OneBot v11 逐条规范与自查方法)。
 
 ---
 
@@ -302,21 +305,29 @@ data/
 
 ## 11. 路线图
 
-**v3.0(本轮)**
+**v3.1(本轮)**
+- **消息接收处理规范**:按 OneBot v11 逐条审计(23 项)并修掉缺口 —— 请求体上限 413、
+  `message_sent` 落库标记 `self`、`notice/group_recall` 撤回标记、`meta_event/heartbeat` 心跳、
+  `(group_id, message_id)` 唯一索引去重、时钟回拨保护、类型归一化、忙锁重试;
+  契约与自查方法见 `docs/INGEST.md`,用例见 `tests/smoke.py::TestIngestSpec`
+- **AI 智能查询**:`framework/llm.py`(供应商抽象:超时/重试/用量/成本/降级)
+  + `plugins/assistant`(中文分词检索 → 编号上下文 → 模型作答带来源 → 两步检索 → 会话落库 → 每日额度)
+  + 控制台「对话」页(气泡/来源芯片可点开原文/降级提示/推荐问题)
+
+**v3.0(上一轮)**
 - 容错内核(账本/守卫/重试/退避/熔断)+ 全局钩子
 - 事件总线 + 阶段化管线 + 插件体系 + 日志广播
 - 控制台路由注册 + 仪表盘/插件/运维(崩溃账本+日志流)+ 三态与错误边界
 - 首批内置插件:reminders(新)+ 现有能力包装
-- 测试 ≥ 140 项;真机验收含"故障注入"
 
-**v3.1**
-- `core.py` 拆分、collector 适配器化、插件市场式安装(从 URL/压缩包导入插件)
-
-**v3.2**
-- LLM 供应商抽象(多 provider/多模型)、函数调用工具(把 QQOps 数据暴露给 LLM)、
-  报告模板系统、WebSocket 推送替代轮询
+**v3.2(下一步)**
+- `core.py` 拆分、collector 适配器化(落库交给管线)、插件市场式安装(从 URL/压缩包导入)
 
 **v3.3**
+- 多 provider / 多模型切换、函数调用工具(把 QQOps 数据暴露给模型自主检索)、
+  报告模板系统、WebSocket 推送替代轮询
+
+**v3.4**
 - 多平台适配器(Telegram/Discord 只读采集)、多实例管理、权限与多用户控制台
 
 ---

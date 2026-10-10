@@ -42,6 +42,7 @@ from qqops.framework import app as fw_app                                       
 from qqops.framework import bus as fw_bus                                        # noqa: E402
 from qqops.framework import errors as fw_errors                                  # noqa: E402
 from qqops.framework import event as fw_event                                    # noqa: E402
+from qqops.framework import llm as fw_llm                                        # noqa: E402
 from qqops.framework import log as fw_log                                        # noqa: E402
 from qqops.framework import pipeline as fw_pipeline                              # noqa: E402
 from qqops.framework import registry as fw_registry                              # noqa: E402
@@ -163,12 +164,19 @@ class TestConfig(unittest.TestCase):
 
 
 class TestStore(unittest.TestCase):
+    _mid = [1000]        # 真实世界里 message_id 不会重复(3.1 起按它去重), 夹具也得讲道理
+
     def setUp(self):
         self.store = core.Store()
 
-    def ev(self, gid=1001, text="hello", t=None, nick="tester"):
+    @classmethod
+    def next_mid(cls) -> int:
+        cls._mid[0] += 1
+        return cls._mid[0]
+
+    def ev(self, gid=1001, text="hello", t=None, nick="tester", mid=None):
         return {"time": t or core.now(), "post_type": "message", "message_type": "group",
-                "group_id": gid, "user_id": 2002, "message_id": 33,
+                "group_id": gid, "user_id": 2002, "message_id": mid or self.next_mid(),
                 "raw_message": text, "sender": {"nickname": nick},
                 "message": [{"type": "text", "data": {"text": text}}]}
 
@@ -1285,7 +1293,7 @@ class TestIntegration(unittest.TestCase):
                 out = (proc.stdout.read() if proc.stdout else "")[-1500:]
                 self.fail("采集器未在超时内监听, 输出:\n%s" % out)
             ev = {"post_type": "message", "message_type": "group", "group_id": 4242,
-                  "user_id": 7, "message_id": 1, "time": int(time.time()),
+                  "user_id": 7, "message_id": 4242001, "time": int(time.time()),
                   "raw_message": "集成测试 头像 讨论", "sender": {"nickname": "集成"},
                   "message": [{"type": "text", "data": {"text": "x"}}]}
             req = urllib.request.Request("http://127.0.0.1:%d/" % port,
@@ -1997,6 +2005,446 @@ class TestPluginSystem(unittest.TestCase):
         # 清掉残留注册, 避免影响其它用例
         app = self._app(roles=("all",))
         app.stop()
+
+
+class TestIngestSpec(unittest.TestCase):
+    """消息接收处理规范(OneBot v11): 逐条验证 docs/INGEST.md 里的约定。
+
+    用一个真实采集器子进程 + 各种上报体, 覆盖: 去重、机器人自身消息、撤回、
+    心跳、体积上限、非法 JSON、未知类型、空消息、chunked。
+    """
+
+    @staticmethod
+    def _env():
+        env = dict(os.environ)
+        env["QQOPS_DATA"] = TMP
+        env["TZ"] = "Asia/Shanghai"
+        return env
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = free_port()
+        cls.proc = subprocess.Popen([sys.executable, "-m", "qqops.collector", "--port", str(cls.port)],
+                                    cwd=ROOT, env=cls._env(), stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True)
+        if not wait_port(cls.port):
+            cls.proc.kill()
+            raise unittest.SkipTest("采集器未在超时内启动")
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            cls.proc.terminate()
+            cls.proc.wait(timeout=8)
+        except Exception:
+            cls.proc.kill()
+
+    def post(self, ev, raw: bytes = None, headers: dict = None, expect: int = 200):
+        body = raw if raw is not None else json.dumps(ev, ensure_ascii=False).encode()
+        h = {"Content-Type": "application/json"}
+        h.update(headers or {})
+        req = urllib.request.Request("http://127.0.0.1:%d/" % self.port, data=body, headers=h)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                self.assertEqual(r.status, expect)
+                return json.loads(r.read().decode() or "{}")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, expect, "期望 HTTP %s, 实际 %s" % (expect, e.code))
+            return json.loads(e.read().decode() or "{}")
+
+    def counters(self) -> dict:
+        with urllib.request.urlopen("http://127.0.0.1:%d/" % self.port, timeout=8) as r:
+            return json.loads(r.read().decode())["counters"]
+
+    def test_01_message_ingested_and_deduped(self):
+        """正常消息入库; 同一条(重连补发)必须被去重拦住。"""
+        ev = {"post_type": "message", "message_type": "group", "group_id": 9001,
+              "user_id": 11, "message_id": 77001, "time": int(time.time()),
+              "raw_message": "规范测试 去重 关键词",
+              "message": [{"type": "text", "data": {"text": "规范测试 去重 关键词"}}],
+              "sender": {"nickname": "甲"}}
+        before = core.Store().messages(hours=1, size=1)["total"]
+        self.post(ev)
+        same = core.Store().messages(group="9001", q="规范测试 去重", hours=1)
+        self.assertEqual(same["total"], 1, "第一次上报应入库")
+        self.post(ev)                                    # 重连补发同一条
+        again = core.Store().messages(group="9001", q="规范测试 去重", hours=1)
+        self.assertEqual(again["total"], 1, "重复消息必须被唯一索引拦住")
+        self.assertGreaterEqual(self.counters()["duplicate"], 1, "重复计数应+1")
+        self.assertGreaterEqual(self.counters()["ingested"], 1)
+        self.assertGreaterEqual(core.Store().messages(hours=1, size=1)["total"], before)
+
+    def test_02_empty_message_skipped(self):
+        """空消息(无 raw_message 也无 message)不入库。"""
+        ev = {"post_type": "message", "message_type": "group", "group_id": 9001,
+              "user_id": 11, "message_id": 77002, "time": int(time.time()),
+              "raw_message": "", "message": [], "sender": {"nickname": "甲"}}
+        skipped = self.counters()["skipped"]
+        self.post(ev)
+        self.assertGreater(self.counters()["skipped"], skipped, "空消息应计入 skipped")
+
+    def test_03_self_message_stored_with_flag(self):
+        """机器人自己发的消息(message_sent)也要入库并标记 self=1。"""
+        ev = {"post_type": "message_sent", "message_type": "group", "group_id": 9001,
+              "self_id": 1127487015, "user_id": 1127487015, "message_id": 77003,
+              "time": int(time.time()), "raw_message": "这是机器人自己发的话",
+              "message": [{"type": "text", "data": {"text": "这是机器人自己发的话"}}],
+              "sender": {"nickname": "黯"}}
+        self.post(ev)
+        rows = core.Store().messages(group="9001", q="机器人自己发的话", hours=1)["rows"]
+        self.assertEqual(len(rows), 1, "机器人自身消息应入库")
+        self.assertEqual(int(rows[0]["self"]), 1, "必须标记 self=1")
+        self.assertGreaterEqual(self.counters()["sent"], 1)
+
+    def test_04_recall_marks_message(self):
+        """notice/group_recall 必须把对应消息标记为已撤回。"""
+        ev = {"post_type": "message", "message_type": "group", "group_id": 9002,
+              "user_id": 12, "message_id": 88001, "time": int(time.time()),
+              "raw_message": "这条等下会被撤回",
+              "message": [{"type": "text", "data": {"text": "这条等下会被撤回"}}],
+              "sender": {"nickname": "乙"}}
+        self.post(ev)
+        self.post({"post_type": "notice", "notice_type": "group_recall", "group_id": 9002,
+                   "user_id": 12, "operator_id": 12, "message_id": 88001,
+                   "time": int(time.time())})
+        rows = core.Store().messages(group="9002", q="等下会被撤回", hours=1)["rows"]
+        self.assertEqual(int(rows[0]["recalled"]), 1, "撤回事件应标记消息")
+        only_live = core.Store().messages(group="9002", q="等下会被撤回", hours=1,
+                                          exclude_recalled=True)
+        self.assertEqual(only_live["total"], 0, "排除撤回后应查不到")
+        self.assertGreaterEqual(self.counters()["notice"], 1)
+
+    def test_05_heartbeat_recorded(self):
+        """meta_event/heartbeat 要写心跳, 这是 NapCat 连接状态的可靠信号。"""
+        core.state_set("napcat_beat", 0)
+        self.post({"post_type": "meta_event", "meta_event_type": "heartbeat", "interval": 5000,
+                   "status": {"online": True, "good": True}, "time": int(time.time())})
+        beat = int(core.state_get("napcat_beat", 0) or 0)
+        self.assertGreater(beat, 0, "心跳应写入 state")
+        self.assertLess(abs(core.now() - beat), 30)
+        self.assertGreaterEqual(self.counters()["meta"], 1)
+
+    def test_06_bad_payloads(self):
+        """畸形上报: 非法 JSON → 400; 未知 post_type → 200 但跳过; 超大体积 → 413(不看体就拒)。"""
+        self.post({}, raw=b"{not json", expect=400)
+        c0 = self.counters()["skipped"]
+        self.post({"post_type": "something_new", "foo": 1}, expect=200)
+        self.assertGreater(self.counters()["skipped"], c0)
+        # 超大体积: 只发请求头(声明 9MB), 服务端应当立刻回 413 而不是先收完 9MB
+        head = ("POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                "Content-Length: 9437184\r\nConnection: close\r\n\r\n").encode()
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+        try:
+            s.sendall(head)
+            resp = s.recv(512).decode("utf-8", "replace")
+        finally:
+            s.close()
+        self.assertIn("413", resp.split("\r\n", 1)[0], resp[:200])
+
+    def test_07_chunked_body_accepted(self):
+        """NapCat 用 chunked 发请求体, 必须能正确消费。
+
+        用裸 socket 发送: urllib 会自动加 Content-Length, 测不出真正的 chunked 路径。
+        """
+        ev = {"post_type": "message", "message_type": "group", "group_id": 9003,
+              "user_id": 13, "message_id": 99001, "time": int(time.time()),
+              "raw_message": "chunked 传输测试",
+              "message": [{"type": "text", "data": {"text": "chunked 传输测试"}}],
+              "sender": {"nickname": "丙"}}
+        raw = json.dumps(ev, ensure_ascii=False).encode()
+        mid = len(raw) // 2
+        chunked = (b"%x\r\n" % mid) + raw[:mid] + b"\r\n" + \
+                  (b"%x\r\n" % (len(raw) - mid)) + raw[mid:] + b"\r\n0\r\n\r\n"
+        head = ("POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n").encode()
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+        try:
+            s.sendall(head + chunked)
+            resp = b""
+            while len(resp) < 8192:
+                part = s.recv(4096)
+                if not part:
+                    break
+                resp += part
+        finally:
+            s.close()
+        text = resp.decode("utf-8", "replace")
+        self.assertIn("200", text.split("\r\n", 1)[0], text[:200])
+        rows = core.Store().messages(group="9003", q="chunked 传输", hours=1)["rows"]
+        self.assertEqual(len(rows), 1, "chunked 上报应正常入库")
+
+    def test_08_kinds_normalized(self):
+        """消息段类型要归一化(record→voice / mface→face / node→forward / flash→image)。"""
+        ev = {"post_type": "message", "message_type": "group", "group_id": 9004,
+              "user_id": 14, "message_id": 99002, "time": int(time.time()),
+              "raw_message": "[CQ:record][CQ:mface][CQ:flash]",
+              "message": [{"type": "record"}, {"type": "mface"}, {"type": "flash"},
+                          {"type": "node"}, {"type": "text"}],
+              "sender": {"nickname": "丁"}}
+        self.post(ev)
+        rows = core.Store().messages(group="9004", hours=1)["rows"]
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["kinds"], "voice,face,image,forward,text", rows[0]["kinds"])
+
+
+class TestAssistantPlugin(unittest.TestCase):
+    """智能查询: 问题解析 → 检索 → 组装 → 模型作答 → 来源/会话/降级/额度。"""
+
+    def setUp(self):
+        for sub in ("plugin_data", "config"):
+            shutil.rmtree(os.path.join(TMP, sub), ignore_errors=True)
+        st = core.Store()
+        con = st.conn()
+        try:
+            for t in ("chat_turns", "chat_sessions", "messages", "events", "memories",
+                      "links", "media"):
+                con.execute("DELETE FROM " + t)
+            try:
+                con.execute("DELETE FROM messages_fts")
+            except Exception:
+                pass
+            con.commit()
+        finally:
+            con.close()
+
+    def _app(self, roles=("console", "tasks")):
+        app = fw_app.QQOpsApp(name="test", roles=roles, plugin_dirs=[PLUGIN_DIR], workers=1)
+        app.setup()
+        return app
+
+    def _seed(self):
+        st = core.Store()
+        st.upsert_group(6666, "测试群")
+        now = int(time.time())
+        rows = [
+            (101, 6666, "小明", "记得下周三交实验报告", "text"),
+            (102, 6666, "小红", "报告我已经写完了, 晚上发你", "text"),
+            (103, 6666, "小明", "这次报告要加一页预算表", "text"),
+        ]
+        for mid, gid, nick, text, kinds in rows:
+            st.insert_message({"post_type": "message", "message_type": "group", "group_id": gid,
+                               "user_id": 100 + mid, "message_id": mid, "time": now - 7200,
+                               "raw_message": text,
+                               "message": [{"type": "text", "data": {"text": text}}],
+                               "sender": {"nickname": nick}})
+        return st
+
+    def _inst(self, app, texts=None, ok=True, error=""):
+        inst = app.plugins.plugins["assistant"]["inst"]
+
+        class FakeLLM:
+            model = "fake-model"
+
+            def __init__(self):
+                self.calls = []
+                self.texts = list(texts or ["这是回答 [#M1]"])
+
+            def chat(self, messages, **kw):
+                self.calls.append(messages)
+                t = self.texts.pop(0) if self.texts else ""
+                return fw_llm.LLMResult(ok=ok, text=t, model=self.model,
+                                        usage={"prompt_tokens": 123, "completion_tokens": 45},
+                                        cost=0.0012, ms=700, error=error)
+
+            def describe(self):
+                return {"configured": True, "model": self.model, "fake": True}
+
+        inst._llm = FakeLLM()
+        return inst, inst._llm
+
+    # ------------------------------------------------------------ 解析与检索
+    def test_scope_parsing(self):
+        app = self._app()
+        try:
+            self._seed()
+            inst, _ = self._inst(app)
+            s = inst._scope("昨天测试群里谁提到了报告")
+            self.assertEqual(s["hours"], 48, s)
+            self.assertEqual(s["group"], 6666, s)
+            self.assertIn("报告", s["tokens"])
+            self.assertNotIn("昨天", s["tokens"], "时间词不该当检索关键词")
+            s2 = inst._scope("最近3天有什么待办")
+            self.assertEqual(s2["hours"], 72, s2)
+            s3 = inst._scope("上周聊了什么")
+            self.assertEqual(s3["hours"], 336, s3)
+        finally:
+            app.stop()
+
+    def test_retrieve_and_citation_lines(self):
+        app = self._app()
+        try:
+            self._seed()
+            inst, _ = self._inst(app)
+            b = inst._retrieve("报告")
+            self.assertTrue(b["messages"], b)
+            lines, sources = inst._build("报告", b)
+            self.assertTrue(lines[0].startswith("[M1]"), lines[0])
+            self.assertEqual(sources[0]["kind"], "M")
+            self.assertIn("报告", sources[0]["text"])
+            self.assertIn("group_name", sources[0])
+            self.assertIn("小明", sources[0]["label"] + sources[0]["text"] + str(sources))
+        finally:
+            app.stop()
+
+    # ------------------------------------------------------------ 问答
+    def test_ask_with_llm_persists_session(self):
+        app = self._app()
+        try:
+            self._seed()
+            inst, fake = self._inst(app, texts=["报告由小红完成, 还要加一页预算表 [#M1][#M3]"])
+            out = inst.ask("测试群里报告的事怎么样了")
+            self.assertTrue(out["ok"], out)
+            self.assertIn("小红", out["answer"])
+            self.assertTrue(out["sources"])
+            self.assertEqual(out["rounds"], 1)
+            self.assertEqual(len(fake.calls), 1)
+            body = fake.calls[0][1]["content"]
+            self.assertIn("[M1]", body, "送进模型的上下文要带来源编号")
+            self.assertIn("测试群里报告的事", body)
+            sess = core.Store().chat_session(out["session_id"])
+            self.assertEqual(len(sess["turns"]), 2, sess["turns"])
+            self.assertEqual(sess["turns"][0]["role"], "user")
+            self.assertEqual(sess["turns"][1]["role"], "assistant")
+            self.assertEqual(sess["tokens_in"], 123)
+            self.assertGreater(sess["turns"][1]["sources"][0]["ref"], "")
+        finally:
+            app.stop()
+
+    def test_ask_degrades_when_model_unavailable(self):
+        app = self._app()
+        try:
+            self._seed()
+            inst, _ = self._inst(app, ok=False, error="HTTP 401 无效的密钥")
+            out = inst.ask("报告的事")
+            self.assertTrue(out["degraded"], out)
+            self.assertIn("模型暂时不可用", out["answer"])
+            self.assertTrue(out["sources"], "降级时也要把检索到的记录给用户")
+            sess = core.Store().chat_session(out["session_id"])
+            self.assertEqual(len(sess["turns"]), 2)
+            self.assertIn("模型暂时不可用", sess["turns"][1]["content"], "降级回答也要落库")
+        finally:
+            app.stop()
+
+    def test_ask_reports_when_no_records(self):
+        app = self._app()
+        try:
+            inst, _ = self._inst(app)
+            out = inst.ask("有没有关于量子纠缠的讨论", hours=1)
+            self.assertTrue(out["ok"])
+            self.assertEqual(out["sources"], [])
+            self.assertIn("记录里没有找到", out["answer"])
+            self.assertTrue(out["degraded"])
+        finally:
+            app.stop()
+
+    def test_second_round_when_model_asks_for_more(self):
+        app = self._app()
+        try:
+            self._seed()
+            inst, fake = self._inst(app, texts=['{"need": {"q": "预算", "hours": 168}}',
+                                                "补充后: 预算表要加一页 [#M1]"])
+            out = inst.ask("报告还要改什么")
+            self.assertEqual(out["rounds"], 2, out)
+            self.assertEqual(len(fake.calls), 2)
+            self.assertIn("预算表", out["answer"])
+            self.assertNotIn('"need"', out["answer"], "不能把 JSON 指令当回答")
+        finally:
+            app.stop()
+
+    def test_daily_quota(self):
+        app = self._app()
+        try:
+            self._seed()
+            inst, _ = self._inst(app)
+            ok, errs, saved = app.plugins.set_config("assistant", {"basic": {"daily_quota": 1}})
+            self.assertTrue(ok, errs)
+            self.assertEqual(saved["basic"]["daily_quota"], 1)
+            app.ctx.invalidate_plugin_cfg("assistant")
+            inst._llm = inst._llm
+            first = inst.ask("报告的事")
+            self.assertTrue(first["ok"], first)
+            second = inst.ask("报告的事")
+            self.assertFalse(second["ok"])
+            self.assertIn("额度", second["error"])
+        finally:
+            app.plugins.set_config("assistant", {"basic": {"daily_quota": 100}})
+            app.stop()
+
+    def test_empty_question_and_disabled(self):
+        app = self._app()
+        try:
+            inst, _ = self._inst(app)
+            self.assertFalse(inst.ask("   ")["ok"])
+            app.plugins.set_config("assistant", {"basic": {"enabled": False}})
+            app.ctx.invalidate_plugin_cfg("assistant")
+            r = inst.ask("报告的事")
+            self.assertFalse(r["ok"])
+            self.assertIn("关闭", r["error"])
+        finally:
+            app.plugins.set_config("assistant", {"basic": {"enabled": True}})
+            app.stop()
+
+    def test_routes_contract(self):
+        app = self._app(roles=("console",))
+        try:
+            self._seed()
+            inst, _ = self._inst(app, texts=["回答 [#M1]"])
+            hit, params = app.router.match("POST", "/api/assistant/ask")
+            self.assertTrue(hit)
+            req = fw_web.Request(method="POST", path="/api/assistant/ask",
+                                 body=json.dumps({"question": "报告"}).encode())
+            out = hit.fn(req, app.ctx)
+            self.assertTrue(out["ok"], out)
+            hit, _ = app.router.match("GET", "/api/assistant/sessions")
+            self.assertIn("sessions", hit.fn(fw_web.Request(), app.ctx))
+            hit, _ = app.router.match("GET", "/api/assistant/suggest")
+            sug = hit.fn(fw_web.Request(), app.ctx)
+            self.assertIn("suggestions", sug)
+            hit, _ = app.router.match("GET", "/api/assistant/stats")
+            st = hit.fn(fw_web.Request(), app.ctx)
+            self.assertIn("tokens_in", st)
+            self.assertIn("llm", st)
+            # 来源详情: 按消息 id 取原文
+            mid = core.Store().messages(group="6666", q="报告", hours=24)["rows"][0]["id"]
+            hit, params = app.router.match("GET", "/api/assistant/source/M/%d" % mid)
+            self.assertTrue(hit, params)
+            req = fw_web.Request(method="GET", path="/api/assistant/source/M/%d" % mid,
+                                 params={"kind": "M", "ref": str(mid)})
+            src = hit.fn(req, app.ctx)
+            self.assertTrue(src["ok"], src)
+            self.assertIn("报告", src["record"]["raw_message"])
+            self.assertIn("ts_text", src["record"])
+        finally:
+            app.stop()
+
+    def test_llm_from_config_falls_back_to_summarizer(self):
+        """llm 段留空时必须回落到 summarizer, 否则会出现"配了总结却问不了"的情况。"""
+        cfg = core.Config()
+        cfg.set_values({"summarizer": {"base_url": "https://api.deepseek.com/v1",
+                                       "api_key": "sk-test", "model": "deepseek-chat"},
+                        "llm": {"base_url": "", "api_key": "", "model": ""}})
+        llm = fw_llm.from_config(core.Config(), component="t")
+        self.assertTrue(llm.configured, llm.describe())
+        self.assertEqual(llm.model, "deepseek-chat")
+        self.assertEqual(llm.base_url, "https://api.deepseek.com/v1")
+        d = llm.describe()
+        cfg.set_values({"llm": {"model": "deepseek-v4-pro", "temperature": 0.5}})
+        llm2 = fw_llm.from_config(core.Config(), component="t")
+        self.assertEqual(llm2.model, "deepseek-v4-pro", llm2.describe())
+        self.assertEqual(llm2.temperature, 0.5)
+        self.assertEqual(d["configured"], True)
+
+    def test_llm_records_failure_without_raising(self):
+        """模型不可用时 LLM 层不能抛异常, 要返回 ok=False 并记账。"""
+        bad = fw_llm.LLM(base_url="http://127.0.0.1:1", api_key="x", model="m",
+                         timeout=5, retries=1, component="t.bad")
+        res = bad.chat([{"role": "user", "content": "hi"}])
+        self.assertFalse(res.ok, res)
+        self.assertTrue(res.error)
+        self.assertEqual(bad.describe()["configured"], True)
+        empty = fw_llm.LLM()
+        self.assertFalse(empty.configured)
+        self.assertFalse(empty.chat([{"role": "user", "content": "hi"}]).ok)
 
 
 if __name__ == "__main__":
