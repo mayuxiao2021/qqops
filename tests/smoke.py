@@ -818,6 +818,7 @@ class TestLifecycle(unittest.TestCase):
         env["QQOPS_DATA"] = TMP
         env["TZ"] = "Asia/Shanghai"
         env["PYTHONIOENCODING"] = "utf-8"      # 子进程打印中文不能崩(西文 Windows)
+        env["QQOPS_DEBUG_START"] = "25"        # 启动卡住就把线程栈打出来(CI 只能靠它看真相)
         return env
 
 
@@ -1571,6 +1572,7 @@ class TestIntegration(unittest.TestCase):
         env["QQOPS_DATA"] = TMP
         env["TZ"] = "Asia/Shanghai"
         env["PYTHONIOENCODING"] = "utf-8"      # 子进程打印中文不能崩(西文 Windows)
+        env["QQOPS_DEBUG_START"] = "25"        # 启动卡住就把线程栈打出来(CI 只能靠它看真相)
         return env
 
     @staticmethod
@@ -2340,6 +2342,7 @@ class TestIngestSpec(unittest.TestCase):
         env["QQOPS_DATA"] = TMP
         env["TZ"] = "Asia/Shanghai"
         env["PYTHONIOENCODING"] = "utf-8"      # 子进程打印中文不能崩(西文 Windows)
+        env["QQOPS_DEBUG_START"] = "25"        # 启动卡住就把线程栈打出来(CI 只能靠它看真相)
         return env
 
     @classmethod

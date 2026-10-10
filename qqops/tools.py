@@ -241,6 +241,7 @@ def cmd_prune(a) -> int:
 
 def main(argv=None) -> int:
     core.ensure_utf8_console()   # 非 UTF-8 控制台下也能安全打印中文
+    core.startup_debug()         # QQOPS_DEBUG_START=<秒> 时卡住会自动 dump 线程栈
     ap = argparse.ArgumentParser(prog="qqops.tools", description="QQOps 工具集")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("init").set_defaults(func=cmd_init)

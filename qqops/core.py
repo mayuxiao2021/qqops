@@ -24,7 +24,7 @@ import urllib.error
 import urllib.request
 import secrets
 
-VERSION = "3.3.8"
+VERSION = "3.3.9"
 
 # 路径解析(踩过坑, 别改回 "靠 $HOME 猜"):
 #   曾经用 BASE = ~/qqops —— 但 $HOME 是环境给的, 从别的目录/cron/adb run-as 调用时
@@ -352,6 +352,27 @@ def redact_text(text: str) -> str:
         except Exception:
             return s
     return s
+
+
+def startup_debug() -> None:
+    """启动卡死的救援: QQOPS_DEBUG_START=<秒> 时到点 dump 线程栈并退出。
+
+    为什么需要: "启动卡住"最难查 —— 没有异常、没有日志, 只有"端口没起来"。
+    打开它, 卡在哪一行会直接出现在 stderr(测试把它转成 CI annotation)。
+    """
+    val = os.environ.get("QQOPS_DEBUG_START")
+    if not val:
+        return
+    try:
+        import faulthandler
+        try:
+            secs = float(val)
+        except ValueError:
+            secs = 15.0
+        faulthandler.enable()
+        faulthandler.dump_traceback_later(max(3.0, secs), exit=True)
+    except Exception:
+        pass
 
 
 def ensure_utf8_console() -> None:

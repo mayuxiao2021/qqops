@@ -229,6 +229,7 @@ class Runner:
 
 def main(argv=None) -> int:
     core.ensure_utf8_console()   # 非 UTF-8 控制台下也能安全打印中文
+    core.startup_debug()         # QQOPS_DEBUG_START=<秒> 时卡住会自动 dump 线程栈
     ap = argparse.ArgumentParser(description="QQOps 单进程运行器(四服务合并)")
     ap.add_argument("--services", default=",".join(ALL),
                     help="要跑的服务, 逗号分隔: %s" % "/".join(ALL))
