@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0          # --history 需要完整历史
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: 扫描工作区
@@ -59,7 +59,7 @@ jobs:
             experimental: true
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
       - name: 语法检查
@@ -99,7 +99,7 @@ jobs:
         with:
           fetch-depth: 0            # 需要 tag 才能做"包 == 已提交 == tag"的一致性检查
           fetch-tags: true
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: 打包
