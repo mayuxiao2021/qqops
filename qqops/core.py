@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 import secrets
 
-VERSION = "3.3.6"
+VERSION = "3.3.7"
 
 # 路径解析(踩过坑, 别改回 "靠 $HOME 猜"):
 #   曾经用 BASE = ~/qqops —— 但 $HOME 是环境给的, 从别的目录/cron/adb run-as 调用时
@@ -1954,9 +1954,15 @@ def _health_single(name: str, cfg: Config, rt: dict, timeout: float = 8.0) -> di
     if not pid or not _pid_alive(pid):
         return {"ok": False, "why": "主进程不在(pid %s)" % (pid or "?")}
     if name == "watchdog":
+        # 主管的首轮体检要跑调度等活, 慢机器上可能还没写心跳 → 等到超时再判
+        end = time.time() + max(1.0, timeout / 3.0)
         beat = last_beat("watchdog")
-        return {"ok": beat > 0 and now() - beat < 300,
-                "why": "主管心跳 %s" % (fmt_ts(beat) if beat else "无")}
+        while not (beat > 0 and now() - beat < 300):
+            if time.time() >= end:
+                return {"ok": False, "why": "主管心跳 %s" % (fmt_ts(beat) if beat else "无")}
+            time.sleep(0.5)
+            beat = last_beat("watchdog")
+        return {"ok": True, "why": "主管心跳 %s" % fmt_ts(beat)}
     if name == "scheduler":
         end = time.time() + max(1.0, timeout / 3.0)
         while True:
@@ -2250,9 +2256,17 @@ def check_port_free(port: int, mod: str = "") -> dict:
             same_data = os.path.realpath(env["QQOPS_DATA"]) == os.path.realpath(DATA)
         except Exception:
             same_data = False
-    ours = bool(mod and mod in cmd and same_data)
     cands = _own_pids(mod) if mod else []
-    if not pid and cands:                       # 手机: 反查不到, 但确实有本套实例在跑
+    ours = bool(mod and mod in cmd and same_data)
+    if pid and pid in cands:
+        # 占用者就在"我们自己的候选集"里(pid 文件记录 / 环境变量一致)→ 自己人。
+        # 不能只认命令行: macOS 的 lsof 只给出命令名(如 `Python`), 拿它比对模块名必然失败。
+        ours = True
+    if pid:
+        full = _cmdline(pid)
+        if full:
+            cmd = full
+    elif cands:                                 # 手机: 反查不到占用者, 但确实有本套实例在跑
         ours, pid, cmd = True, cands[0], _cmdline(cands[0])
     if pid:
         who = "(pid %s %s)" % (pid, cmd[:70])
