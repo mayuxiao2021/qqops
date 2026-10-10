@@ -19,6 +19,16 @@ import subprocess
 import sys
 import tarfile
 
+
+def _utf8_console() -> None:
+    """非 UTF-8 控制台(西文 Windows)下打印中文不能崩 —— 见 qqops/core.py 的同名函数。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NEED = [
     "bin/qqops",
@@ -63,6 +73,7 @@ def git(*args: str) -> str:
 
 
 def main() -> int:
+    _utf8_console()
     ver = open(os.path.join(ROOT, "VERSION"), encoding="utf-8").read().strip()
     tar_path = os.path.join(ROOT, "dist", "qqops-%s.tar.gz" % ver)
     print("版本       : %s" % ver)

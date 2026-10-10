@@ -15,6 +15,16 @@ import os
 import sys
 import tarfile
 
+
+def _utf8_console() -> None:
+    """非 UTF-8 控制台(西文 Windows)下打印中文不能崩 —— 见 qqops/core.py 的同名函数。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # 与 pack.sh 保持一致的清单(不含 data/ .testdata/ dist/ .git/ .github/)
@@ -99,4 +109,5 @@ def build(out_dir: str = None, verbose: bool = True) -> str:
 
 
 if __name__ == "__main__":
+    _utf8_console()
     sys.exit(0 if build() else 1)

@@ -1,5 +1,26 @@
 # CHANGELOG
 
+## [3.3.3] — 2026-10-10
+
+**修一个只在"西文 Windows"上才暴露的 bug**(CI 的 `windows-latest` 上抓到):非 UTF-8 控制台下
+打印中文会抛 `UnicodeEncodeError`,把服务启动日志、`qqops doctor`、测试输出一起打崩。
+
+### 修复:非 UTF-8 控制台打印中文崩溃
+- `core.ensure_utf8_console()`:把 `stdout/stderr` 切到 UTF-8 + `errors="replace"` ——
+  能显示就正常显示, 显示不了只丢个别字符, **绝不让程序因为"打印"而死**。
+- 七个进程入口(`collector/webapp/scheduler/watchdog/runner/svc/tools`)在 `main()` 第一行调用它;
+  独立工具(`pack.py`、`tools/check_secrets.py`、`tools/verify_package.py`)自带同样实现
+  (它们不 import qqops);测试进程同样先切。
+- 测试里所有 `text=True` 的子进程显式 `encoding="utf-8", errors="replace"`,并给子进程环境加
+  `PYTHONIOENCODING=utf-8`(子进程读写的管道也不能是 cp437)。
+- CI 顶层加 `PYTHONIOENCODING: utf-8` 兜底。
+
+### 测试
+- 171 → **172 项**:新增「非 UTF-8 控制台打印中文不能崩」——断言标准流是 UTF-8,
+  且**每个入口都调用了** `ensure_utf8_console()`(以后新增入口忘了调用会被挡住)。
+- 复现方式(本地中文 Windows 看不出这个问题):`PYTHONIOENCODING=cp1252 python tests/smoke.py`
+  —— 修前 `FAILED (failures=2, errors=1)`,修后全绿。
+
 ## [3.3.2] — 2026-10-10
 
 **开源发布准备**: 文档体系、隐私门禁、CI 与工程规范。功能代码不变。

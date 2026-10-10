@@ -781,6 +781,7 @@ def build_server(cfg=None, app=None, host: str = None, port: int = None):
 
 
 def main(argv=None) -> int:
+    core.ensure_utf8_console()   # 非 UTF-8 控制台下也能安全打印中文
     ap = argparse.ArgumentParser(description="QQOps 控制台")
     ap.add_argument("--host", default=None)
     ap.add_argument("--port", type=int, default=None)

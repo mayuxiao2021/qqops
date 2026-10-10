@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # 兜底: 代码里每个入口都会自己切 UTF-8, 这里再保证一次(CI 的 Windows 默认是 cp437)
+  PYTHONIOENCODING: utf-8
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true

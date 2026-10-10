@@ -76,6 +76,7 @@ def _switch(cfg: core.Config, key: str, val: str, label: str) -> int:
 
 
 def main(argv=None) -> int:
+    core.ensure_utf8_console()   # 非 UTF-8 控制台下也能安全打印中文
     ap = argparse.ArgumentParser(prog="qqops.svc", description="QQOps 服务进程管理")
     ap.add_argument("action", choices=["start", "stop", "restart", "status", "extras",
                                        "mode", "power"])

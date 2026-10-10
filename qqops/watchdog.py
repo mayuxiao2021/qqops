@@ -66,6 +66,7 @@ def check_once(cfg: core.Config | None = None, auto_start: bool = True,
 
 
 def main(argv=None) -> int:
+    core.ensure_utf8_console()   # 非 UTF-8 控制台下也能安全打印中文
     ap = argparse.ArgumentParser(prog="qqops.watchdog", description="QQOps 看门狗")
     ap.add_argument("--once", action="store_true", help="只体检一轮就退出")
     ap.add_argument("--interval", type=int, default=0, help="覆盖体检间隔(秒)")

@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 import secrets
 
-VERSION = "3.3.2"
+VERSION = "3.3.3"
 
 # 路径解析(踩过坑, 别改回 "靠 $HOME 猜"):
 #   曾经用 BASE = ~/qqops —— 但 $HOME 是环境给的, 从别的目录/cron/adb run-as 调用时
@@ -301,6 +301,21 @@ def redact_text(text: str) -> str:
         except Exception:
             return s
     return s
+
+
+def ensure_utf8_console() -> None:
+    """把标准输出/错误切到 UTF-8, 避免在非 UTF-8 控制台上"打印中文就崩"。
+
+    为什么需要: Windows 上控制台默认用系统 ANSI 代码页(西文机器是 cp1252/cp437),
+    Python 往那儿 `print` 中文会抛 UnicodeEncodeError —— 服务启动日志、`qqops doctor`
+    的中文输出全都会炸(CI 的 windows-latest 上实测过)。切到 UTF-8 + errors=replace:
+    能显示就正常显示, 显示不了只丢个别字符, **绝不让程序因为"打印"而死**。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 
 def log(name: str, level: str, msg: str, max_mb: float = 4.0) -> None:

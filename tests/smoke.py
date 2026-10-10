@@ -39,6 +39,7 @@ sys.path.insert(0, ROOT)
 
 from qqops import (collector, core, extract, fileread, linkfetch, media, render,  # noqa: E402
                    summarizer, svc, tools, watchdog, webapp)
+core.ensure_utf8_console()   # 非 UTF-8 控制台(如西文 Windows)下打印中文不能崩
 from qqops import runner as runner_mod                                           # noqa: E402
 from qqops.framework import app as fw_app                                        # noqa: E402
 from qqops.framework import bus as fw_bus                                        # noqa: E402
@@ -386,7 +387,7 @@ class TestExtras(unittest.TestCase):
                 "n = core.kill_pattern(%r, sig=0)\n"      # sig=0: 只探测不真杀
                 "print('SURVIVED', n)\n" % (ROOT, pat)
             )
-            p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
+            p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
             self.assertEqual(p.returncode, 0,
                              "调用方被自己杀掉了(回归): rc=%s out=%s" % (p.returncode, p.stdout))
             self.assertIn("SURVIVED", p.stdout)
@@ -794,6 +795,7 @@ class TestLifecycle(unittest.TestCase):
         env = dict(os.environ)
         env["QQOPS_DATA"] = TMP
         env["TZ"] = "Asia/Shanghai"
+        env["PYTHONIOENCODING"] = "utf-8"      # 子进程打印中文不能崩(西文 Windows)
         return env
 
 
@@ -919,6 +921,26 @@ class TestConsistency(unittest.TestCase):
             "x.py", 'api_key = "%s..."  # 示例\n' % "sk-", []) if f[0] == "hard"], [])
         self.assertEqual(cs.scan_text(
             "x.py", 'token = "%s"  # secret-scan: allow\n' % ("abcdefgh" + "12345678"), []), [])
+
+    def test_console_encoding_never_breaks_chinese(self):
+        """非 UTF-8 控制台(西文 Windows 是 cp1252/cp437)下, 打印中文不能把程序打崩。
+
+        踩过的坑: CI 的 windows-latest 上, 服务启动日志/`qqops doctor`/测试自己打印的中文
+        都抛 UnicodeEncodeError —— 本地中文 Windows(cp936)完全看不出来。
+        修法: 每个入口先 `core.ensure_utf8_console()`, 独立工具脚本自带同样的 3 行。
+        """
+        for stream in (sys.stdout, sys.stderr):
+            enc = str(getattr(stream, "encoding", "") or "").lower().replace("-", "")
+            self.assertEqual(enc, "utf8", "标准流没有切到 UTF-8: %r" % stream)
+        # 每个进程入口都必须调用(新增入口忘了调用时, 这条测试会挡住)
+        for rel in ("qqops/collector.py", "qqops/webapp.py", "qqops/scheduler.py",
+                    "qqops/watchdog.py", "qqops/runner.py", "qqops/svc.py", "qqops/tools.py"):
+            with open(os.path.join(ROOT, rel), encoding="utf-8") as f:
+                self.assertIn("ensure_utf8_console()", f.read(), "%s 没有切 UTF-8 控制台" % rel)
+        # 独立工具/打包脚本自带实现(它们不 import qqops)
+        for rel in ("pack.py", "tools/check_secrets.py", "tools/verify_package.py"):
+            with open(os.path.join(ROOT, rel), encoding="utf-8") as f:
+                self.assertIn("_utf8_console", f.read(), "%s 没有切 UTF-8 控制台" % rel)
 
     def test_docs_and_packaging_are_consistent(self):
         """文档/打包清单/CI 互相引用一致 —— 发布前最容易出现的"漏打包/死链接"。"""
@@ -1410,13 +1432,14 @@ class TestIntegration(unittest.TestCase):
         env = dict(os.environ)
         env["QQOPS_DATA"] = TMP
         env["TZ"] = "Asia/Shanghai"
+        env["PYTHONIOENCODING"] = "utf-8"      # 子进程打印中文不能崩(西文 Windows)
         return env
 
     def test_collector_roundtrip_and_shutdown(self):
         port = free_port()
         proc = subprocess.Popen([sys.executable, "-m", "qqops.collector", "--port", str(port)],
                                 cwd=ROOT, env=self._env(), stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True)
+                                stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
         try:
             if not wait_port(port):
                 proc.kill()
@@ -1455,7 +1478,7 @@ class TestIntegration(unittest.TestCase):
         token = cfg.data["web"]["token"]
         proc = subprocess.Popen([sys.executable, "-m", "qqops.webapp", "--port", str(port)],
                                 cwd=ROOT, env=self._env(), stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True)
+                                stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
         try:
             if not wait_port(port):
                 proc.kill()
@@ -2149,6 +2172,7 @@ class TestIngestSpec(unittest.TestCase):
         env = dict(os.environ)
         env["QQOPS_DATA"] = TMP
         env["TZ"] = "Asia/Shanghai"
+        env["PYTHONIOENCODING"] = "utf-8"      # 子进程打印中文不能崩(西文 Windows)
         return env
 
     @classmethod
@@ -2156,7 +2180,7 @@ class TestIngestSpec(unittest.TestCase):
         cls.port = free_port()
         cls.proc = subprocess.Popen([sys.executable, "-m", "qqops.collector", "--port", str(cls.port)],
                                     cwd=ROOT, env=cls._env(), stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT, text=True)
+                                    stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
         if not wait_port(cls.port):
             cls.proc.kill()
             raise unittest.SkipTest("采集器未在超时内启动")

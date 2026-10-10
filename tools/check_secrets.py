@@ -30,6 +30,16 @@ import re
 import subprocess
 import sys
 
+
+def _utf8_console() -> None:
+    """非 UTF-8 控制台(西文 Windows)下打印中文不能崩 —— 见 qqops/core.py 的同名函数。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 IGNORE_FILE = os.path.join(ROOT, "tools", ".secretscanignore")
 DENYLIST_FILE = os.path.join(ROOT, "tools", "secret_denylist.txt")
@@ -226,6 +236,7 @@ def scan_history(deny: list) -> list:
 
 
 def main() -> int:
+    _utf8_console()
     ap = argparse.ArgumentParser(description="隐私/密钥扫描(仓库门禁)")
     ap.add_argument("--path", nargs="*", default=None, help="只扫这些路径(默认: git 跟踪的全部文件)")
     ap.add_argument("--staged", action="store_true", help="只扫暂存区(给 pre-commit 用)")

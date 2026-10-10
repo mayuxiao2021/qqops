@@ -182,6 +182,7 @@ def power_tick(cfg: core.Config = None) -> int:
 
 
 def main(argv=None) -> int:
+    core.ensure_utf8_console()   # 非 UTF-8 控制台下也能安全打印中文
     core.ensure_dirs()
     cfg = core.Config()
     core.apply_power_profile(cfg)
