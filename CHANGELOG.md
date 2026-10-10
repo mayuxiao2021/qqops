@@ -1,5 +1,35 @@
 # CHANGELOG
 
+## [3.3.2] — 2026-10-10
+
+**开源发布准备**: 文档体系、隐私门禁、CI 与工程规范。功能代码不变。
+
+### 文档(对齐 AstrBot 等成熟开源仓库)
+- `README.md` 重写:徽章、功能表、安装、界面、架构、文档索引、安全、开发;
+  新增 `README_EN.md`(英文简版)、`SECURITY.md`、`CONTRIBUTING.md`、`CODE_OF_CONDUCT.md`。
+- 新增 `docs/DEPLOY.md`(Termux/Android、Linux、Windows 的部署、NapCat 接线、保活、升级、排错)、
+  `docs/FAQ.md`(隐私、成本、性能、卡片等常见问题)。
+- `LICENSE` 由 MIT 改为 **AGPL-3.0**。
+
+### 隐私与密钥门禁(硬性, 不靠自觉)
+- 新增 `tools/check_secrets.py`:通用规则(私钥块、`sk-`/`ghp_`/`AKIA`/`xox*`/JWT/Telegram 令牌、
+  硬编码的 password/token/api_key、个人绝对路径、非 noreply 邮箱、中国大陆手机号、超长十六进制串)
+  **+ 本机禁词表** `tools/secret_denylist.txt`(已 gitignore, 永不入仓;格式见
+  `tools/secret_denylist.example.txt`)。支持 `--staged`(提交前)、`--history`(全历史)、`--strict`。
+- `pack.py` 打包前自动跑一遍扫描;新增 `.githooks/pre-commit` 与 `tools/install-hooks.sh`;
+  CI 有独立的 `privacy` job 扫工作区与全历史。
+- `.gitignore` 增补 `.env`/`*.pem`/`*.key`/禁词表;`config.example.json` 重新生成, 密钥一律留空。
+- 测试新增「仓库不得含隐私/密钥」:既断言仓库干净, 也断言扫描器**确实能抓到**假密钥/个人路径/禁词
+  (测试里的假值用拼接构造, 免得测试文件自己变成"泄漏")。
+
+### 工程与 CI
+- `.github/workflows/ci.yml`:隐私扫描 + 三平台 × 多 Python 版本测试 + 控制台探针 + 打包校验;
+  另有 `ISSUE_TEMPLATE`(bug/feature/config)、`PULL_REQUEST_TEMPLATE.md`、`dependabot.yml`。
+- `.editorconfig`、`.gitattributes`(强制 LF, 二进制与生成物标记)。
+- 开发工具搬进仓库并去掉私有内容:`tools/console_probe.js`(桩 DOM 渲染 + 交互断言)、
+  `tools/verify_package.py`(断言 包 == 工作区 == 已提交 == tag, 且包内权限位正确)。
+- `pack.py` 清单纳入全部文档与工具;测试 169 → **171 项**。
+
 ## [3.3.1] — 2026-10-10
 
 接上一版: 把 **Markdown 卡片**这条线摸到底并接进产品(它的真实身份是 **PacketBackend 的
