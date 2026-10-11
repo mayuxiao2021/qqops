@@ -1265,6 +1265,10 @@ class TestConsistency(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp, True)
         env = dict(os.environ)
         env.pop("PREFIX", None)                    # 模拟 Linux: 没有 Termux 的 PREFIX
+        # 必须清掉 QQOPS_DATA: 测试套件在模块级把它设成了自己的共享数据目录, 子进程一旦继承,
+        # 安装器里的 init 就会把配置写到那儿 —— 断言找不到配置, 还会污染后面的 webapp 测试。
+        # (真踩过: CI 上三个 ubuntu 任务一起红, 根因就是这一行没写。)
+        env.pop("QQOPS_DATA", None)
         env["HOME"] = tmp                          # 别污染真实 HOME(安装器会写 ~/.termux/boot/)
         env["QQOPS_HOME"] = os.path.join(tmp, "qqops")
         p = subprocess.run(["bash", os.path.join(ROOT, "install.sh"), "--no-start"],
@@ -1273,7 +1277,7 @@ class TestConsistency(unittest.TestCase):
         self.assertNotIn("unbound variable", out, "安装器引用了未定义的变量:\n%s" % out[-600:])
         self.assertEqual(p.returncode, 0, "安装器在无 Termux 环境下失败:\n%s" % out[-800:])
         self.assertTrue(os.path.exists(os.path.join(tmp, "qqops", "data", "config.json")),
-                        "安装器没有生成配置:\n%s" % out[-600:])
+                        "安装器没有生成配置(检查是否继承了 QQOPS_DATA):\n%s" % out[-600:])
         self.assertIn("安装完成", out, "安装器没有跑到结束提示:\n%s" % out[-600:])
 
     def test_docs_site_anchors_are_valid(self):
