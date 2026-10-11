@@ -102,13 +102,15 @@ def verify_no_private(tar_path: str) -> list:
 
 
 def build(out_dir: str = None, verbose: bool = True, scan: bool = True) -> str:
-    # 打包前的隐私门禁: 包是要发出去的, 里面绝不能有本机隐私/密钥
+    # 打包前的隐私门禁: 包是要发出去的, 里面绝不能有本机隐私/密钥。
+    # 用 --tree 而不是默认的"已跟踪文件": 包打的是**工作区**, 一个还没 git add 的新文件
+    # 也会被装进去 —— 只扫已跟踪文件的话, 这句"扫描通过"是打折的(打包后还会再验一次)。
     scanner = os.path.join(ROOT, "tools", "check_secrets.py")
     if scan and os.path.exists(scanner):
         import subprocess
-        p = subprocess.run([sys.executable, scanner, "--quiet"], cwd=ROOT)
+        p = subprocess.run([sys.executable, scanner, "--quiet", "--tree"], cwd=ROOT)
         if p.returncode != 0:
-            raise SystemExit("✘ 隐私扫描未通过, 已中止打包: python3 tools/check_secrets.py")
+            raise SystemExit("✘ 隐私扫描未通过, 已中止打包: python3 tools/check_secrets.py --tree")
     ver = open(os.path.join(ROOT, "VERSION"), encoding="utf-8").read().strip()
     name = "qqops-" + ver
     out_dir = out_dir or os.path.join(ROOT, "dist")

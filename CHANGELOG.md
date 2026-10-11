@@ -1,5 +1,26 @@
 # CHANGELOG
 
+## [3.4.1] — 2026-10-11
+
+**发布流程收尾**:3.4.0 打 tag 后暴露的两个问题, 都修掉。
+
+- **文档站工作流不再挂红。** 启用 GitHub Pages 属于仓库管理设置, `GITHUB_TOKEN` 没有这个权限
+  (`configure-pages` 的 `enablement` 报 `Resource not accessible by integration`), 于是整个 Docs 工作流失败。
+  现在工作流**先探测 Pages 是否已启用**:已启用 → 照常发布;未启用 → **只构建不发布**
+  (构建与死链检查照跑, 站点产物传成 `docs-site` 供离线查看), 并把"去哪里点一下"写进 job 摘要与
+  warning, 不让仓库一直红着。
+  一次性启用(仓库所有者, 约 30 秒):Settings → Pages → Build and deployment → Source 选 `GitHub Actions`。
+- **发布说明取自 CHANGELOG。** `gh release create --generate-notes` 只给一句 compare 链接,
+  对"能不能用起来"没有帮助。新增 `tools/changelog_notes.py`:Release 正文用 CHANGELOG 里该版本的段落,
+  并附上发布包大小与 SHA256;取不到该版本才回退到自动 notes。顺带把发布步骤做成**可重跑**
+  (同一个 tag 重推时更新既有 Release, 而不是失败在"Release 已存在")。
+- **打包前的隐私门禁补上一个缺口。** 扫描一直用 `git ls-files`(只扫**已跟踪**文件),而 `pack.py`
+  打的是**工作区** —— 一个还没 `git add` 的新文件会被装进发布包却躲过扫描。现在新增 `--tree`
+  (已跟踪 + 未跟踪但未被 gitignore 的文件, 用 `git ls-files -co --exclude-standard`),
+  `pack.py` 打包前改用它;被 gitignore 的开发草稿/运行时数据不扫(否则满屏假警报)。
+  新增测试: 往工作区放一个未跟踪的假密钥文件, 扫描必须拦下(退出码 1)。
+- `CONTRIBUTING.md` 新增「文档站」一节:本地预览/构建命令、死链策略为什么开着、Pages 的一次性启用。
+
 ## [3.4.0] — 2026-10-11
 
 **文档站 + 自动发布**:用开源文档框架 VitePress 补全**使用文档**并发布到 GitHub Pages;

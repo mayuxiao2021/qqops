@@ -1102,7 +1102,8 @@ class TestConsistency(unittest.TestCase):
             with open(os.path.join(ROOT, rel), encoding="utf-8") as f:
                 self.assertIn("ensure_utf8_console()", f.read(), "%s 没有切 UTF-8 控制台" % rel)
         # 独立工具/打包脚本自带实现(它们不 import qqops)
-        for rel in ("pack.py", "tools/check_secrets.py", "tools/verify_package.py"):
+        for rel in ("pack.py", "tools/check_secrets.py", "tools/verify_package.py",
+                    "tools/changelog_notes.py"):
             with open(os.path.join(ROOT, rel), encoding="utf-8") as f:
                 self.assertIn("_utf8_console", f.read(), "%s 没有切 UTF-8 控制台" % rel)
 
@@ -1155,6 +1156,56 @@ class TestConsistency(unittest.TestCase):
         for rel in ("README.md", "README_EN.md", "LICENSE", "SECURITY.md", "CONTRIBUTING.md",
                     "CODE_OF_CONDUCT.md", "docs", "tools"):
             self.assertIn(rel, pack_mod.ITEMS, "pack.py 清单缺少 %s" % rel)
+
+    def test_changelog_notes_extracts_the_release_section(self):
+        """Release 正文取自 CHANGELOG: 抽取器要准 —— 抽错/抽串会让发布页写错版本。"""
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import changelog_notes as cn                                 # noqa: E402
+        with open(os.path.join(ROOT, "VERSION"), encoding="utf-8") as f:
+            cur = f.read().strip()
+        with open(os.path.join(ROOT, "CHANGELOG.md"), encoding="utf-8") as f:
+            text = f.read()
+        body = cn.extract(text, cur)
+        self.assertTrue(body, "CHANGELOG 里缺少当前版本 %s 的段落" % cur)
+        self.assertNotIn("## [", body, "%s 的段落把下一个版本也带上了" % cur)
+        self.assertEqual(cn.extract(text, "v" + cur), body, "v 前缀应当等价")
+        # 每个版本都要能取到, 且互不相同(抽串了就会出现重复内容)
+        vers = re.findall(r"^##\s+\[?(\d+\.\d+\.\d+)\]?", text, re.M)
+        self.assertGreaterEqual(len(vers), 10, "CHANGELOG 版本记录太少, 抽取器可能没被真正验证")
+        seen = {}
+        for v in vers:
+            b = cn.extract(text, v)
+            self.assertTrue(b, "取不到 %s 的段落" % v)
+            seen[v] = b
+        self.assertEqual(len(set(seen.values())), len(seen), "不同版本抽出了相同内容")
+        # 不存在的版本: 明确失败, 绝不返回半截内容
+        self.assertEqual(cn.extract(text, "99.99.99"), "")
+
+    def test_secret_scan_covers_untracked_files(self):
+        """打包门禁必须扫"工作区"(含**未跟踪**文件) —— 包打的是工作区, 不是 git 索引。"""
+        if not os.path.isdir(os.path.join(ROOT, ".git")):
+            self.skipTest("不是 git 检出")
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import check_secrets as cs                                  # noqa: E402
+        with open(os.path.join(ROOT, "pack.py"), encoding="utf-8") as f:
+            self.assertIn("--tree", f.read(), "pack.py 的打包前扫描没覆盖未跟踪文件")
+        tracked, tree = set(cs.tracked_files()), set(cs.tree_files())
+        self.assertTrue(tracked <= tree, "工作区清单漏掉了已跟踪文件")
+        # 被 gitignore 的目录不该被扫: 开发草稿里必然有真 QQ 号, 扫了只会变成假警报
+        for bad in ("data/", "dist/", "node_modules/", "_probe/", "__pycache__/"):
+            self.assertFalse([p for p in tree if p.startswith(bad)],
+                             "工作区扫描把 gitignore 的 %s 也扫了" % bad)
+        # 新文件(未跟踪)要在清单里, 而且真能被扫出问题(退出码 1)
+        probe = os.path.join(ROOT, "_scan_probe_test.txt")
+        fake = "ghp_" + "A" * 30                 # 拼出来: 这一行本身不能命中扫描规则
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("token = %s\n" % fake)
+        self.addCleanup(lambda: os.path.exists(probe) and os.remove(probe))
+        self.assertIn("_scan_probe_test.txt", set(cs.tree_files()))
+        p = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "check_secrets.py"),
+                            "--tree", "--quiet"], cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 1,
+                         "未跟踪文件里的密钥没被拦下: %s" % (p.stdout or "")[-300:])
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):

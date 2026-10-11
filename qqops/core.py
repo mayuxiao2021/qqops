@@ -24,7 +24,7 @@ import urllib.error
 import urllib.request
 import secrets
 
-VERSION = "3.4.0"
+VERSION = "3.4.1"
 
 # 路径解析(踩过坑, 别改回 "靠 $HOME 猜"):
 #   曾经用 BASE = ~/qqops —— 但 $HOME 是环境给的, 从别的目录/cron/adb run-as 调用时

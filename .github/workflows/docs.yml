@@ -1,8 +1,17 @@
 name: Docs
 
-# 构建 VitePress 文档站并发布到 GitHub Pages。
-# 首次运行会自动尝试启用 Pages(见 configure-pages 的 enablement);
-# 若仓库策略不允许, 请在 Settings → Pages → Source 选择 "GitHub Actions" 后重跑。
+# 构建 VitePress 文档站; 如果仓库已启用 GitHub Pages 就顺手发布上去。
+#
+# 为什么要判断 Pages 是否启用:
+#   启用 Pages 属于仓库管理操作, GITHUB_TOKEN 没有这个权限
+#   (configure-pages 的 enablement 会报 "Resource not accessible by integration")。
+#   所以这里先探测一次: 已启用 → 正常发布; 未启用 → 只构建 + 上传站点产物,
+#   并把"去哪里点一下"写进 job 摘要, 不让整个仓库一直挂红。
+#
+# 一次性启用(仓库所有者操作, 约 30 秒):
+#   Settings → Pages → Build and deployment → Source 选 "GitHub Actions"
+#   然后重跑本工作流(或再推一次 docs/), 站点会发布到
+#   https://<owner>.github.io/<repo>/
 
 on:
   push:
@@ -16,8 +25,6 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: docs-pages
@@ -27,26 +34,86 @@ jobs:
   build:
     name: 构建文档站
     runs-on: ubuntu-latest
+    outputs:
+      pages_enabled: ${{ steps.pages.outputs.enabled }}
+      pages_url: ${{ steps.pages.outputs.url }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: npm
+
       - name: 安装依赖
         run: npm ci --no-audit --no-fund
+
       - name: 构建(死链会直接失败)
         run: npm run docs:build
-      - uses: actions/configure-pages@v5
+
+      - name: 检查 GitHub Pages 是否已启用
+        id: pages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pages" || echo 000)
+          url="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/"
+          if [ "$code" = "200" ]; then
+            echo "enabled=true"  >> "$GITHUB_OUTPUT"
+            echo "GitHub Pages 已启用, 将发布到 $url"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::GitHub Pages 尚未启用(HTTP $code): 本次只构建站点, 不发布。请在 Settings → Pages → Source 选择 \"GitHub Actions\" 后重跑。"
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: 上传站点产物(未启用 Pages 时也能下载离线看)
+        uses: actions/upload-artifact@v4
         with:
-          enablement: true
-      - uses: actions/upload-pages-artifact@v3
+          name: docs-site
+          path: docs/.vitepress/dist
+          retention-days: 14
+
+      - name: 上传 Pages 产物
+        if: steps.pages.outputs.enabled == 'true'
+        uses: actions/upload-pages-artifact@v3
         with:
           path: docs/.vitepress/dist
+
+      - name: 写 job 摘要
+        if: always()
+        env:
+          ENABLED: ${{ steps.pages.outputs.enabled }}
+          SITE_URL: ${{ steps.pages.outputs.url }}
+        run: |
+          {
+            echo "## 文档站构建"
+            echo ""
+            echo "- 构建: VitePress, 死链检查已开启(有死链会直接失败)"
+            if [ "${ENABLED:-false}" = "true" ]; then
+              echo "- 发布: ✅ 已上传 Pages 产物, 由 deploy job 发布到 ${SITE_URL:-（见部署步骤）}"
+            else
+              echo "- 发布: ⏸ 跳过 —— 仓库还没启用 GitHub Pages"
+              echo ""
+              echo "**一次性启用(约 30 秒):** Settings → Pages → Build and deployment → Source 选 \`GitHub Actions\`,"
+              echo "然后重跑本工作流。站点地址: ${SITE_URL:-https://<owner>.github.io/<repo>/}"
+              echo ""
+              echo "在启用之前, 可以下载本 job 的 \`docs-site\` 产物离线查看。"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
   deploy:
     name: 发布到 Pages
     needs: build
+    if: needs.build.outputs.pages_enabled == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

@@ -29,11 +29,31 @@ git clone https://github.com/mayuxiao2021/qqops && cd qqops
 python3 tests/smoke.py            # 冒烟测试(纯标准库, 不需要网络; 手机与 PC 都应通过)
 node tools/console_probe.js       # 桩 DOM 渲染全部控制台页面 + 点一遍关键按钮(能抓到"渲染正常但点了没用")
 python3 tools/check_secrets.py    # 隐私扫描
+python3 tools/check_secrets.py --tree   # 连"还没 git add 的新文件"一起扫(打包前用这个)
 python3 pack.py && python3 tools/verify_package.py   # 打包并校验 包==工作区==已提交
 ```
 
 Windows 上注意:shell 脚本必须是 LF 换行(`.gitattributes` 已兜底);用 `pwsh` 时别在命令行里塞复杂引号,
 把脚本写成文件再执行。
+
+## 文档站
+
+使用文档在 `docs/guide/`,用 **VitePress** 构建成静态站点(这是仓库里唯一的 Node 依赖,只为文档服务;
+程序本体仍然是零依赖纯标准库 Python)。
+
+```bash
+npm ci                # 只在第一次或依赖变动后需要
+npm run docs:dev      # 本地预览 http://localhost:5173/qqops/
+npm run docs:build    # 构建到 docs/.vitepress/dist(死链会直接失败)
+```
+
+推送 `docs/**` 会自动触发 `.github/workflows/docs.yml`。两点注意:
+
+- **死链检查是开着的**(`ignoreDeadLinks: false`)。写了指向不存在页面的链接,构建就会失败 —— 这是故意的,
+  文档站最怕"点进去 404"。
+- **发布到 GitHub Pages 需要仓库所有者一次性启用**:Settings → Pages → Build and deployment → Source 选
+  `GitHub Actions`。启用前工作流只构建、不发布(并把站点产物传成 `docs-site` 供离线查看),
+  不会让仓库一直挂红;启用后重跑一次即可上线。
 
 ## 代码风格
 
@@ -67,7 +87,8 @@ qqops/            程序本体(纯标准库)
   static/         前端(原生 JS + CSS, 无构建)
 tests/smoke.py    冒烟测试(单文件, unittest)
 tools/            开发工具:隐私扫描 / 控制台探针 / 打包校验 / 保活脚本
-docs/             设计与运维文档
+docs/             文档:guide/ 是使用文档(文档站), 其余是设计与运维文档
+  .vitepress/     文档站配置(VitePress, 仅文档用)
 data/             运行时数据(不入仓):config.json / messages.db / logs / reports / backups
 ```
 

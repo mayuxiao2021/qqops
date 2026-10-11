@@ -2,6 +2,8 @@ name: Release
 
 # 打 tag(v*)即发布:跑测试与隐私门禁 → 打包 → 生成 GitHub Release 并附上发布包。
 # 用 runner 自带的 gh CLI + GITHUB_TOKEN, 不需要任何额外凭据。
+# 发布说明取自 CHANGELOG.md 里该版本的段落(取不到才回退到自动生成的 notes);
+# 重复推同一个 tag 时会更新既有 Release 而不是报错。
 
 on:
   push:
@@ -43,13 +45,46 @@ jobs:
           sha256sum qqops-*.tar.gz > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      - name: 创建 Release 并附上发布包
+      - name: 取本次发布说明(CHANGELOG 里那一段)
+        run: |
+          set -eu
+          ver="${GITHUB_REF_NAME#v}"
+          if python tools/changelog_notes.py "$ver" > RELEASE_NOTES.md 2>/dev/null && [ -s RELEASE_NOTES.md ]; then
+            # 附上发布包信息, 下载的人不用自己算一遍
+            {
+              echo ""
+              echo "---"
+              echo ""
+              echo "### 发布包"
+              echo ""
+              echo '```'
+              ls -l dist/qqops-*.tar.gz | awk '{print $9, $5 " bytes"}'
+              cat dist/SHA256SUMS.txt
+              echo '```'
+            } >> RELEASE_NOTES.md
+            echo "已从 CHANGELOG 取到 $ver 的说明($(wc -l < RELEASE_NOTES.md) 行)"
+          else
+            rm -f RELEASE_NOTES.md
+            echo "::notice::CHANGELOG 里没有 $ver 的段落, 回退到 GitHub 自动生成的 notes"
+          fi
+
+      - name: 创建(或更新)Release 并附上发布包
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            dist/qqops-*.tar.gz \
-            dist/SHA256SUMS.txt \
-            --title "QQOps ${GITHUB_REF_NAME}" \
-            --generate-notes \
-            --verify-tag
+          set -eu
+          if [ -s RELEASE_NOTES.md ]; then notes=(--notes-file RELEASE_NOTES.md); else notes=(--generate-notes); fi
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            # tag 重推/重跑时不要让 workflow 挂在"Release 已存在"上
+            gh release edit "${GITHUB_REF_NAME}" --title "QQOps ${GITHUB_REF_NAME}" "${notes[@]}"
+            gh release upload "${GITHUB_REF_NAME}" dist/qqops-*.tar.gz dist/SHA256SUMS.txt --clobber
+            echo "已更新既有 Release"
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              dist/qqops-*.tar.gz \
+              dist/SHA256SUMS.txt \
+              --title "QQOps ${GITHUB_REF_NAME}" \
+              "${notes[@]}" \
+              --verify-tag
+            echo "已创建 Release"
+          fi

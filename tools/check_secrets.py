@@ -117,10 +117,43 @@ def tracked_files() -> list:
             return [x for x in p.stdout.splitlines() if x.strip()]
     except Exception:
         pass
+    return walk_files()
+
+
+# 工作区遍历时要绕开的目录: 依赖/构建产物/运行时数据(这些要么很大, 要么本来就私有)
+WALK_SKIP_DIRS = {".git", "data", "dist", "__pycache__", ".testdata", "node_modules", ".venv",
+                  "venv", ".mypy_cache", ".pytest_cache", ".ruff_cache", "cache", ".idea",
+                  ".vscode"}
+# 工作区遍历会看到**未跟踪**的本地私有文件(本机禁词表等) —— 它们本来就不该入库/入包
+LOCAL_SKIP_NAMES = {"secret_denylist.txt", ".secretscanignore"}
+
+
+def tree_files() -> list:
+    """工作区里**可能入库/入包**的文件 = 已跟踪 + 未跟踪但未被 gitignore 的。
+
+    为什么不用 os.walk 全量: 被 `.gitignore` 的目录(本机开发草稿、运行时数据、依赖)
+    本来就不会入库也不会进发布包, 扫它们只会制造假警报(本项目就踩过: 开发草稿里必然有真 QQ 号)。
+    又为什么不能只用 `git ls-files`: 那样会漏掉**还没 `git add` 的新文件**, 而 `pack.py`
+    打的正是工作区 —— 一个新建文件会被装进发布包却躲过扫描。
+    """
+    try:
+        p = subprocess.run(["git", "ls-files", "-co", "--exclude-standard"], cwd=ROOT,
+                           capture_output=True, text=True)
+        if p.returncode == 0:
+            return [x for x in p.stdout.splitlines() if x.strip()]
+    except Exception:
+        pass
+    return walk_files()
+
+
+def walk_files() -> list:
+    """没有 git 时的兜底: 遍历整个工作区(发布包里解出来就是这个场景)。"""
     out = []
     for cur, dirs, files in os.walk(ROOT):
-        dirs[:] = [d for d in dirs if d not in (".git", "data", "dist", "__pycache__", ".testdata")]
+        dirs[:] = [d for d in dirs if d not in WALK_SKIP_DIRS]
         for f in files:
+            if f in LOCAL_SKIP_NAMES:
+                continue
             out.append(os.path.relpath(os.path.join(cur, f), ROOT).replace(os.sep, "/"))
     return out
 
@@ -240,13 +273,22 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="隐私/密钥扫描(仓库门禁)")
     ap.add_argument("--path", nargs="*", default=None, help="只扫这些路径(默认: git 跟踪的全部文件)")
     ap.add_argument("--staged", action="store_true", help="只扫暂存区(给 pre-commit 用)")
+    ap.add_argument("--tree", action="store_true",
+                    help="扫整个工作区(含未跟踪文件); 打包前用这个, 因为包会带上未跟踪文件")
     ap.add_argument("--history", action="store_true", help="额外扫全历史 blob")
     ap.add_argument("--strict", action="store_true", help="提示级问题也返回失败")
     ap.add_argument("--quiet", action="store_true", help="只输出结论")
     args = ap.parse_args()
 
     ignore, deny = load_ignore(), load_denylist()
-    only = args.path or (staged_files() if args.staged else None)
+    if args.path:
+        only = args.path
+    elif args.staged:
+        only = staged_files()
+    elif args.tree:
+        only = tree_files()
+    else:
+        only = None
     if args.staged and not only:
         print("✔ 暂存区没有文件需要扫描")
         return 0
