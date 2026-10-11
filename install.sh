@@ -119,9 +119,12 @@ ${C_OK}安装完成 🎉${C_OFF}
     qqops backup        备份数据
 
   还需在 NapCat 侧做两件事(只做一次):
-    1) 打开 OneBot HTTP API —— 编辑容器内 onebot11_<QQ>.json, 在 network.httpServers 加:
-       {"enable":true,"name":"local-api","host":"127.0.0.1","port":3000,"token":"<自定义令牌>"}
-       然后把它填到 QQOps 配置页 push.napcat_api_port / push.token
+    1) 打开 OneBot HTTP API —— 编辑 NapCat 的 onebot11_ 配置(在 napcat/config/ 下, 文件名里带你的 QQ 号),
+       在 network.httpServers 里加:
+       {"enable":true,"name":"local-api","host":"127.0.0.1","port":3000,"token":"change-me-3000"}
+       那串 token 是自己定的(这里示例用 change-me-3000), 再到控制台「设置 → 推送」填同一个值
     2) 让消息上报到采集器 —— network.httpClients 指向 http://127.0.0.1:8080/
        重启 NapCat 生效(proot 里: bash /root/_napcat_run.sh)
+
+  控制台地址就是上面那条(带令牌);忘了随时执行: qqops url
 EOF

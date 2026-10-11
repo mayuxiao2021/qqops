@@ -34,11 +34,26 @@ Everything stays on your device. Only the records you allow are ever sent to you
 
 ## Quick start
 
+Termux / Linux — copy-paste all four lines (the URL is fixed, no version number to fill in):
+
 ```bash
-tar xzf qqops-<version>.tar.gz -C ~ && bash ~/qqops-<version>/install.sh
+pkg update && pkg install -y python curl      # Termux; Linux usually ships python3 already
+curl -L -o ~/qqops.tar.gz https://github.com/mayuxiao2021/qqops/releases/latest/download/qqops-latest.tar.gz
+rm -rf ~/qqops-src && mkdir -p ~/qqops-src && tar xzf ~/qqops.tar.gz -C ~/qqops-src --strip-components=1
+bash ~/qqops-src/install.sh
+```
+
+The installer copies to `~/qqops`, generates config and a random token, starts the services and
+**prints the console URL (token included)**. Then:
+
+```bash
+qqops url             # print the console URL again
 qqops doctor          # verify collector + NapCat API + storage + model
 qqops status          # services, ports, message counts, schedule
 ```
+
+Windows needs no bash: `python -m qqops.tools init` then `python -m qqops.svc start`
+(see [docs/DEPLOY.md](docs/DEPLOY.md#3-windows)).
 
 Wire NapCat once (`httpClients` → `http://127.0.0.1:8080/`, `httpServers` → port 3000) —
 see [docs/DEPLOY.md](docs/DEPLOY.md).
@@ -49,7 +64,7 @@ see [docs/DEPLOY.md](docs/DEPLOY.md).
 python3 tests/smoke.py            # smoke tests (no network needed)
 node tools/console_probe.js       # render every console page in a stub DOM
 python3 tools/check_secrets.py    # privacy/secret scan (required before commit)
-python3 pack.py                   # build dist/qqops-<version>.tar.gz
+python3 pack.py                   # build a versioned tarball into dist/
 python3 tools/verify_package.py   # assert package == worktree == commit
 ```
 

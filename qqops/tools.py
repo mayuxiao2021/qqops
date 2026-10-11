@@ -28,6 +28,9 @@ def cmd_init(_a) -> int:
     print("配置文件 : %s" % core.CONF_PATH)
     print("数据库   : %s" % core.DB_PATH)
     print("访问令牌 : %s" % cfg.data["web"]["token"])
+    w = cfg.data["web"]
+    # 直接把带令牌的地址打印出来 —— 文档里就不用写 "?token=<令牌>" 这种要人替换的东西
+    print("控制台   : http://%s:%s/?token=%s" % (w["host"], w["port"], w["token"]))
     if errs:
         print("配置告警 : %s" % "; ".join(errs))
     print("初始化完成 ✅")

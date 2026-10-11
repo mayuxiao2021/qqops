@@ -53,6 +53,9 @@ jobs:
       - name: 构建(死链会直接失败)
         run: npm run docs:build
 
+      - name: 检查站内锚点(VitePress 只管页面在不在, 不管锚点)
+        run: python3 tools/check_docs_anchors.py
+
       - name: 检查 GitHub Pages 是否已启用
         id: pages
         env:

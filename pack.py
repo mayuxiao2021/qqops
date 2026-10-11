@@ -7,7 +7,7 @@
   * 这里显式写入每个文件的权限位(见 `mode_for`), 因此在任何系统上打包结果一致。
 
 用法:
-    python3 pack.py            # → dist/qqops-<版本>.tar.gz
+    python3 pack.py            # → dist/ 下一个带版本号的 tar.gz
 """
 from __future__ import annotations
 

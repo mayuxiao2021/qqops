@@ -1207,6 +1207,58 @@ class TestConsistency(unittest.TestCase):
         self.assertEqual(p.returncode, 1,
                          "未跟踪文件里的密钥没被拦下: %s" % (p.stdout or "")[-300:])
 
+    def test_install_docs_are_copy_pasteable(self):
+        """安装教程必须能**整段复制粘贴**: 不许出现 <版本号> 这类要人手动替换的占位符。"""
+        docs = ["README.md", "README_EN.md", "docs/guide/quickstart.md", "docs/DEPLOY.md",
+                "docs/guide/backup.md"]
+        # 只针对"要人替换才能用"的占位符; HTML 标签、CLI 用法表(如 <type>(<scope>))不在其中
+        bad = re.compile(r"<\s*(版本|新版本|version|ver|token|令牌|QQ|你的QQ|自定义令牌)\s*>"
+                         r"|qqops-<")
+        # 命令里不许出现"带版本号的包名"(qqops-3.4.2.tar.gz / qqops-<版本>.tar.gz 都算);
+        # qqops-latest.tar.gz 与用户自己生成的 qqops-data.tar.gz 不算
+        vered = re.compile(r"qqops-\d+\.\d+|qqops-<")
+        for rel in docs:
+            with open(os.path.join(ROOT, rel), encoding="utf-8") as f:
+                text = f.read()
+            hits = sorted({m.group(0) for m in bad.finditer(text)})
+            self.assertEqual(hits, [], "%s 里还有要人手动替换的占位符: %s" % (rel, hits))
+            self.assertIsNone(vered.search(text), "%s 的命令里还有带版本号的包名" % rel)
+        # 下载网址必须是固定名字的那种(releases/latest + qqops-latest.tar.gz)
+        url = "releases/latest/download/qqops-latest.tar.gz"
+        for rel in ("README.md", "docs/guide/quickstart.md", "docs/DEPLOY.md",
+                    "docs/guide/backup.md"):
+            with open(os.path.join(ROOT, rel), encoding="utf-8") as f:
+                self.assertIn(url, f.read(), "%s 的安装/升级步骤没有用固定网址" % rel)
+
+    def test_release_publishes_a_fixed_name_asset(self):
+        """文档写死了 releases/latest/download/qqops-latest.tar.gz —— 发布流程必须真的产出它。"""
+        path = os.path.join(ROOT, ".github", "workflows", "release.yml")
+        if not os.path.exists(path):
+            self.skipTest("发布包不带 CI 配置")
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("qqops-latest.tar.gz", text,
+                      "release.yml 没有产出固定名字的发布包, 文档里的固定网址会 404")
+        self.assertIn("releases/latest/download", text, "固定网址的由来没有写在发布流程里")
+        # 校验和要覆盖两个包(用户下载固定名字的那个也要能核对)
+        self.assertIn("sha256sum qqops-*.tar.gz", text, "SHA256SUMS 没有覆盖固定名字的包")
+
+    def test_docs_site_anchors_are_valid(self):
+        """站内 `#锚点` 必须真的存在 —— 锚点错了构建不报, 用户点进去只是"没跳转"。"""
+        dist = os.path.join(ROOT, "docs", ".vitepress", "dist")
+        if not os.path.isdir(dist):
+            self.skipTest("没有文档站构建产物(先 npm run docs:build)")
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import check_docs_anchors as cda                              # noqa: E402
+        problems = cda.check()
+        self.assertEqual(problems, [], "站内锚点失效: %s" % problems[:5])
+        # 文档站工作流要跑这个检查, 否则本地不构建就没人查
+        wf = os.path.join(ROOT, ".github", "workflows", "docs.yml")
+        if os.path.exists(wf):
+            with open(wf, encoding="utf-8") as f:
+                self.assertIn("check_docs_anchors.py", f.read(),
+                              "docs.yml 没有跑锚点检查")
+
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """urllib 默认自动跟随 302, 会掩盖"未鉴权应跳登录"的断言语义。"""

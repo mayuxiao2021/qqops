@@ -56,7 +56,7 @@ def extract(text: str, version: str) -> str:
 
 def main(argv: list) -> int:
     if len(argv) < 2:
-        print("用法: changelog_notes.py <版本号, 如 3.4.1>")
+        print("用法: changelog_notes.py 3.4.1")
         return 2
     try:
         with open("CHANGELOG.md", encoding="utf-8") as f:

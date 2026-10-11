@@ -32,22 +32,28 @@ Android 上不能跑 Docker,标准做法是 **Termux + proot-distro 容器**:
 
 ### 1.1 装 Termux 侧
 
+**整段复制粘贴**(网址固定, 不用管版本号):
+
 ```bash
-pkg update && pkg install -y python
-# 下载发布包(或 git clone 本仓库)
-tar xzf qqops-<版本>.tar.gz -C ~ && bash ~/qqops-<版本>/install.sh
+pkg update && pkg install -y python curl
+curl -L -o ~/qqops.tar.gz https://github.com/mayuxiao2021/qqops/releases/latest/download/qqops-latest.tar.gz
+rm -rf ~/qqops-src && mkdir -p ~/qqops-src && tar xzf ~/qqops.tar.gz -C ~/qqops-src --strip-components=1
+bash ~/qqops-src/install.sh
 ```
 
-安装器会:检查 `python3` → 复制程序到 `~/qqops` → 生成配置与**随机令牌** →
-迁移旧数据(可选)→ 注册 `qqops` 命令 → 启动服务 → 跑一次自检,最后打印控制台地址。
+- 第 2 行的网址永远指向**最新版**(GitHub 的 `releases/latest`), 以后升级也是同一行;
+- 第 3 行把包解到 `~/qqops-src/`;`--strip-components=1` 是"去掉包里的版本目录"这个前缀;
+- 第 4 行才是安装:复制到 `~/qqops`、生成配置与**随机令牌**、注册 `qqops` 命令、启动服务、自检,
+  最后**打印控制台地址(带令牌)**。
 
-常用参数:
+安装器的可选参数(照抄, 按需删掉不要的行):
 
-| 参数 | 说明 |
-|---|---|
-| `--no-start` | 只安装不启动 |
-| `--import-db <旧库>` | 迁移旧的 `messages.db` |
-| `--import-config <旧配置>` | 迁移旧配置(模型/群/推送) |
+```bash
+bash ~/qqops-src/install.sh                                     # 安装并启动(默认)
+bash ~/qqops-src/install.sh --no-start                          # 只安装, 先不启动
+bash ~/qqops-src/install.sh --import-db ~/old/messages.db        # 顺带迁移旧的采集库
+bash ~/qqops-src/install.sh --import-config ~/old/config.json    # 顺带迁移旧配置(模型/群/推送)
+```
 
 ### 1.2 装 NapCat(proot 容器)
 
@@ -65,7 +71,13 @@ bash napcat.sh
 
 ### 1.3 接线(只做一次)
 
-编辑容器内 `…/Napcat/opt/QQ/resources/app/app_launcher/napcat/config/onebot11_<你的QQ>.json`:
+先找到 NapCat 的配置文件(容器内执行;文件名里带你的 QQ 号):
+
+```bash
+ls ~/*/opt/QQ/resources/app/app_launcher/napcat/config/onebot11_*.json
+```
+
+编辑它, 在 `"network"` 里加上两段:
 
 ```jsonc
 "network": {
@@ -74,10 +86,13 @@ bash napcat.sh
      "messagePostFormat": "array", "reportSelfMessage": false, "secret": ""}
   ],
   "httpServers": [
-    {"enable": true, "name": "local-api", "host": "127.0.0.1", "port": 3000, "token": "<自定义令牌>"}
+    {"enable": true, "name": "local-api", "host": "127.0.0.1", "port": 3000, "token": "change-me-3000"}
   ]
 }
 ```
+
+上面 `token` 那一串是**自己定的**(示例 `change-me-3000` 照抄就能用, 想更安全就换成随机一串),
+只要等下在 QQOps 里填**同一个值**。
 
 重启 NapCat,然后在控制台「设置 → 推送」把 `napcat_api_port`(3000)与 `token` 填成一致。
 验证:
@@ -112,30 +127,39 @@ qqops doctor        # 采集口、NapCat API、存储、模型、保活逐项体
 
 ## 2. Linux
 
+整段复制粘贴即可(`sudo apt` 那行换成你的发行版的装包命令;多数发行版已自带 python3):
+
 ```bash
-tar xzf qqops-<版本>.tar.gz -C ~ && bash ~/qqops-<版本>/install.sh
+sudo apt install -y python3 curl
+curl -L -o ~/qqops.tar.gz https://github.com/mayuxiao2021/qqops/releases/latest/download/qqops-latest.tar.gz
+rm -rf ~/qqops-src && mkdir -p ~/qqops-src && tar xzf ~/qqops.tar.gz -C ~/qqops-src --strip-components=1
+bash ~/qqops-src/install.sh
 ```
 
 - 服务用 `nohup` + `data/run/*.pid` 管理,不依赖 screen/tmux,SSH 断线不受影响。
-- 想让开机自启,写一个 systemd 单元(可选):
+- 想让开机自启, 复制下面整段即可(不用手动替换任何东西, 用户名与路径由 shell 展开):
 
-  ```ini
-  # /etc/systemd/system/qqops.service
+  ```bash
+  sudo tee /etc/systemd/system/qqops.service >/dev/null <<EOF
   [Unit]
   Description=QQOps
   After=network.target
 
   [Service]
   Type=forking
-  User=<你的用户>
-  WorkingDirectory=/home/<你的用户>/qqops
-  ExecStart=/home/<你的用户>/qqops/bin/qqops start
-  ExecStop=/home/<你的用户>/qqops/bin/qqops stop
+  User=$USER
+  WorkingDirectory=$HOME/qqops
+  ExecStart=$HOME/qqops/bin/qqops start
+  ExecStop=$HOME/qqops/bin/qqops stop
   Restart=on-failure
 
   [Install]
   WantedBy=multi-user.target
+  EOF
+  sudo systemctl daemon-reload && sudo systemctl enable --now qqops
   ```
+
+  (`$USER` / `$HOME` 由 shell 展开成真实值再写进文件, 不用手动替换任何东西。)
 
 - 运行形态默认按平台自动选:Android → 单进程;其它 → 多进程。可显式指定:
   `qqops mode single|multi|auto`。
@@ -144,23 +168,34 @@ tar xzf qqops-<版本>.tar.gz -C ~ && bash ~/qqops-<版本>/install.sh
 
 ## 3. Windows
 
+不需要 bash 也能用。**整段复制粘贴到 PowerShell**:
+
 ```powershell
-# 解压后用 PowerShell 执行
-tar xzf qqops-<版本>.tar.gz -C $HOME
-bash $HOME/qqops-<版本>/install.sh     # 需要 Git Bash 或 WSL 提供 bash
+# 1) 下载并解压到 $HOME\qqops-src(网址固定, 不用管版本号)
+cd $HOME
+curl.exe -L -o qqops.tar.gz https://github.com/mayuxiao2021/qqops/releases/latest/download/qqops-latest.tar.gz
+Remove-Item -Recurse -Force qqops-src -ErrorAction SilentlyContinue
+New-Item -ItemType Directory qqops-src | Out-Null
+tar xzf qqops.tar.gz -C qqops-src --strip-components=1
+
+# 2) 初始化(生成配置与随机令牌, 并打印控制台地址)
+cd $HOME\qqops-src
+python -m qqops.tools init
+
+# 3) 启动 / 查看 / 停止
+python -m qqops.svc start
+python -m qqops.svc status
+python -m qqops.svc stop
 ```
 
-或者不装 Git Bash,直接手动跑:
+装了 Git Bash 或 WSL 的话, 也可以走和 Linux 完全一样的安装器(它会装到 `~/qqops` 并注册 `qqops` 命令):
 
-```powershell
-cd $HOME\qqops
-python -m qqops.svc start      # 启动
-python -m qqops.svc status     # 状态
-python -m qqops.svc stop       # 停止
+```bash
+bash ~/qqops-src/install.sh
 ```
 
 Windows 上注意:服务以子进程方式管理,`qqops` 的 shell 包装脚本需要 bash;
-用 `python -m qqops.svc` 系列命令可以完全绕开它。
+用 `python -m qqops.svc` 系列命令可以完全绕开它。配置、数据库、日志都在 `$HOME\qqops-src\data\`。
 
 ---
 
@@ -181,20 +216,22 @@ qqops napcat restart             # 重启 NapCat
 
 访问控制台(默认只监听本机):
 
-- 手机浏览器直接开 `http://127.0.0.1:8091/?token=<令牌>`;
-- 电脑访问:`adb forward tcp:8091 tcp:8091` 后开 `http://127.0.0.1:8091/?token=<令牌>`
-  (令牌在 `data/config.json` 的 `web.token`,或安装结束打印的地址里)。
+- 手机浏览器:直接开**安装结束时打印的那条地址**,或随时执行 `qqops url` 让它再打印一次;
+- 电脑访问:先 `adb forward tcp:8091 tcp:8091`,再打开同一条地址
+  (令牌在 `data/config.json` 的 `web.token`)。
 
 ---
 
 ## 5. 升级与卸载
 
-**升级**(保留数据):
+**升级**(保留数据;网址固定, 不用查版本号):
 
 ```bash
 qqops stop
-# 用新版本覆盖程序目录(qqops/ bin/ tools/ docs/ …), 千万不要动 data/
-qqops start
+curl -L -o ~/qqops.tar.gz https://github.com/mayuxiao2021/qqops/releases/latest/download/qqops-latest.tar.gz
+rm -rf ~/qqops-src && mkdir -p ~/qqops-src && tar xzf ~/qqops.tar.gz -C ~/qqops-src --strip-components=1
+bash ~/qqops-src/install.sh        # 幂等: 覆盖程序文件(qqops/ bin/ tools/ …), 绝不碰 data/
+qqops doctor
 ```
 
 **卸载**:

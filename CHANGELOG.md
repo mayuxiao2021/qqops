@@ -1,5 +1,27 @@
 # CHANGELOG
 
+## [3.4.2] — 2026-10-11
+
+**安装教程改成"整段复制粘贴"。** 以前命令里带 `<版本号>`
+(如 `tar xzf qqops-<版本>.tar.gz -C ~ && bash ~/qqops-<版本>/install.sh`):每升一次级都得改命令,
+对新手也不友好。现在:
+
+- **发布包多一个固定名字**:每次发布除了 `qqops-3.4.2.tar.gz`, 还产出 `qqops-latest.tar.gz`,
+  于是文档里的下载网址可以**写死**:
+  `https://github.com/mayuxiao2021/qqops/releases/latest/download/qqops-latest.tar.gz` ——
+  永远指向最新版, 以后升级也是同一行;`SHA256SUMS.txt` 同时覆盖两个包。
+- **解压不再需要版本号**:用 `--strip-components=1` 解到固定的 `~/qqops-src/`
+  (Termux 的 GNU tar 1.35、Windows 自带 bsdtar 3.8 都支持, 两边都在真机上验过),
+  于是"装 + 跑"四行命令全程不用改一个字, 重跑也安全(先 `rm -rf` 再解)。
+- **控制台地址不再让人自己拼**:`python -m qqops.tools init` 与安装器结束语都直接打印
+  `http://127.0.0.1:8091/?token=…`, 文档里不再出现 `?token=<令牌>`;随时 `qqops url` 可以再看一次。
+- **NapCat 接线示例给具体值**:`token` 用 `change-me-3000` 并说明"自己定一串、两边填一致";
+  找不到配置文件时给出 `ls ~/*/opt/QQ/…/config/onebot11_*.json` 这条命令。
+- **Linux 的 systemd 自启**写成一条可复制的 heredoc(`$USER`/`$HOME` 由 shell 展开, 不用手改);
+  **Windows** 补上完全不需要 bash 的流程(下载 → 解压 → `python -m qqops.tools init` → `svc start`)。
+- 新增两条测试:安装类文档里不得出现"要人替换"的占位符或带版本号的解压命令;
+  发布流程必须产出固定名字的包(否则文档里写死的网址会 404)。测试 179 → 181 项。
+
 ## [3.4.1] — 2026-10-11
 
 **发布流程收尾**:3.4.0 打 tag 后暴露的问题, 一个个修掉。

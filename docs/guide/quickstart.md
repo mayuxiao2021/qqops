@@ -22,22 +22,39 @@ QQOps 自己**不碰 QQ 协议**, 只做"收消息 → 存下来 → 总结/查�
 
 ## 1. 装 QQOps
 
-Android / Termux(推荐, 也是本项目的主要目标平台):
+Android / Termux(推荐, 也是本项目的主要目标平台)。**把下面四行整段复制粘贴进去就行** ——
+网址是固定的, 不用管版本号:
 
 ```bash
-pkg update && pkg install -y python
-# 把发布包传到手机后:
-tar xzf qqops-<版本>.tar.gz -C ~ && bash ~/qqops-<版本>/install.sh
+pkg update && pkg install -y python curl
+curl -L -o ~/qqops.tar.gz https://github.com/mayuxiao2021/qqops/releases/latest/download/qqops-latest.tar.gz
+rm -rf ~/qqops-src && mkdir -p ~/qqops-src && tar xzf ~/qqops.tar.gz -C ~/qqops-src --strip-components=1
+bash ~/qqops-src/install.sh
 ```
 
-安装器会:检查 `python3` → 复制到 `~/qqops` → 生成配置与**随机令牌** → 注册 `qqops` 命令 →
-写开机自启脚本 → 启动服务 → 跑一次自检, 最后打印控制台地址。
+逐行在做什么:
 
-Linux / Windows 见[部署指南](/DEPLOY)。
+| 行 | 作用 |
+|---|---|
+| `pkg install` | 装 Python(程序只用标准库, 不需要 pip)与 curl |
+| `curl -L -o` | 下载**最新**发布包到 `~/qqops.tar.gz`;网址里没有版本号, 以后升级也是同一行 |
+| `rm -rf … tar xzf` | 清掉上次解压的目录, 再解到 `~/qqops-src/`(`--strip-components=1` 去掉包里的版本目录) |
+| `bash …/install.sh` | 安装到 `~/qqops`、生成配置与随机令牌、启动服务、自检, 并**打印控制台地址** |
+
+看到最后打印出 `安装完成 🎉` 与控制台地址就算成功。想再看一次地址或体检:
+
+```bash
+qqops url        # 打印带令牌的控制台地址
+qqops status     # 服务状态 + 近 24 小时消息数
+qqops doctor     # 逐项体检(采集口 / NapCat API / 存储 / 模型 / 保活)
+```
+
+Linux 一样(通常已自带 `python3`, 只需后三行);Windows 不需要 bash, 见[部署指南](/DEPLOY#_3-windows)。
 
 ## 2. 把 NapCat 的消息接过来
 
-编辑 NapCat 的 `onebot11_<你的QQ>.json`, 加上两段(完整示例见[部署指南](/DEPLOY#_1-3-接线-只做一次)):
+编辑 NapCat 的 `onebot11_` 配置文件(在容器内 `…/napcat/config/` 下, 文件名里带你的 QQ 号;
+找不到就先 `ls ~/*/opt/QQ/resources/app/app_launcher/napcat/config/`), 加上两段:
 
 ```jsonc
 "network": {
@@ -46,14 +63,15 @@ Linux / Windows 见[部署指南](/DEPLOY)。
     {"enable": true, "name": "qqops", "url": "http://127.0.0.1:8080/",
      "messagePostFormat": "array", "reportSelfMessage": false, "secret": ""}
   ],
-  // ② 打开 HTTP API(QQOps 用它发消息、取群列表)
+  // ② 打开 HTTP API(QQOps 用它发消息、取群列表);token 自己定一串, 例如 change-me-3000
   "httpServers": [
-    {"enable": true, "name": "local-api", "host": "127.0.0.1", "port": 3000, "token": "<自定义令牌>"}
+    {"enable": true, "name": "local-api", "host": "127.0.0.1", "port": 3000, "token": "change-me-3000"}
   ]
 }
 ```
 
-重启 NapCat, 然后**在群里发一条消息**, 验证:
+重启 NapCat, 再在控制台「设置 → 推送」把 `napcat_api_port`(3000)与 `token` 填成**同一个值**。
+然后**在群里发一条消息**, 验证:
 
 ```bash
 qqops doctor          # 采集口 / NapCat API / 存储 / 模型 / 保活 逐项体检
@@ -64,8 +82,8 @@ qqops status          # 看"近 24 小时"消息数是否在涨
 
 控制台只监听 `127.0.0.1`(手机本机):
 
-- **手机浏览器**:直接用安装结束打印的地址 `http://127.0.0.1:8091/?token=<令牌>`;
-- **电脑浏览器**:先转发端口, 再打开同一地址
+- **手机浏览器**:直接用安装结束打印的那条地址(里面已经带令牌), 或随时 `qqops url` 打印一次;
+- **电脑浏览器**:先转发端口, 再打开 `qqops url` 打印的地址
 
   ```bash
   adb forward tcp:8091 tcp:8091

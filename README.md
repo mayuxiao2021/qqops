@@ -50,18 +50,28 @@ QQOps 是一个**跑在自己设备上的 QQ 群消息管家**。它接在 [NapC
 
 > 前置:[NapCat](https://github.com/NapNeko/NapCatQQ) 已在跑(手机用 proot 容器或 Linux 直接跑),并能登录你的 QQ。
 
+**Termux / Linux:把下面四行整段复制粘贴进去就行** —— 网址是固定的,不用管版本号:
+
 ```bash
-# 1) 下载发布包(或 git clone)
-tar xzf qqops-<版本>.tar.gz -C ~ && bash ~/qqops-<版本>/install.sh
-
-# 2) 安装器会:检查 python3 → 复制程序 → 生成配置与随机令牌 → 注册 qqops 命令
-#    → 启动服务 → 跑一次自检, 最后打印控制台地址(含令牌)
-
-# 3) 把 NapCat 的消息接到采集口(见下), 然后
-qqops doctor
+pkg update && pkg install -y python curl      # Termux 需要;Linux 一般自带 python3
+curl -L -o ~/qqops.tar.gz https://github.com/mayuxiao2021/qqops/releases/latest/download/qqops-latest.tar.gz
+rm -rf ~/qqops-src && mkdir -p ~/qqops-src && tar xzf ~/qqops.tar.gz -C ~/qqops-src --strip-components=1
+bash ~/qqops-src/install.sh
 ```
 
-NapCat 侧只需接线一次(容器内 `…/napcat/config/onebot11_<QQ>.json`):
+安装器会自动:检查 `python3` → 复制到 `~/qqops` → 生成配置与**随机令牌** → 注册 `qqops` 命令 →
+写开机自启脚本 → 启动服务 → 自检。**最后一行会打印控制台地址(带令牌)**,点开就能用;想再看一次:
+
+```bash
+qqops url          # 打印带令牌的控制台地址
+qqops status       # 服务状态 + 近 24 小时消息数
+qqops doctor       # 逐项体检:缺什么它会直接告诉你执行哪条命令
+```
+
+Windows 不需要 bash:解压后 `python -m qqops.tools init` 生成配置(会打印控制台地址),
+再用 `python -m qqops.svc start` 启动 —— 见 [部署指南](docs/DEPLOY.md#3-windows)。
+
+NapCat 侧只需接线一次(容器内 `…/napcat/config/` 下文件名带你 QQ 号的那个 json):
 
 ```jsonc
 "network": {
@@ -70,12 +80,14 @@ NapCat 侧只需接线一次(容器内 `…/napcat/config/onebot11_<QQ>.json`):
     {"enable": true, "name": "qqops", "url": "http://127.0.0.1:8080/",
      "messagePostFormat": "array", "reportSelfMessage": false, "secret": ""}
   ],
-  // ② 打开 HTTP API(发送出口 / 实时群列表)
+  // ② 打开 HTTP API(发送出口 / 实时群列表);token 自己定一串, 例如 change-me-3000
   "httpServers": [
-    {"enable": true, "name": "local-api", "host": "127.0.0.1", "port": 3000, "token": "<自定义令牌>"}
+    {"enable": true, "name": "local-api", "host": "127.0.0.1", "port": 3000, "token": "change-me-3000"}
   ]
 }
 ```
+
+改完重启 NapCat,再到控制台「设置 → 推送」把 `napcat_api_port`(3000)与 `token` 填成**同一个值**。
 
 详细步骤(Android/Termux、Linux、Windows,含保活与排错):**[docs/DEPLOY.md](docs/DEPLOY.md)**
 
@@ -178,7 +190,7 @@ QQ ──▶ NapCat ──HTTP 上报──▶ collector ──▶ SQLite(消息
 python3 tests/smoke.py            # 冒烟测试(纯标准库, 不需要网络)
 node tools/console_probe.js       # 用桩 DOM 渲染全部页面 + 点一遍关键按钮
 python3 tools/check_secrets.py    # 隐私/密钥扫描(提交前必跑)
-python3 pack.py                   # 打包 dist/qqops-<版本>.tar.gz
+python3 pack.py                   # 打包到 dist/(文件名带版本号)
 python3 tools/verify_package.py   # 校验"包 == 工作区 == 已提交代码"
 npm ci && npm run docs:build      # 构建文档站(VitePress, 需要 Node 18+)
 bash tools/install-hooks.sh       # 装 pre-commit 钩子(自动跑隐私扫描)

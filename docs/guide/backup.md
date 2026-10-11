@@ -53,17 +53,22 @@ qqops start
 
 ## 升级
 
+程序和 `data/` 是分开的, 升级只覆盖程序, **`data/` 一个字节都不动**。整段复制粘贴:
+
 ```bash
 qqops stop
-# 解包新版本, 覆盖程序目录(qqops/ bin/ tools/ docs/ pack.py install.sh …)
-tar xzf qqops-<新版本>.tar.gz -C ~
-# 用新版本目录覆盖安装目录里的程序文件, 不要覆盖 data/
-qqops start
+curl -L -o ~/qqops.tar.gz https://github.com/mayuxiao2021/qqops/releases/latest/download/qqops-latest.tar.gz
+rm -rf ~/qqops-src && mkdir -p ~/qqops-src && tar xzf ~/qqops.tar.gz -C ~/qqops-src --strip-components=1
+bash ~/qqops-src/install.sh          # 安装器是幂等的: 覆盖程序文件, 保留 data/
 qqops doctor
 ```
 
+第二条命令的网址永远指向最新版, 不用去查版本号; 想升到某个**指定**版本时, 到
+[Releases](https://github.com/mayuxiao2021/qqops/releases) 页面右键复制那个 `.tar.gz` 的链接,
+把 `curl -L -o ~/qqops.tar.gz` 后面的网址换掉即可。
+
 版本变化与迁移说明看 [CHANGELOG](https://github.com/mayuxiao2021/qqops/blob/master/CHANGELOG.md);
-配置键的迁移是自动的(旧键会被搬到新位置并记日志)。
+配置键的迁移是自动的(旧键会被搬到新位置并记日志)。升级前建议先 `qqops backup`。
 
 ## 清理与瘦身
 

@@ -39,9 +39,14 @@ jobs:
       - name: 校验"包 == 工作区 == 已提交 == tag"
         run: python tools/verify_package.py --require-tag
 
-      - name: 生成校验和
+      - name: 生成校验和与"固定名字"的发布包
         run: |
+          set -eu
           cd dist
+          # 文档里的下载网址必须固定 —— 不能要求用户把版本号抄进命令。
+          # 复制一份固定名字的包, 这样下面这个网址永远指向最新版:
+          #   https://github.com/<owner>/<repo>/releases/latest/download/qqops-latest.tar.gz
+          cp "$(ls qqops-*.tar.gz | head -1)" qqops-latest.tar.gz
           sha256sum qqops-*.tar.gz > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
