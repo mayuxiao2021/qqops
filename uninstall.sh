@@ -12,7 +12,10 @@ fi
 for name in qqops-collector qqops-scheduler qqops-web; do
   screen -S "$name" -X quit >/dev/null 2>&1 && echo "  已停止 $name"
 done
-for BIN in "$PREFIX/bin" "$HOME/.local/bin" "/usr/local/bin"; do
+# $PREFIX 只有 Termux 有, Linux 上没有 —— set -u 下必须兜住(见 install.sh 同名注释)
+BINS="$HOME/.local/bin /usr/local/bin"
+[ -n "${PREFIX:-}" ] && BINS="$PREFIX/bin $BINS"
+for BIN in $BINS; do
   [ -L "$BIN/qqops" ] && rm -f "$BIN/qqops" && echo "  已移除 $BIN/qqops"
 done
 

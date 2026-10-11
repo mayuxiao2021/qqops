@@ -24,6 +24,7 @@ import socket
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import unittest
 import urllib.error
@@ -1242,6 +1243,38 @@ class TestConsistency(unittest.TestCase):
         self.assertIn("releases/latest/download", text, "固定网址的由来没有写在发布流程里")
         # 校验和要覆盖两个包(用户下载固定名字的那个也要能核对)
         self.assertIn("sha256sum qqops-*.tar.gz", text, "SHA256SUMS 没有覆盖固定名字的包")
+
+    def test_installer_survives_a_non_termux_environment(self):
+        """install.sh 必须在**没有 Termux 环境**的普通 Linux 上跑完。
+
+        真机验收时抓到的 bug: 注册命令那一步写了 `"$PREFIX/bin"`, 而 `$PREFIX` 只有 Termux 才有,
+        脚本又是 `set -u` —— Linux 用户照文档安装会在第 5/7 步**当场退出**:
+        程序复制了、配置生成了, 但服务没启动、结束提示也没打印。
+        """
+        if not shutil.which("bash"):
+            self.skipTest("没有 bash(Windows 上正常跳过)")
+        # Windows 上 `where bash` 找到的是 WSL 启动器, 装了发行版才能用 —— 先探一下
+        try:
+            probe = subprocess.run(["bash", "-c", "echo ok"], capture_output=True,
+                                   text=True, timeout=60)
+        except Exception as e:
+            self.skipTest("bash 跑不起来: %s" % e)
+        if probe.returncode != 0 or "ok" not in (probe.stdout or ""):
+            self.skipTest("bash 不可用(Windows 的 WSL 启动器不算)")
+        tmp = tempfile.mkdtemp(prefix="qqops-install-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        env = dict(os.environ)
+        env.pop("PREFIX", None)                    # 模拟 Linux: 没有 Termux 的 PREFIX
+        env["HOME"] = tmp                          # 别污染真实 HOME(安装器会写 ~/.termux/boot/)
+        env["QQOPS_HOME"] = os.path.join(tmp, "qqops")
+        p = subprocess.run(["bash", os.path.join(ROOT, "install.sh"), "--no-start"],
+                           cwd=ROOT, env=env, capture_output=True, text=True, timeout=300)
+        out = (p.stdout or "") + (p.stderr or "")
+        self.assertNotIn("unbound variable", out, "安装器引用了未定义的变量:\n%s" % out[-600:])
+        self.assertEqual(p.returncode, 0, "安装器在无 Termux 环境下失败:\n%s" % out[-800:])
+        self.assertTrue(os.path.exists(os.path.join(tmp, "qqops", "data", "config.json")),
+                        "安装器没有生成配置:\n%s" % out[-600:])
+        self.assertIn("安装完成", out, "安装器没有跑到结束提示:\n%s" % out[-600:])
 
     def test_docs_site_anchors_are_valid(self):
         """站内 `#锚点` 必须真的存在 —— 锚点错了构建不报, 用户点进去只是"没跳转"。"""

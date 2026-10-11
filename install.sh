@@ -38,7 +38,7 @@ step "1/7 依赖检查"
 [ -n "$PY" ] || { bad "找不到 python3(在 Termux 里执行 pkg install python)"; exit 1; }
 PYV="$($PY -c 'import sys;print("%d.%d"%sys.version_info[:2])')"
 if $PY -c 'import sys;sys.exit(0 if sys.version_info>=(3,9) else 1)'; then ok "python3 $PYV"; else bad "python3 版本过低($PYV), 需要 >= 3.9"; exit 1; fi
-if command -v screen >/dev/null; then ok "screen $(screen --version 2>/dev/null | head -1 | awk '{print $NF}')(可选, 仅用于手动挂后台)"; else
+if command -v screen >/dev/null; then ok "screen 已安装(可选, 仅用于手动挂后台)"; else
   warn "未安装 screen(可选; 服务用 nohup + PID 文件管理, 不影响运行)"; fi
 if command -v curl >/dev/null; then ok "curl 已安装"; else warn "未安装 curl(仅影响文档里的调试命令)"; fi
 command -v termux-wake-lock >/dev/null && { termux-wake-lock 2>/dev/null && ok "已获取 wakelock(防休眠杀进程)"; }
@@ -76,9 +76,17 @@ else
 fi
 
 step "5/7 注册命令"
-for BIN in "$PREFIX/bin" "$HOME/.local/bin" "/usr/local/bin"; do
-  [ -d "$BIN" ] && [ -w "$BIN" ] && ln -sf "$DEST/bin/qqops" "$BIN/qqops" 2>/dev/null && { ok "已注册: $BIN/qqops"; break; }
+# $PREFIX 是 Termux 特有的, Linux 上根本没有 —— `set -u` 下直接引用会当场退出,
+# 结果是"复制、配置都做完了, 服务却没启动"。必须用 ${PREFIX:-} 兜住。
+BINS="$HOME/.local/bin /usr/local/bin"
+[ -n "${PREFIX:-}" ] && BINS="$PREFIX/bin $BINS"
+REGISTERED=0
+for BIN in $BINS; do
+  if [ -d "$BIN" ] && [ -w "$BIN" ]; then
+    ln -sf "$DEST/bin/qqops" "$BIN/qqops" 2>/dev/null && { ok "已注册: $BIN/qqops"; REGISTERED=1; break; }
+  fi
 done
+[ "$REGISTERED" = "1" ] || warn "没能注册 qqops 命令(可直接用 $DEST/bin/qqops)"
 
 step "6/7 启动服务"
 if [ "$NO_START" = "1" ]; then
