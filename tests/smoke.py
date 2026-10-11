@@ -1106,6 +1106,29 @@ class TestConsistency(unittest.TestCase):
             with open(os.path.join(ROOT, rel), encoding="utf-8") as f:
                 self.assertIn("_utf8_console", f.read(), "%s 没有切 UTF-8 控制台" % rel)
 
+    def test_docs_site_nav_has_no_dead_links(self):
+        """文档站的导航/侧边栏指向的文件必须真实存在(死导航比死链更讨厌)。"""
+        cfg = os.path.join(ROOT, "docs", ".vitepress", "config.mts")
+        if not os.path.exists(cfg):
+            self.skipTest("没有文档站配置")
+        with open(cfg, encoding="utf-8") as f:
+            text = f.read()
+        links = set(re.findall(r"link:\s*'([^']+)'", text))
+        self.assertGreater(len(links), 10, "导航条目太少, 配置可能没被解析")
+        for link in links:
+            if link.startswith("http"):
+                continue
+            rel = link.strip("/").split("#")[0]
+            cand = os.path.join(ROOT, "docs", rel + ".md")
+            cand2 = os.path.join(ROOT, "docs", rel, "index.md")
+            self.assertTrue(os.path.exists(cand) or os.path.exists(cand2),
+                            "导航指向不存在的页面: %s" % link)
+        # 站点的首页与几个使用文档必须在
+        for rel in ("docs/index.md", "docs/guide/quickstart.md", "docs/guide/cli.md",
+                    "docs/guide/console.md", "docs/guide/config.md", "docs/guide/security.md",
+                    "docs/guide/troubleshooting.md", "docs/guide/plugins.md"):
+            self.assertTrue(os.path.exists(os.path.join(ROOT, rel)), "缺少 %s" % rel)
+
     def test_docs_and_packaging_are_consistent(self):
         """文档/打包清单/CI 互相引用一致 —— 发布前最容易出现的"漏打包/死链接"。"""
         need = ["README.md", "README_EN.md", "LICENSE", "SECURITY.md", "CONTRIBUTING.md",

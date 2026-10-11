@@ -31,7 +31,9 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 ITEMS = ["qqops", "bin", "tests", "tools", "docs", "VERSION", "README.md", "README_EN.md",
          "CHANGELOG.md", "LICENSE", "SECURITY.md", "CONTRIBUTING.md", "CODE_OF_CONDUCT.md",
          "install.sh", "uninstall.sh", "pack.sh", "pack.py", "config.example.json"]
-SKIP_DIRS = {"__pycache__", ".testdata", "data", "run", ".git", "dist"}
+SKIP_DIRS = {"__pycache__", ".testdata", "data", "run", ".git", "dist",
+             # 文档站配置与构建产物: 部署包只需要 docs/*.md
+             ".vitepress", "node_modules"}
 # 绝不进发布包的本机私有文件(真机上被抓到过一次: 禁词表随 tools/ 整目录被打进包)
 SKIP_FILES = {"secret_denylist.txt", ".secretscanignore", ".env", "config.json",
               "state.json", "crashes.jsonl"}

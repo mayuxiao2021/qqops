@@ -1,5 +1,50 @@
 # CHANGELOG
 
+## [3.4.0] — 2026-10-11
+
+**文档站 + 自动发布**:用开源文档框架 VitePress 补全**使用文档**并发布到 GitHub Pages;
+打 tag 自动创建 GitHub Release 并附上发布包与校验和。
+
+### 新增:文档站 <https://mayuxiao2021.github.io/qqops/>
+- `docs/.vitepress/`:VitePress 配置(中文、本地搜索、导航/侧边栏、**死链检查开启**);底座 `/qqops/`。
+- 新写的**使用文档** `docs/guide/`(14 篇):快速开始、控制台、消息与检索、总结与报告、
+  AI 智能查询、在 QQ 里直接问、提醒与待办、配置详解、命令行手册、保活、备份与升级、
+  安全与隐私、排错、插件开发。
+- 首页 `docs/index.md`:hero + 特性卡 + "你是哪种人 → 看哪篇"入口表;
+  原有设计文档纳入导航(使用指南 / 部署 / 设计文档 / FAQ)。
+
+### 新增:自动发布
+- `.github/workflows/docs.yml`:构建文档站 → 发布 GitHub Pages(含 `enablement` 自动启用 Pages)。
+- `.github/workflows/release.yml`:打 `v*` tag 自动跑**隐私扫描(含全历史)+ 全量测试 → 打包 →
+  校验「包 == 工作区 == 已提交 == tag」→ SHA256 → 创建 Release 并附发布包**;
+  用 runner 自带 `gh` 与 `GITHUB_TOKEN`, 无需额外凭据。
+
+### 工程
+- `package.json`/`package-lock.json`(仅文档站用;程序本体仍是零依赖纯标准库 Python);
+- `.gitignore` 排除 `node_modules/` 与 `docs/.vitepress/{dist,cache}`;`pack.py` 排除 `.vitepress`;
+- `verify_package.py` 关键文件加入文档站首页与使用文档;
+- 测试 176 → **177 项**:新增「文档站导航不得有死链」。
+
+## [3.3.12] — 2026-10-10
+
+CI/工具链收尾(这几版都是 CI 一跑就暴露的问题, 逐个修掉):
+- **3.3.7** 进程归属判定:占用者只要出现在"我们自己的候选集"(pid 文件 / 环境变量一致)里就算自己人,
+  不再只比对命令行 —— macOS 的 `lsof` 只给命令名(`Python`), 原来必然判错;
+  单进程模式下主管心跳检查改为**等到超时**(慢机器上会误判"没有心跳")。
+- **3.3.8** 修一个真 bug:多进程/多线程同时**读改写 `state.json`** → Windows 上 `os.replace` 撞共享冲突
+  (直接启动失败), 其它平台**丢更新**(心跳/计数忽然回退)。改用**心跳独立文件**(`data/run/beat_<服务>`)
+  + `state_set` 跨进程文件锁 + `atomic_replace` 重试;runner 在线程启动后立刻写心跳。
+- **3.3.9 / 3.3.10** 加 `QQOPS_DEBUG_START=<秒>`:启动卡死时自动 dump 全部线程栈(只 dump 不退出);
+  测试的失败信息带**退出码 + 子进程输出 + 日志尾巴**, 并把诊断以 `::error::` 发成 CI annotation
+  (job 日志要登录才能看, annotation 是公开的)。
+- **3.3.11** 修**打包路径的隐私漏洞**:`pack.py` 把整个 `tools/` 打进发布包, 连**本机禁词表**
+  (QQ 号/群号/令牌)一起带了出去 —— 真机测试当场拦下 12 条命中。现在排除私有文件, 并在打包后
+  **再校验一遍包内容**(命中就删包报错)+ 新增发布包隐私测试;仓库侧一直干净。
+- **3.3.12** CI 的打包校验任务取全历史与标签(`fetch-depth: 0` + `fetch-tags`),
+  `verify_package.py` 的标签检查改为默认宽容(`--require-tag` 时严格)。
+- 平台现状:Linux(Termux)与 Windows 全绿;macOS 代码已补 `ps`/`lsof` 兜底, 但 CI 上两个
+  "独立启动 collector/webapp"的用例仍失败(子进程无输出, 原因未查明), 该 job 已标为实验性。
+
 ## [3.3.6] — 2026-10-10
 
 接着修跨平台问题:上一版"读不到环境变量就不认领进程"虽然更安全,但**在 macOS 上把自己人也否掉了**

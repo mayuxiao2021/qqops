@@ -1,0 +1,55 @@
+name: Docs
+
+# 构建 VitePress 文档站并发布到 GitHub Pages。
+# 首次运行会自动尝试启用 Pages(见 configure-pages 的 enablement);
+# 若仓库策略不允许, 请在 Settings → Pages → Source 选择 "GitHub Actions" 后重跑。
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - 'docs/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: docs-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: 构建文档站
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: 安装依赖
+        run: npm ci --no-audit --no-fund
+      - name: 构建(死链会直接失败)
+        run: npm run docs:build
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/.vitepress/dist
+
+  deploy:
+    name: 发布到 Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

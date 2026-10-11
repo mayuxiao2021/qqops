@@ -1,0 +1,55 @@
+name: Release
+
+# 打 tag(v*)即发布:跑测试与隐私门禁 → 打包 → 生成 GitHub Release 并附上发布包。
+# 用 runner 自带的 gh CLI + GITHUB_TOKEN, 不需要任何额外凭据。
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: 发布 ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0            # 需要 tag 做一致性校验
+          fetch-tags: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 隐私与密钥扫描
+        run: python tools/check_secrets.py --history
+
+      - name: 全量测试
+        run: python tests/smoke.py
+
+      - name: 打包
+        run: python pack.py
+
+      - name: 校验"包 == 工作区 == 已提交 == tag"
+        run: python tools/verify_package.py --require-tag
+
+      - name: 生成校验和
+        run: |
+          cd dist
+          sha256sum qqops-*.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: 创建 Release 并附上发布包
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/qqops-*.tar.gz \
+            dist/SHA256SUMS.txt \
+            --title "QQOps ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --verify-tag

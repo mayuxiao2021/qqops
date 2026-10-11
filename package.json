@@ -1,0 +1,14 @@
+{
+  "name": "qqops-docs",
+  "version": "1.0.0",
+  "private": true,
+  "description": "QQOps 文档站(VitePress)。只用于构建文档, 与程序本体(纯标准库 Python)无关。",
+  "scripts": {
+    "docs:dev": "vitepress dev docs",
+    "docs:build": "vitepress build docs",
+    "docs:preview": "vitepress preview docs"
+  },
+  "devDependencies": {
+    "vitepress": "^1.6.3"
+  }
+}

@@ -3,7 +3,7 @@
 **Self-hosted QQ group message collector, summarizer, AI query console and ops dashboard.**
 Pure-stdlib Python — no pip dependencies, no frontend build step.
 
-[中文说明](README.md) · [Deployment](docs/DEPLOY.md) · [Architecture](docs/ARCHITECTURE.md) · [Security](SECURITY.md)
+[中文说明](README.md) · **Docs site: <https://mayuxiao2021.github.io/qqops/>** · [Quickstart](docs/guide/quickstart.md) · [Deployment](docs/DEPLOY.md) · [Architecture](docs/ARCHITECTURE.md) · [Security](SECURITY.md)
 
 ## What it does
 

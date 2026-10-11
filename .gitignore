@@ -35,3 +35,8 @@ tools/secret_denylist.txt
 .env.*
 *.pem
 *.key
+
+# 文档站(VitePress): 依赖与构建产物不入库
+node_modules/
+docs/.vitepress/dist/
+docs/.vitepress/cache/

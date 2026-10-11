@@ -8,6 +8,7 @@
 
 [![CI](https://github.com/mayuxiao2021/qqops/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/mayuxiao2021/qqops/actions/workflows/ci.yml)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-qqops-3c8772.svg)](https://mayuxiao2021.github.io/qqops/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)](#为什么零依赖)
 [![Platform](https://img.shields.io/badge/platform-Termux%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#安装)
@@ -117,7 +118,29 @@ QQ ──▶ NapCat ──HTTP 上报──▶ collector ──▶ SQLite(消息
 所以核心只用标准库:SQLite(+FTS5)、`http.server`、`urllib`、`threading`。
 `tests/smoke.py` 里有一项测试**专门断言模块级不得出现第三方导入**;唯一可选件是 PDF 解析(`pip install pypdf`)。
 
-## 文档索引
+## 文档
+
+**在线阅读(推荐):** <https://mayuxiao2021.github.io/qqops/> —— 用 VitePress 构建, 带搜索与侧边导航。
+
+### 使用文档
+
+| 文档 | 内容 |
+|---|---|
+| [快速开始](docs/guide/quickstart.md) | 10 分钟跑起来:装、接线、第一次总结 |
+| [控制台](docs/guide/console.md) | 15 个页面分别做什么、怎么用 |
+| [消息与检索](docs/guide/messages.md) | 采集范围、全文检索、去重规则 |
+| [总结与报告](docs/guide/reports.md) | 定时/立即/试运行、报告形态、推送、成本控制 |
+| [AI 智能查询](docs/guide/chat.md) | 提问、来源编号、追问、额度 |
+| [在 QQ 里直接问](docs/guide/qq-chat.md) | 触发规则、白名单、回答形态 |
+| [配置详解](docs/guide/config.md) | 每个配置键的作用与默认值 |
+| [命令行手册](docs/guide/cli.md) | 全部命令与退出码 |
+| [保活(Android)](docs/guide/keepalive.md) | 进程不被杀的三层防护 |
+| [备份与升级](docs/guide/backup.md) | 数据在哪、怎么备份/迁移/卸载 |
+| [安全与隐私](docs/guide/security.md) | 暴露面、令牌、仓库隐私门禁 |
+| [排错](docs/guide/troubleshooting.md) | 按现象查 |
+| [插件开发](docs/guide/plugins.md) | 写一个自己的插件 |
+
+### 设计与运维文档
 
 | 文档 | 内容 |
 |---|---|
@@ -157,6 +180,7 @@ node tools/console_probe.js       # 用桩 DOM 渲染全部页面 + 点一遍关
 python3 tools/check_secrets.py    # 隐私/密钥扫描(提交前必跑)
 python3 pack.py                   # 打包 dist/qqops-<版本>.tar.gz
 python3 tools/verify_package.py   # 校验"包 == 工作区 == 已提交代码"
+npm ci && npm run docs:build      # 构建文档站(VitePress, 需要 Node 18+)
 bash tools/install-hooks.sh       # 装 pre-commit 钩子(自动跑隐私扫描)
 ```
 
