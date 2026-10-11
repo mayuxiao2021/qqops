@@ -39,6 +39,8 @@ jobs:
       pages_url: ${{ steps.pages.outputs.url }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0            # 每页的"最后更新"取自该文件的提交历史, 浅克隆会让所有页显示同一个时间
 
       - uses: actions/setup-node@v4
         with:
