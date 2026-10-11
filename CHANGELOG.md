@@ -2,7 +2,7 @@
 
 ## [3.4.1] — 2026-10-11
 
-**发布流程收尾**:3.4.0 打 tag 后暴露的两个问题, 都修掉。
+**发布流程收尾**:3.4.0 打 tag 后暴露的问题, 一个个修掉。
 
 - **文档站工作流不再挂红。** 启用 GitHub Pages 属于仓库管理设置, `GITHUB_TOKEN` 没有这个权限
   (`configure-pages` 的 `enablement` 报 `Resource not accessible by integration`), 于是整个 Docs 工作流失败。
