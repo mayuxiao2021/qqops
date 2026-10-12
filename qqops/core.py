@@ -19,12 +19,13 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 import secrets
 
-VERSION = "3.4.4"
+VERSION = "3.4.5"
 
 # 路径解析(踩过坑, 别改回 "靠 $HOME 猜"):
 #   曾经用 BASE = ~/qqops —— 但 $HOME 是环境给的, 从别的目录/cron/adb run-as 调用时
@@ -200,24 +201,34 @@ def _file_lock(path: str, timeout: float = 3.0):
 def atomic_write(path: str, text: str) -> None:
     d = os.path.dirname(path) or "."
     os.makedirs(d, exist_ok=True)
-    fd, tmp = None, os.path.join(d, ".%s.tmp" % os.path.basename(path))
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    # Windows 上另一个进程正在读/写目标文件时 os.replace 会报 WinError 32(共享冲突),
-    # 重试几次基本都能过;实在过不去就退化成直接写(总比整个操作失败好)。
-    for i in range(6):
+    # 临时名带上 pid 与线程号: 两个写入者共用同一个 tmp 文件时, 先完成的那个会把它"用掉",
+    # 后一个 os.replace 就 FileNotFoundError —— 表现是"状态文件偶发保存失败 / 丢更新"。
+    tmp = os.path.join(d, ".%s.%d.%d.tmp" % (os.path.basename(path), os.getpid(),
+                                             threading.get_ident()))
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        # Windows 上另一个进程正在读/写目标文件时 os.replace 会报 WinError 32(共享冲突),
+        # 重试几次基本都能过;实在过不去就退化成直接写(总比整个操作失败好)。
+        for i in range(6):
+            try:
+                os.replace(tmp, path)
+                return
+            except OSError:
+                time.sleep(0.05 * (i + 1))
         try:
             os.replace(tmp, path)
-            return
         except OSError:
-            time.sleep(0.05 * (i + 1))
-    try:
-        os.replace(tmp, path)
-    except OSError:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(text)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+    finally:
+        try:                                   # 临时文件要么被 replace 走, 要么在这里清掉
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
 
 
 def deep_merge(base: dict, override: dict) -> dict:
@@ -2461,6 +2472,14 @@ def start_service(name: str, wait: float = 25.0) -> str:
             if pid:
                 _write_pidfile(name, pid)
             return "%s 已在运行(%s)" % (name, h["why"])
+    # 单进程模式: 服务是 runner 里的线程, 没有独立进程 —— pgrep 永远找不到,
+    # 而端口是"自己人"占着的, 直接走端口预检就会报"端口已被占用(且定位不到占用者)",
+    # 用户点「启动」看到的就是这条吓人的错误(明明一切正常)。
+    rt = runtime_state()
+    if rt.get("mode") == "single" and name in (rt.get("services") or []):
+        h = service_health(name, timeout=6)
+        if h["ok"]:
+            return "%s 已在运行(单进程模式, 由 runner 托管: %s)" % (name, h["why"])
     # 端口预检: 上一份僵死进程占着端口会让新进程秒退, 这是"启动不完全"的头号原因
     port, note = _svc_port(name), ""
     if port:

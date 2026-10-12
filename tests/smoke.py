@@ -1280,6 +1280,46 @@ class TestConsistency(unittest.TestCase):
                         "安装器没有生成配置(检查是否继承了 QQOPS_DATA):\n%s" % out[-600:])
         self.assertIn("安装完成", out, "安装器没有跑到结束提示:\n%s" % out[-600:])
 
+    def test_no_undefined_names_in_shipped_code(self):
+        """少 import 一个模块 = 按钮点了 500 —— 静态拦住这类 NameError。
+
+        真踩过: `console/pages.py` 的 `_spawn_restart()` 用了 `os` 却没 `import os`,
+        运维页「切换功耗档位 / 进程模式」按钮直接 500, 而且**只有用户点了才会发现**。
+        """
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import check_names as cn                                     # noqa: E402
+        problems = []
+        for p in cn.py_files(include_tests=False):
+            problems += cn.check_module(p)
+        self.assertEqual(problems, [], "有未定义的名字(多半是少 import): %s" % problems[:6])
+
+    def test_atomic_write_is_concurrency_safe(self):
+        """atomic_write 的临时名必须唯一: 共用同一个 tmp 时并发保存会互删 → 状态文件保存失败。
+
+        (真踩过: `plugins.json` 的两个保存者抢同一个 `.tmp`, 后一个 os.replace 报 FileNotFoundError。)
+        """
+        import threading as _threading
+        path = os.path.join(TMP, "atomic-conc.json")
+        errs = []
+
+        def worker(i: int):
+            try:
+                for _ in range(30):
+                    core.atomic_write(path, json.dumps({"i": i, "pad": "x" * 200}))
+            except Exception as e:                                   # noqa: BLE001
+                errs.append("%s: %r" % (i, e))
+
+        ts = [_threading.Thread(target=worker, args=(i,)) for i in range(6)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(errs, [], "并发保存出错: %s" % errs[:3])
+        with open(path, encoding="utf-8") as f:
+            json.load(f)                                            # 内容必须是完整 JSON
+        leftover = [f for f in os.listdir(TMP) if ".tmp" in f and "atomic-conc" in f]
+        self.assertEqual(leftover, [], "临时文件没有清理干净: %s" % leftover)
+
     def test_docs_site_anchors_are_valid(self):
         """站内 `#锚点` 必须真的存在 —— 锚点错了构建不报, 用户点进去只是"没跳转"。"""
         dist = os.path.join(ROOT, "docs", ".vitepress", "dist")
@@ -1839,6 +1879,44 @@ class TestIntegration(unittest.TestCase):
             else:
                 proc.terminate()
                 proc.wait(timeout=8)
+
+    def test_media_raw_really_serves_the_file(self):
+        """取图接口必须真的把文件读出来并返回。
+
+        回归: `webapp.py` 里 `fh.read()` 曾被写在 `with open(...)` **外面** —— 文件已经关闭才读,
+        每个图片请求都是 500 `read of closed file`。症状是"控制台里所有图片都打不开",
+        而且只有点开「数据 → 媒体」或看带图消息时才会暴露, 平时根本发现不了。
+        """
+        key = "test-media-" + core.gen_token(8)
+        img = os.path.join(TMP, "media-%s.png" % key)
+        payload = b"\x89PNG\r\n\x1a\n" + b"qqops-media-test-payload" * 3
+        with open(img, "wb") as f:
+            f.write(payload)
+        self.assertTrue(core.Store().media_upsert(key, group_id=1, message_id=1, kind="image",
+                                                  name="t.png", path=img, size=len(payload)))
+        port = free_port()
+        token = core.Config().data["web"]["token"]
+        proc = subprocess.Popen([sys.executable, "-m", "qqops.webapp", "--port", str(port)],
+                                cwd=ROOT, env=self._env(), stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                                errors="replace")
+        try:
+            if not wait_port(port):
+                proc.kill()
+                self.fail("控制台未在超时内监听\n%s"
+                          % ci_note(self._why_not_listening(proc, "web"), "控制台未启动"))
+            req = urllib.request.Request(
+                "http://127.0.0.1:%d/api/media/raw?key=%s" % (port, key))
+            req.add_header("X-Token", token)
+            with urllib.request.urlopen(req, timeout=10) as r:
+                self.assertEqual(r.status, 200, "取图应返回 200")
+                self.assertEqual(r.read(), payload, "取图返回的内容与磁盘文件不一致")
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                proc.kill()
 
     def test_webapp_http_contract(self):
         port = free_port()

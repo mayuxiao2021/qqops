@@ -64,13 +64,14 @@ class PluginManager:
 
     def _save_state(self) -> None:
         try:
-            os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
             payload = {"schema_version": 1, "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
                        "plugins": self._state}
-            tmp = self.state_path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=1)
-            os.replace(tmp, self.state_path)
+            # 用 core.atomic_write: 它有跨进程文件锁 + os.replace 重试 + 唯一临时名。
+            # 老写法是自己拼 `plugins.json.tmp` 再 os.replace —— 两个线程/进程同时保存时,
+            # 先完成的那个把 tmp 用掉了, 后一个就 FileNotFoundError(插件状态偶发丢失)。
+            from .. import core                      # 懒加载: 避免 framework ↔ core 的导入环
+            core.atomic_write(self.state_path,
+                              json.dumps(payload, ensure_ascii=False, indent=1) + "\n")
         except Exception as e:
             errors.record("plugins.state", exc=e, kind="state_save")
 

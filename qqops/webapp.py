@@ -315,8 +315,9 @@ class Handler(BaseHTTPRequestHandler):
             if not p or not os.path.isfile(p):
                 return self._send(404, b"not found", "text/plain")
             with open(p, "rb") as fh:
-                from . import media as _media            # 懒加载: 只有取图才需要
-            return self._send(200, fh.read(), _media.guess_mime(os.path.basename(p)),
+                data = fh.read()                     # 必须在 with 里读完: 出了 with 文件就关了
+            from . import media as _media            # 懒加载: 只有取图才需要
+            return self._send(200, data, _media.guess_mime(os.path.basename(p)),
                               cache="private, max-age=3600")
         try:
             return self.api_get(path, qs)
