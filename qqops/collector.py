@@ -31,6 +31,22 @@ from .framework.event import Event
 MAX_BODY = 8 * 1024 * 1024          # 8MB: 正常上报远小于此, 超过即视为异常
 
 
+def start_backfill(cfg: core.Config, store: core.Store) -> None:
+    """启动后补采一次(把停机期间 NapCat 上报失败漏掉的消息捞回来)。
+
+    放在这里是因为单进程模式采集器是线程(走 runner)、多进程模式是独立进程(走本模块 main),
+    两条路径都会经过这个函数。失败只记日志, 不影响采集。
+    """
+    try:
+        if not (cfg.data.get("collector") or {}).get("backfill", True):
+            core.log("collector", "INFO", "停机补采已在配置里关闭, 跳过")
+            return
+        from . import backfill
+        backfill.start_async(cfg, store)
+    except Exception as e:                                  # noqa: BLE001
+        core.log("collector", "WARN", "补采启动失败(不影响采集): %s" % e)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
     server_version = "QQOps/" + core.VERSION
@@ -314,6 +330,7 @@ def main(argv=None) -> int:
     host, port = srv.server_address[0], srv.server_address[1]
     core.log("collector", "INFO", "监听 http://%s:%d (db=%s)" % (host, port, store.path))
     print("[collector] listening on http://%s:%d  db=%s" % (host, port, store.path), flush=True)
+    start_backfill(cfg, store)
 
     def shutdown(*_a):
         # 注意: 不能在信号处理器里调用 srv.shutdown() —— serve_forever 跑在同一线程,

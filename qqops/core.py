@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 import secrets
 
-VERSION = "3.4.10"
+VERSION = "3.4.11"
 
 # 路径解析(踩过坑, 别改回 "靠 $HOME 猜"):
 #   曾经用 BASE = ~/qqops —— 但 $HOME 是环境给的, 从别的目录/cron/adb run-as 调用时
@@ -55,6 +55,16 @@ DEFAULT_CONFIG = {
         "groups": [], "kinds": [], "store_private": False, "debug": False,
         # 私聊不入库, 但仍交给插件处理(聊天里问 AI 要用); 关掉它私聊提问就没反应
         "command_private": True,
+        # 停机补采: 采集器不在跑的时候, NapCat 的上报**失败就失败了**(不重试、不排队),
+        # 那段时间的消息在库里就是空洞。恢复后用 OneBot 历史接口把缺口补回库
+        # (复用同一条落库路径, (group_id,message_id) 唯一索引保证重复补采也不会写重)。
+        "backfill": True,               # 单进程/多进程启动后自动补一次
+        "backfill_minutes": 720,        # 最多往回补多久(12 小时)
+        "backfill_count": 100,          # 每页取多少条历史
+        "backfill_max_pages": 4,        # 每个会话最多往回翻几页(翻页靠 message_seq+reverseOrder)
+        "backfill_min_gap": 45,         # 空档小于这个秒数就不补(重启几秒不值得扫全群)
+        "backfill_include_self": False,  # 是否把机器人自己发的消息也补进来
+        "backfill_new_groups": True,    # 库里完全没有的群也捞最近一页(刚拉进的新群)
     },
     "summarizer": {
         "base_url": "https://api.deepseek.com/v1", "api_key": "", "model": "deepseek-chat",
@@ -1380,6 +1390,32 @@ class NapCat:
             except Exception:
                 continue
         return out
+
+    # ------------------------------------------------------------ 历史消息(补采用)
+    def group_history(self, group_id: int, count: int = 100, message_seq: int = 0,
+                      reverse: bool = False) -> list:
+        """取某群历史消息。
+
+        NapCat 的翻页口径(实测): 不传 `message_seq` 时返回**最新** `count` 条(老→新);
+        传 `message_seq=<某条消息的 seq>` 且 `reverseOrder=true` 时返回**比它更早**的一页。
+        只传 `message_seq` 不传 reverseOrder 是无效的(原样返回最新一页)。
+        """
+        payload = {"group_id": int(group_id), "count": int(count)}
+        if message_seq:
+            payload["message_seq"] = int(message_seq)
+            payload["reverseOrder"] = bool(reverse)
+        data = (self.call("get_group_msg_history", payload, timeout=30) or {}).get("data") or {}
+        return list(data.get("messages") or [])
+
+    def friend_history(self, user_id: int, count: int = 100, message_seq: int = 0,
+                       reverse: bool = False) -> list:
+        """取与某人的私聊历史消息(翻页口径同群历史)。"""
+        payload = {"user_id": int(user_id), "count": int(count)}
+        if message_seq:
+            payload["message_seq"] = int(message_seq)
+            payload["reverseOrder"] = bool(reverse)
+        data = (self.call("get_friend_msg_history", payload, timeout=30) or {}).get("data") or {}
+        return list(data.get("messages") or [])
 
     def send_private(self, user_id: int, text: str) -> dict:
         return self.call("send_private_msg", {"user_id": int(user_id),

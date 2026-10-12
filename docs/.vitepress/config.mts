@@ -52,6 +52,7 @@ export default defineConfig({
           items: [
             { text: '控制台', link: '/guide/console' },
             { text: '消息与全文检索', link: '/guide/messages' },
+        { text: '会不会漏消息', link: '/guide/no-loss' },
             { text: '总结与报告', link: '/guide/reports' },
             { text: 'AI 智能查询', link: '/guide/chat' },
             { text: '在 QQ 里直接问', link: '/guide/qq-chat' },

@@ -1681,7 +1681,18 @@ async function _opsBackup(box) {
     <div class="it"><b>跳过</b><span class="right">${(d.counters || {}).skipped || 0} 条</span></div>
     <div class="it"><b>拒绝</b><span class="right">${(d.counters || {}).rejected || 0} 条</span></div>
     <div class="it"><b>错误</b><span class="right">${(d.counters || {}).errors || 0} 条</span></div>
-  </div>`, '采集器自启动以来的累计')}`;
+  </div>`, '采集器自启动以来的累计')}
+  ${card('停机补采', `<div class="list">
+    <div class="it"><b>上次补采</b><span class="right muted" id="bf-when">读取中…</span></div>
+    <div class="it"><b>补回消息</b><span class="right" id="bf-num">-</span></div>
+  </div>
+  <div class="row" style="margin-top:10px">
+    <span class="muted">往回补</span><input id="bf-min" type="number" min="10" max="20160" value="720" style="width:90px"><span class="muted">分钟</span>
+    <button class="primary" id="bf-go">立即补采</button>
+    <button id="bf-dry">试运行(不落库)</button>
+    <label class="muted" style="display:flex;align-items:center;gap:4px"><input type="checkbox" id="bf-deep">深挖</label>
+  </div>
+  <div class="muted" style="margin-top:8px" id="bf-note">采集器不在跑的时候, NapCat 的上报失败就失败了(不重试、不排队) —— 那段时间的消息会从 NapCat 本地历史回捞, 按 message_id 去重, 重复补采不会写重。</div>`)}`;
   q(box, '#bk').onclick = async () => {
     const r = await api('/api/backup', {method: 'POST', body: '{}'});
     if (r && r.ok) toast('备份完成: ' + r.file, 'ok');
@@ -1690,6 +1701,35 @@ async function _opsBackup(box) {
     const r = await api('/api/reindex', {method: 'POST', body: '{}'});
     if (r && r.ok) toast('索引已重建: ' + r.rows + ' 条', 'ok');
   };
+  /* ---- 停机补采 ---- */
+  const bfShow = st => {
+    const r = (st && st.result) || {};
+    const when = q(box, '#bf-when'), num = q(box, '#bf-num');
+    if (when) when.textContent = r.finished_at ? fmtTs(r.finished_at) + (st.running ? ' · 正在补采…' : '') : (st && st.running ? '正在补采…' : '还没补过');
+    if (num) num.textContent = r.finished_at ? (r.inserted || 0) + ' 条' + ((r.duplicate || 0) ? ' (重复 ' + r.duplicate + ')' : '') : '-';
+  };
+  bfShow(await api('/api/backfill'));
+  const bfRun = async dry => {
+    const min = +q(box, '#bf-min').value || 720;
+    const deep = !!(q(box, '#bf-deep') || {}).checked;
+    const r = await api('/api/backfill', {method: 'POST', body: JSON.stringify({minutes: min, dry_run: dry, deep})});
+    if (!r || !r.ok) return toast((r && r.error) || '补采没能启动', 'warn');
+    toast(dry ? '试运行中…' : '正在从 NapCat 历史回捞…', 'warn');
+    for (let i = 0; i < 40; i++) {                      // 轮询到结束(通常几秒)
+      await new Promise(s => setTimeout(s, 1500));
+      const st = await api('/api/backfill');
+      if (!st || !st.running) {
+        bfShow(st);
+        const x = (st && st.result) || {};
+        if (st && st.error) return toast('补采失败: ' + st.error, 'warn');
+        return toast(dry ? `试运行: ${x.groups || 0} 群 / ${x.users || 0} 私聊, 本该补回 ${x.would_insert || 0} 条`
+          : `补采完成: 入库 ${x.inserted || 0} 条(重复 ${x.duplicate || 0}${x.deep ? ', 深挖' : ''})`, 'ok');
+      }
+    }
+    toast('补采还在跑, 稍后回来看', 'warn');
+  };
+  q(box, '#bf-go').onclick = () => bfRun(false);
+  q(box, '#bf-dry').onclick = () => bfRun(true);
 }
 VIEWS.settings = VIEWS.config;      /* 设置页 = 原有配置视图(字段说明+校验已在其中) */
 

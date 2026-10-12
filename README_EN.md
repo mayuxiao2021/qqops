@@ -28,6 +28,7 @@ Everything stays on your device. Only the records you allow are ever sent to you
 |---|---|
 | Runtime | One process for all services (saves ~74% RAM on Android) or four isolated processes; `performance` / `balanced` / `saver` power profiles |
 | Fault tolerance | Crash ledger, five isolation layers, exponential backoff + circuit breaker, port pre-check and reclaim, real health checks |
+| No message loss | `qqops backfill` re-fetches messages that arrived while the collector was down (NapCat's HTTP report never retries); idempotent via `(group_id, message_id)` |
 | Plugin system | AstrBot-aligned layout: `@register / @route / @command / @task / @on_event / @on_stage`, hot reload, console pages from plugins |
 | Console | 15 pages, zero build: dashboard, chat, messages (FTS5 highlight), reports, tasks, plugins, data, ops, settings, help |
 | Dependencies | Standard library only (SQLite+FTS5, `http.server`, `urllib`, `threading`); optional `pypdf` for PDF |

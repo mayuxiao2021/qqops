@@ -78,6 +78,7 @@ print("  控制台: http://%s:%s/?token=%s" % (w['host'], w['port'], w['token'])
 PY
     ) ;;
   backup)   ( cd "$BASE" && exec "$PY" -m qqops.tools backup ) ;;
+  backfill) ( cd "$BASE" && exec "$PY" -m qqops.backfill "$@" ) ;;
   doctor)   ( cd "$BASE" && exec "$PY" -m qqops.tools doctor ) ;;
   prune)    ( cd "$BASE" && exec "$PY" -m qqops.tools prune "$@" ) ;;
   summary)  ( cd "$BASE" && exec "$PY" -m qqops.summarizer "$@" ) ;;
@@ -94,6 +95,7 @@ QQOps 控制脚本 v$(cat "$BASE/VERSION" 2>/dev/null || echo '?')
   qqops logs [name]      跟踪日志: collector|scheduler|web|summarizer|runner
   qqops summary [--dry-run] [--hours 24]   手动总结
   qqops backup           立即备份数据库与配置
+  qqops backfill [--minutes 720] [--dry-run]   补采停机期间漏掉的消息(从 NapCat 历史回捞)
   qqops prune --days N   清理 N 天前的消息
   qqops doctor           环境与链路自检
 

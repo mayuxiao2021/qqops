@@ -110,6 +110,8 @@ class Runner:
                 self.restarts[name] = 1
         core.beat("watchdog")        # 主管(主线程)此刻已经在跑
         core.runtime_write("single", list(self.services))
+        if "collector" in self.services:
+            collector.start_backfill(self.cfg, self.store)     # 补回停机期间漏掉的消息
         core.log("runner", "INFO", "单进程模式启动: %s | 档位 %s(调度 %ds / 主管 %ds)"
                  % (",".join(self.services), self.profile["power_mode"], self.tick, self.interval))
         return self

@@ -506,6 +506,241 @@ class TestSummarizer(unittest.TestCase):
             self.assertIn("dry-run", f.read(), "预览报告里没标注这是试运行")
 
 
+class TestBackfill(unittest.TestCase):
+    """停机补采: 采集器不在跑时 NapCat 的上报失败就失败了(不重试/不排队), 那段时间的消息
+    只能等恢复后用 OneBot 历史接口回捞。这里用假 NapCat 把"缺口识别→回捞→去重→幂等"跑通。"""
+
+    def _fake_napcat(self, history: dict | None = None, self_id: int = 10001):
+        """假 NapCat: 只实现补采用到的三个接口。返回 (端口, 调用记录)。"""
+        import http.server
+        import threading
+        calls = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(n).decode("utf-8", "replace") or "{}")
+                action = self.path.strip("/")
+                calls.append({"action": action, "body": body})
+                if action == "get_login_info":
+                    data = {"user_id": self_id, "nickname": "假的机器人"}
+                elif action == "get_group_list":
+                    data = [{"group_id": g, "group_name": "群 %d" % g}
+                            for g in sorted((history or {}).get("group", {}))]
+                elif action == "get_group_msg_history":
+                    msgs = (history or {}).get("group", {}).get(int(body.get("group_id") or 0), [])
+                    n = int(body.get("count") or 50)
+                    seq = int(body.get("message_seq") or 0)
+                    if seq and body.get("reverseOrder"):
+                        older = [m for m in msgs if int(m.get("message_seq") or m["message_id"]) < seq]
+                        data = {"messages": older[-n:]}
+                    else:
+                        data = {"messages": msgs[-n:]}
+                elif action == "get_friend_msg_history":
+                    msgs = (history or {}).get("private", {}).get(int(body.get("user_id") or 0), [])
+                    n = int(body.get("count") or 50)
+                    seq = int(body.get("message_seq") or 0)
+                    if seq and body.get("reverseOrder"):
+                        older = [m for m in msgs if int(m.get("message_seq") or m["message_id"]) < seq]
+                        data = {"messages": older[-n:]}
+                    else:
+                        data = {"messages": msgs[-n:]}
+                else:
+                    data = {}
+                payload = json.dumps({"status": "ok", "retcode": 0, "data": data}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1], calls
+
+    def _point_at_fake_napcat(self, port: int, **collector_patch):
+        cfg = core.Config()
+        patch = {"push": {"napcat_api_port": port, "token": ""},
+                 "collector": dict({"backfill": True, "backfill_minutes": 720,
+                                    "backfill_count": 50, "backfill_min_gap": 45}, **collector_patch)}
+        cfg.set_values(patch)
+        return cfg
+
+    @staticmethod
+    def _msg(gid: int, mid: int, ts: int, uid: int = 20002, text: str = "漏掉的消息"):
+        return {"message_id": mid, "real_id": mid, "message_seq": mid, "time": ts,
+                "message_type": "group", "group_id": gid, "user_id": uid, "self_id": 10001,
+                "post_type": "message", "raw_message": text,
+                "sender": {"nickname": "同学", "card": "", "role": "member"},
+                "message": [{"type": "text", "data": {"text": text}}]}
+
+    def test_backfill_recovers_only_the_missing_messages(self):
+        """缺口里的消息补回库; 已有的重复条不重写; 机器人自己发的按配置跳过。"""
+        from qqops import backfill
+        now = core.now()
+        gid = 8801
+        st = core.Store()
+        have = self._msg(gid, 1001, now - 3600, text="早就有了")
+        st.insert_message(dict(have))
+        missing = self._msg(gid, 1002, now - 180, text="停机期间漏掉的")
+        selfmsg = self._msg(gid, 1003, now - 170, uid=10001, text="机器人自己发的")
+        after = self._msg(gid, 1004, now - 100, text="恢复后正常收到的")
+        port, calls = self._fake_napcat({"group": {gid: [have, missing, selfmsg, after]}})
+        cfg = self._point_at_fake_napcat(port)
+        res = backfill.run(cfg, st, minutes=720)
+        self.assertTrue(res["ok"], res)
+        rows = st.messages(group=str(gid), hours=24)["rows"]
+        texts = {r["raw_message"] for r in rows}
+        self.assertIn("停机期间漏掉的", texts, "缺口里的消息没补回来")
+        self.assertIn("恢复后正常收到的", texts)
+        self.assertNotIn("机器人自己发的", texts, "reportSelfMessage=false 时不该补机器人自己的消息")
+        self.assertEqual(res["inserted"], 2, res)
+        self.assertGreaterEqual(res["duplicate"], 1, "已存在的消息应走 duplicate 而不是重写")
+        self.assertEqual(res["self_skipped"], 1, res)
+        self.assertEqual(len([c for c in calls if c["action"] == "get_group_msg_history"
+                              and c["body"].get("group_id") == gid]), 1)
+        # 幂等: 再补一次不会写重
+        res2 = backfill.run(cfg, st, minutes=720)
+        self.assertEqual(res2["inserted"], 0, res2)
+        self.assertEqual(len(st.messages(group=str(gid), hours=24)["rows"]), 3)
+
+    def test_backfill_pages_backwards_when_the_gap_is_bigger_than_one_page(self):
+        """一页装不下缺口时必须靠 message_seq+reverseOrder 往回翻页, 否则老的那段还是漏。"""
+        from qqops import backfill
+        now = core.now()
+        gid = 8802
+        st = core.Store()
+        st.insert_message(self._msg(gid, 1900, now - 9000, text="两个半小时前"))
+        hist = [self._msg(gid, 2001 + i, now - 9000 + i * 15, text="中间第 %d 条" % i)
+                for i in range(600)]
+        port, calls = self._fake_napcat({"group": {gid: hist}})
+        cfg = self._point_at_fake_napcat(port)
+        # 默认 4 页封顶: 只补回 200 条, 并把"没够到底"如实报出来(不假装补全了)
+        capped = backfill.run(cfg, st, minutes=720, count=50, groups=[gid])
+        self.assertLessEqual(capped["fetched"], 200, capped)
+        self.assertTrue([x for x in capped["incomplete"] if str(gid) in x],
+                        "页数封顶时必须报告'未够到底': %s" % capped["incomplete"])
+        # 放开页数: 600 条要 12 页, 缺口补齐
+        res = backfill.run(cfg, st, minutes=720, count=50, groups=[gid], max_pages=15)
+        pages = [c for c in calls if c["action"] == "get_group_msg_history"
+                 and c["body"].get("group_id") == gid]
+        self.assertGreater(len(pages), 1, "缺口大于一页时必须翻页: %s" % pages)
+        self.assertTrue(any(c["body"].get("reverseOrder") for c in pages),
+                        "翻页必须带 reverseOrder=true(NapCat 只认这个口径): %s" % pages)
+        self.assertGreaterEqual(res["inserted"], 380, res)
+        rows = core.Store().messages(group=str(gid), hours=24, size=500)["rows"]
+        self.assertGreaterEqual(len(rows), 400)
+
+    def test_backfill_skips_quiet_groups_and_never_touches_a_dead_napcat(self):
+        """刚收到消息的群(空档小于 min_gap)不该去扫; NapCat 挂了要老老实实报错而不是崩。"""
+        from qqops import backfill
+        st = core.Store()
+        st.insert_message(self._msg(8803, 3001, core.now() - 3, text="刚刚才收到"))
+        port, calls = self._fake_napcat({})
+        cfg = self._point_at_fake_napcat(port)
+        res = backfill.run(cfg, st, minutes=720)
+        self.assertTrue(res["ok"], res)
+        asked = [c["body"].get("group_id") for c in calls if c["action"] == "get_group_msg_history"]
+        self.assertNotIn(8803, asked, "空档只有 3 秒的群不该扫(但其它有缺口的群不受影响)")
+        # NapCat 不可用: 明确返回 ok=False + 原因, 不抛异常
+        dead = core.Config()
+        dead.set_values({"push": {"napcat_api_port": self._free_port(), "token": ""}})
+        res2 = backfill.run(dead, st, minutes=720)
+        self.assertFalse(res2["ok"])
+        self.assertIn("NapCat", res2.get("error", ""))
+
+    @staticmethod
+    def _free_port() -> int:
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+
+    def test_backfill_dry_run_writes_nothing(self):
+        from qqops import backfill
+        now = core.now()
+        gid = 8804
+        st = core.Store()
+        hist = [self._msg(gid, 4000 + i, now - 300 + i, text="第 %d" % i) for i in range(5)]
+        st.insert_message(dict(hist[0]))                  # 5 条里已有 1 条
+        port, _ = self._fake_napcat({"group": {gid: hist}})
+        cfg = self._point_at_fake_napcat(port)
+        res = backfill.run(cfg, st, minutes=720, dry_run=True)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["inserted"], 0)
+        self.assertEqual(res["would_insert"], 4, "试运行只该统计真的缺的那些: %s" % res)
+        self.assertEqual(res["duplicate"], 1, res)
+        self.assertEqual(len(st.messages(group=str(gid), hours=24)["rows"]), 1, "试运行不能落库")
+
+    def test_backfill_picks_up_a_group_we_never_saw(self):
+        """库里完全没有的群(停机期间刚被拉进去): 也要捞最近一页, 否则新群开头那几条永远缺。"""
+        from qqops import backfill
+        now = core.now()
+        gid = 8810
+        st = core.Store()
+        hist = [self._msg(gid, 7000 + i, now - 120 + i * 10, text="新群第 %d 条" % i)
+                for i in range(4)]
+        port, calls = self._fake_napcat({"group": {gid: hist}})
+        cfg = self._point_at_fake_napcat(port)
+        res = backfill.run(cfg, st, minutes=720)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["new_groups"], 1, res)
+        self.assertEqual(res["inserted"], 4, res)
+        rows = st.messages(group=str(gid), hours=24, size=500)["rows"]
+        self.assertEqual(len(rows), 4)
+        self.assertNotIn("%s(50 条未够到底)" % gid, res["incomplete"], "新群只取一页, 不该报未取到底")
+
+    def test_backfill_targets_every_group_that_has_a_gap(self):
+        """缺口识别: 只看"最后一条消息距今 > min_gap 秒"的会话, 并带上配置里关注的群。"""
+        from qqops import backfill
+        now = core.now()
+        st = core.Store()
+        st.insert_message(self._msg(8805, 5001, now - 600, text="十分钟前的缺口群"))
+        st.insert_message(self._msg(8806, 5002, now - 2, text="刚收到的群"))
+        plan = backfill.holes(st, minutes=720, min_gap=45, now=now, extra_groups=[8807])
+        self.assertIn(8805, plan["groups"])
+        self.assertNotIn(8806, plan["groups"], "空档只有 2 秒的群不该被当成缺口")
+        self.assertIn(8807, plan["groups"], "配置里关注的群也要检查")
+        # run() 必须把配置里关注的群也带上(否则"配置了却没补"这种坑没人发现)
+        cfg = core.Config()
+        port, calls = self._fake_napcat({"group": {8809: [self._msg(8809, 5100, core.now() - 300,
+                                                                    text="关注群缺口")]}})
+        cfg.set_values({"summarizer": {"groups": [8809]}, "push": {"napcat_api_port": port, "token": ""}})
+        res = backfill.run(cfg, st, minutes=720, groups=[8809])
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["inserted"], 1, res)
+        self.assertTrue([c for c in calls if c["body"].get("group_id") == 8809])
+
+    def test_backfill_keeps_private_messages_when_store_private_is_on(self):
+        """私聊(store_private=true)同样能补: 接口不同, 入库路径相同。"""
+        from qqops import backfill
+        now = core.now()
+        uid = 8808
+        st = core.Store()
+        st.insert_message({"time": now - 600, "message_type": "private", "group_id": 0,
+                           "user_id": uid, "message_id": 6000, "raw_message": "老私聊",
+                           "self_id": 10001, "sender": {"nickname": "朋友"},
+                           "message": [{"type": "text", "data": {"text": "老私聊"}}]})
+        priv = {"message_id": 6001, "time": now - 300, "message_type": "private",
+                "user_id": uid, "self_id": 10001, "post_type": "message",
+                "raw_message": "停机期间发的私聊", "sender": {"nickname": "朋友"},
+                "message": [{"type": "text", "data": {"text": "停机期间发的私聊"}}]}
+        port, calls = self._fake_napcat({"private": {uid: [priv]}})
+        cfg = self._point_at_fake_napcat(port, store_private=True)
+        res = backfill.run(cfg, st, minutes=720)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["inserted"], 1, res)
+        self.assertTrue([c for c in calls if c["action"] == "get_friend_msg_history"])
+        rows = st.messages(hours=24)["rows"]
+        self.assertTrue(any(r["raw_message"] == "停机期间发的私聊" for r in rows), "私聊没补回来")
+
+
 class TestCollectorFilter(unittest.TestCase):
     def _h(self, patch=None):
         cfg = core.Config()

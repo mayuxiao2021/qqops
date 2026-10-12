@@ -6,6 +6,7 @@
 #    bash install.sh --no-start          只安装不启动
 #    bash install.sh --import-db <路径>   迁移旧采集库
 #    bash install.sh --import-config <路径> 迁移旧 summarize.json
+#    bash install.sh --force-new          确实要装到另一个目录时用(默认会拦住"装第二份")
 # ============================================================
 set -uo pipefail
 
@@ -18,17 +19,36 @@ bad()  { echo "  ${C_BAD}✘${C_OFF} $*"; }
 warn() { echo "  ${C_WARN}!${C_OFF} $*"; }
 step() { echo; echo "${C_DIM}── $* ──${C_OFF}"; }
 
-NO_START=0; IMPORT_DB=""; IMPORT_CFG=""
+NO_START=0; IMPORT_DB=""; IMPORT_CFG=""; FORCE_NEW=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --no-start) NO_START=1 ;;
     --import-db) IMPORT_DB="${2:-}"; shift ;;
     --import-config) IMPORT_CFG="${2:-}"; shift ;;
+    --force-new) FORCE_NEW=1 ;;
     -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
     *) warn "忽略未知参数: $1" ;;
   esac
   shift
 done
+
+# ---------------------------------------------------------------- 装错地方防呆
+# `$HOME` 不一定是 Termux 的家目录: 用 `adb shell run-as`、cron、别的 shell 跑安装器时,
+# Termux 里 $HOME=/data/data/com.termux/files/home, 而 run-as 下是 /data/user/0/com.termux ——
+# 于是"再装一份"到另一个目录: 新实例起来了、库是空的, 原来的数据看起来"没了"。
+# (真踩过。) 发现这种情况就停下来, 把话说清楚, 而不是默默装第二份。
+TERMUX_HOME="/data/data/com.termux/files/home"
+if [ "$FORCE_NEW" != "1" ] && [ ! -e "$DEST/VERSION" ] && [ -e "$TERMUX_HOME/qqops/VERSION" ] \
+   && [ "$DEST" != "$TERMUX_HOME/qqops" ]; then
+  step "装错地方了?"
+  bad "检测到已有安装: $TERMUX_HOME/qqops, 但这次会装到: $DEST"
+  echo "  原因: 当前 \$HOME=${HOME:-<空>} 不是 Termux 的家目录($TERMUX_HOME)"
+  echo "  解决(二选一):"
+  echo "    export HOME=$TERMUX_HOME && bash \"$0\""
+  echo "    QQOPS_HOME=$TERMUX_HOME/qqops bash \"$0\""
+  echo "  确实要装到新位置: bash \"$0\" --force-new"
+  exit 1
+fi
 
 echo "🐧 QQOps 安装器"
 echo "  源目录: $SRC"

@@ -4,5 +4,5 @@
 但与本程序共享 loopback, 因此可直接调用其 OneBot HTTP API。
 """
 
-__version__ = "3.4.10"
+__version__ = "3.4.11"
 __all__ = ["__version__"]

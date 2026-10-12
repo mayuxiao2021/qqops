@@ -448,6 +448,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/napcat":
             nc = core.napcat_from_config(cfg)
             return self.json({"health": nc.health()})
+        if path == "/api/backfill":
+            from . import backfill as _bf                # 懒加载
+            return self.json(_bf.status())
         return self.json({"error": "not found", "path": path}, 404)
 
     def groups_payload(self, cfg: core.Config, store: core.Store, force: bool = False) -> dict:
@@ -612,6 +615,14 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/reindex":
             n = store.rebuild_fts()
             return self.json({"ok": True, "rows": n, "fts": {"available": store.fts_ok, "rows": store.fts_count()}})
+        if path == "/api/backfill":
+            from . import backfill as _bf                # 懒加载
+            minutes = int(body.get("minutes") or 0)
+            if body.get("action") == "cancel" or minutes < 0:
+                return self.json({"ok": False, "error": "补采不支持中断, 等它跑完即可(通常几秒)"}, 400)
+            r = _bf.start_async(cfg, store, minutes=minutes, dry_run=bool(body.get("dry_run")),
+                                deep=bool(body.get("deep")))
+            return self.json(r, 200 if r.get("ok") else 409)
         if path == "/api/napcat/send":
             text = str(body.get("text") or "")
             if not text:

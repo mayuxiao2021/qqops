@@ -104,7 +104,7 @@ NapCat 侧只需接线一次(容器内 `…/napcat/config/` 下文件名带你 Q
 | 任务 | 定时设置(每天定点/间隔/每周)、运行历史、token 与费用、手工触发 |
 | 插件 | 内置与第三方插件:启停、配置(带说明的表单)、重载、命令、定时任务 |
 | 数据 | 群组、事件/待办、长期记忆、链接、媒体 |
-| 运维 | 服务启停、**资源与功耗**(单/多进程、三档、内存)、崩溃账本、实时日志、框架自检、备份 |
+| 运维 | 服务启停、**资源与功耗**(单/多进程、三档、内存)、崩溃账本、实时日志、框架自检、备份、**停机补采** |
 | 设置 | 全部配置项(密钥掩码)、令牌、模型、推送、端口 |
 
 手机浏览器打开即可,底部有标签栏;桌面用 `adb forward tcp:8091 tcp:8091` 转发后访问。
@@ -120,6 +120,10 @@ QQ ──▶ NapCat ──HTTP 上报──▶ collector ──▶ SQLite(消息
    scheduler ──▶ 定时总结 / 维护 / 备份          webapp ──▶ 控制台(HTTP API + SPA)
    watchdog/runner ──▶ 进程或线程级监督, 退避重启 + 熔断
 ```
+
+> NapCat 的上报**失败不重试、不排队**,所以 QQOps 没在跑的那段时间消息会丢 ——
+> 恢复后 `qqops backfill` 会从 NapCat 本地历史按 `message_id` 补回来(幂等)。
+> 审计方法、实测数字与翻页口径见 [docs/guide/no-loss.md](docs/guide/no-loss.md)。
 
 分层与 AstrBot 对齐(`app.py` 生命周期、`framework/` 骨架、`plugins/` 相当于 builtin_stars、
 `console/` 相当于 dashboard)。设计原则、容错模型、迁移路线见 **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**。

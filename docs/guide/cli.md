@@ -57,6 +57,21 @@ qqops reindex                   # 重建全文索引(检索不准/索引落后�
 qqops export.csv --hours 168    # 导出最近 7 天消息为 CSV(Excel 可直接打开)
 ```
 
+## 补采(停机期间漏掉的消息)
+
+NapCat 的上报**失败不重试、不排队**,所以 QQOps 没在跑的那段时间消息会丢。恢复后可以从
+NapCat 本地历史补回来(幂等,不会写重):
+
+```bash
+qqops backfill                          # 补最近 12 小时(默认窗口)
+qqops backfill --minutes 720            # 指定往回补多久
+qqops backfill --dry-run                # 只统计不落库: 先看能补回多少
+qqops backfill --group 123 --group 456  # 只补指定群
+qqops backfill --deep --minutes 9000 --pages 60   # 深挖: 连夹在中间的老空洞一起修
+```
+
+升级/迁机器之后建议跑一次 `qqops backfill`。详见[会不会漏消息](/guide/no-loss)。
+
 ## 旁路服务
 
 QQOps 不依赖 NapCat 之外的东西, 但可以帮你管理它们:

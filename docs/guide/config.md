@@ -21,6 +21,12 @@
 | `store_private` | `false` | 是否保存私聊消息(内容层面) |
 | `command_private` | `true` | 私聊不入库, 但仍交给插件(「在 QQ 里问」的前提) |
 | `debug` | `false` | 每条消息记日志(排错用, 平时关掉) |
+| `backfill` | `true` | 启动后自动补采一次(补回停机期间 NapCat 上报失败漏掉的消息) |
+| `backfill_minutes` | `720` | 自动补采往回补多久(分钟) |
+| `backfill_count` / `backfill_max_pages` | `100` / `4` | 每页多少条 / 每个会话最多往回翻几页 |
+| `backfill_min_gap` | `45` | 空档小于这个秒数就不扫(重启几秒不值得扫全群) |
+| `backfill_new_groups` | `true` | 库里完全没有的群也捞最近一页(刚被拉进去的新群) |
+| `backfill_include_self` | `false` | 是否把机器人自己发的消息也补进来(默认不补, 与实时采集口径一致) |
 
 ## 总结 summarizer
 

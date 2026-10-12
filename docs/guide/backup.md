@@ -60,6 +60,7 @@ qqops stop
 curl -fL --retry 3 --retry-delay 2 -o ~/qqops.tar.gz https://github.com/mayuxiao2021/qqops/releases/latest/download/qqops-latest.tar.gz
 rm -rf ~/qqops-src && mkdir -p ~/qqops-src && tar xzf ~/qqops.tar.gz -C ~/qqops-src --strip-components=1
 bash ~/qqops-src/install.sh          # 安装器是幂等的: 覆盖程序文件, 保留 data/
+qqops backfill                       # 补回停机/重启期间 NapCat 上报失败漏掉的消息
 qqops doctor
 ```
 
@@ -67,6 +68,13 @@ qqops doctor
 [Releases](https://github.com/mayuxiao2021/qqops/releases) 页面右键复制那个 `.tar.gz` 的链接,
 把 `curl -fL --retry 3` 后面的网址换掉即可(`-f` 让 404 之类直接报错而不是存下一个错误页,
 `--retry` 会在网络抖动/SSL 中断时自动重试)。
+
+> **升级那一刻起采集就断了** —— NapCat 的上报失败不重试, 停机期间的消息会丢。
+> 新版启动后会自动补一次; 手工补一次更稳(`qqops backfill`, 通常几秒)。
+> 原理与实测见[会不会漏消息](/guide/no-loss)。
+
+> 装错地方防呆: 如果在 `adb shell run-as`、cron 等 `$HOME` 不是 Termux 家目录的环境里跑
+> 安装器, 它**会拒绝执行**并提示怎么改(否则会"再装一份"到别的目录, 新实例空库、旧数据看着像丢了)。
 
 版本变化与迁移说明看 [CHANGELOG](https://github.com/mayuxiao2021/qqops/blob/master/CHANGELOG.md);
 配置键的迁移是自动的(旧键会被搬到新位置并记日志)。升级前建议先 `qqops backup`。
