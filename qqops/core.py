@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 import secrets
 
-VERSION = "3.4.7"
+VERSION = "3.4.8"
 
 # 路径解析(踩过坑, 别改回 "靠 $HOME 猜"):
 #   曾经用 BASE = ~/qqops —— 但 $HOME 是环境给的, 从别的目录/cron/adb run-as 调用时
@@ -2706,29 +2706,99 @@ def extras_check(cfg: Config, counters: dict, manage: bool = False) -> list:
     return out
 
 
-def qqops_processes() -> list:
+_PROC_CACHE: tuple = ()                      # (时间戳, 进程列表) —— 见 qqops_processes 的缓存说明
+
+
+def _read_cmdline_only(pid: int) -> str:
+    """只读 /proc/<pid>/cmdline, **绝不退回 ps**。
+
+    批量扫进程时必须这样: Android 上读别人进程的 cmdline 会被系统拒绝, 老写法于是对每个 pid
+    起一个 `ps` 子进程 —— 手机上上千个进程就是 8~10 秒(见 qqops_processes 的注释)。
+    读不到就当"不是我们的进程"跳过, 这对筛选 QQOps 进程没有任何损失。
+    """
+    try:
+        with open("/proc/%d/cmdline" % int(pid), "rb") as f:
+            return f.read().decode("utf-8", "replace").replace("\0", " ").strip()
+    except Exception:
+        return ""
+
+
+def _rss_etime_only(pid: int) -> tuple:
+    """同样只读 /proc(批量场景), 不退回 ps。"""
+    rss, etime = 0, ""
+    try:
+        with open("/proc/%d/statm" % int(pid)) as f:
+            rss = int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    except Exception:
+        pass
+    try:
+        with open("/proc/%d/stat" % int(pid)) as f:
+            parts = f.read().split()
+        start = int(parts[21]) / os.sysconf("SC_CLK_TCK")
+        with open("/proc/uptime") as f:
+            up = float(f.read().split()[0])
+        secs = max(0, int(up - start))
+        etime = "%02d:%02d:%02d" % (secs // 3600, (secs % 3600) // 60, secs % 60)
+    except Exception:
+        pass
+    return rss, etime
+
+
+def _processes_from_ps() -> list:
+    """没有 /proc 的平台(macOS/BSD): **一次** ps 拿全表再过滤, 不要每个 pid 起一个 ps。"""
+    out = []
+    for line in (_run(["ps", "-Axo", "pid=,rss=,etime=,command="], 10) or "").splitlines():
+        bits = line.split(None, 3)
+        if len(bits) < 4:
+            continue
+        pid_s, rss_s, etime, cmd = bits
+        if "python" not in cmd or "qqops." not in cmd:
+            continue
+        try:
+            pid = int(pid_s)
+        except Exception:
+            continue
+        out.append({"pid": pid, "cmd": cmd[:140], "rss": int(rss_s or 0) * 1024,
+                    "etime": etime, "self": pid == os.getpid()})
+    return out
+
+
+def qqops_processes(use_cache: bool = True) -> list:
     """列出本机上属于 QQOps 的 python 进程(单进程运行器也算一个进程)。
 
     用于控制台"资源"页: 让人直观看到"合并前 4 个进程 vs 合并后 1 个"。
+
+    性能上很讲究 —— 这是整个控制台里唯一会**遍历全部进程**的接口:
+      * 只读 /proc(读不到就跳过), 绝不为单个 pid 起子进程: Android 上读别人进程的 cmdline
+        会被拒绝, 老写法于是为上千个 pid 各起一个 `ps`, 接口耗时 8~10 秒, 控制台
+        「运维 → 资源与功耗」页因此一直转圈、看着像空的(真踩过);
+      * 没有 /proc 的平台用**一次** ps 批量拿;
+      * 5 秒缓存: 页面会自动轮询, 没必要每次都真扫一遍。
     """
+    global _PROC_CACHE
+    t = time.time()
+    if use_cache and _PROC_CACHE and t - _PROC_CACHE[0] < 5.0:
+        return [dict(x) for x in _PROC_CACHE[1]]
     out = []
     if os.path.isdir("/proc"):
-        for pid in os.listdir("/proc"):
-            if not pid.isdigit():
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
                 continue
-            try:
-                cmd = _cmdline(int(pid))
-                if "python" not in cmd or "qqops." not in cmd:
-                    continue
-                rss, etime = _rss_and_etime(int(pid))
-                out.append({"pid": int(pid), "cmd": cmd[:140], "rss": rss, "etime": etime,
-                            "self": int(pid) == os.getpid()})
-            except Exception:
+            pid = int(name)
+            cmd = _read_cmdline_only(pid)
+            if not cmd or "python" not in cmd or "qqops." not in cmd:
                 continue
+            rss, etime = _rss_etime_only(pid)
+            out.append({"pid": pid, "cmd": cmd[:140], "rss": rss, "etime": etime,
+                        "self": pid == os.getpid()})
     elif os.name == "nt":
-        return [{"pid": os.getpid(), "cmd": "python -m qqops.…(Windows 仅供开发)",
-                 "rss": self_rss(), "etime": "", "self": True}]
-    return sorted(out, key=lambda x: -int(x.get("rss") or 0))
+        out = [{"pid": os.getpid(), "cmd": "python -m qqops.…(Windows 仅供开发)",
+                "rss": self_rss(), "etime": "", "self": True}]
+    else:
+        out = _processes_from_ps()
+    out.sort(key=lambda x: -int(x.get("rss") or 0))
+    _PROC_CACHE = (t, [dict(x) for x in out])
+    return out
 
 
 def instance_status(cfg: Config = None) -> dict:

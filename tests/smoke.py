@@ -1359,6 +1359,24 @@ class TestConsistency(unittest.TestCase):
             os.environ["QQOPS_NO_EXTRAS"] = "1"               # 恢复: 其余测试不许动真实服务
             core.pgrep, core.napcat_from_config, core.extra_action = orig_pgrep, orig_nc, orig_action
 
+    def test_process_scan_never_spawns_one_ps_per_pid(self):
+        """遍历进程时不许为**单个 pid** 起 `ps` —— 那会让「运维 → 资源与功耗」页卡成空白。
+
+        Android 上读别人进程的 `/proc/<pid>/cmdline` 会被系统拒绝, 老写法于是为上千个 pid
+        各起一个 `ps` 子进程, 这个接口要 8~10 秒, 页面看着就是"空的"(真踩过)。
+        """
+        calls = []
+        orig_run = core._run
+        core._run = lambda cmd, *a, **k: (calls.append([str(x) for x in cmd]), "")[1]
+        try:
+            core._PROC_CACHE = ()                        # 清缓存, 强制真扫一遍
+            core.qqops_processes(use_cache=False)
+        finally:
+            core._run = orig_run
+            core._PROC_CACHE = ()
+        per_pid = [c for c in calls if c and c[0] == "ps" and "-p" in c]
+        self.assertEqual(per_pid, [], "遍历进程时为单个 pid 起了 ps: %s" % per_pid[:3])
+
     def test_docs_site_anchors_are_valid(self):
         """站内 `#锚点` 必须真的存在 —— 锚点错了构建不报, 用户点进去只是"没跳转"。"""
         dist = os.path.join(ROOT, "docs", ".vitepress", "dist")
