@@ -300,6 +300,11 @@ def run(hours: float | None = None, groups: list | None = None, dry_run: bool = 
     sc = cfg.data["summarizer"]
     ex = cfg.data.get("extract", {})
     push_cfg = cfg.data["push"]
+    # 试运行一律不推送: 它只是让你看"会总结成什么", 而"不花钱"的预览报告推到 QQ 只会是噪音
+    # (内容里还写着"未调用模型")。控制台的「试运行(不花钱)」按钮只发 dry_run, 不带 no_push,
+    # 所以这里必须由自己兜底 —— 真踩过: 点试运行会给自己的 QQ 发一条预览。
+    if dry_run:
+        no_push = True
     hours = float(hours if hours is not None else sc.get("window_hours", 24))
     glist = groups or store.enabled_groups() or list(sc.get("groups") or [])
     kinds = sc.get("kinds") or []

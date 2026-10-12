@@ -407,6 +407,41 @@ class TestSummarizer(unittest.TestCase):
                                        "input_price_per_mtok": 1.0, "output_price_per_mtok": 2.0},
                         "push": {"enable": False}})
 
+    def test_dry_run_never_pushes_even_with_push_enabled(self):
+        """「试运行(不花钱)」不能往 QQ 推消息 —— 前端只发 dry_run, 不带 no_push。
+
+        真踩过: 推送那块只判 no_push, 于是点一次试运行就给自己发一条"未调用模型"的预览。
+        """
+        port, hits = self._fake_model("{}")
+        self._point_at_fake(port)
+        core.Config().set_values({"push": {"enable": True, "user_id": 12345}})
+        sent = []
+
+        class FakeNap:
+            def send_text(self, *a, **k):
+                sent.append(("text", a, k))
+                return 1
+
+            def send_forward(self, *a, **k):
+                sent.append(("forward", a, k))
+                return {"status": "ok"}
+
+            def send_markdown(self, *a, **k):
+                sent.append(("markdown", a, k))
+                return {"status": "ok"}
+
+        orig = core.napcat_from_config
+        core.napcat_from_config = lambda cfg: FakeNap()
+        try:
+            self._seed_group(gid=780)
+            res = summarizer.run(hours=24, groups=[780], dry_run=True)   # 故意不传 no_push
+        finally:
+            core.napcat_from_config = orig
+            core.Config().set_values({"push": {"enable": False}})
+        self.assertEqual(sent, [], "试运行往 QQ 推送了: %s" % sent[:2])
+        self.assertEqual(res.get("pushed"), 0, res)
+        self.assertEqual(hits, [], "dry-run 也不该调用模型")
+
     def test_full_run_writes_report_and_accounts_tokens(self):
         """一次完整总结: 调模型 → 解析 → 写 md/html → 记账(token 与费用)。"""
         model_json = json.dumps({
