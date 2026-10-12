@@ -20,6 +20,8 @@ from .framework import errors
 
 BACKOFF = errors.Backoff(base=10.0, factor=3.0, cap=300.0, window=900.0, trip=5,
                          stable_after=600.0)
+# 旁路服务的"连续不健康"计数(跨轮次保留, 用来去抖; 见 core.extras_check)
+EXTRAS_BAD: dict = {}
 
 
 def check_once(cfg: core.Config | None = None, auto_start: bool = True,
@@ -98,11 +100,13 @@ def main(argv=None) -> int:
                     if state != "ok":
                         core.log("watchdog", "WARN", "%s %s: %s" % (name, state, msg))
             core.beat("watchdog")
-            if wd.get("manage_extras"):
-                for ex, spec in core.EXTRAS.items():
-                    if not core.pgrep(spec["pattern"]):
-                        core.log("watchdog", "WARN", "旁路服务 %s 不在, 尝试拉起" % ex)
-                        core.extra_action(cfg, ex, "start")
+            # 旁路服务(NapCat 等): 按**真实接口健康**判, 不只看进程 —— 见 core.extras_check。
+            # 可选旁路(如 AstrBot)没在跑不算问题, 只有 NapCat 不在才值得告警。
+            for ex, state, msg in core.extras_check(cfg, EXTRAS_BAD,
+                                                    bool(wd.get("manage_extras"))):
+                if state in ("ok", "cooling") or (state == "dead" and ex != "napcat"):
+                    continue
+                core.log("watchdog", "WARN", "旁路服务 %s %s: %s" % (ex, state, msg))
         except Exception as e:
             core.log("watchdog", "ERROR", "体检异常: %s" % e)
         time.sleep(interval)

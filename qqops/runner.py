@@ -53,6 +53,7 @@ class Runner:
         self.backoff = errors.Backoff(base=10.0, factor=3.0, cap=300.0, window=900.0,
                                       trip=5, stable_after=600.0)
         self.restarts = {}
+        self.extra_bad = {}                      # 旁路服务"连续不健康"计数(见 core.extras_check)
         self.tick = int(self.profile["scheduler_tick"])
         self.interval = int(self.profile["watchdog_interval"])
         self.started_at = 0.0
@@ -171,6 +172,17 @@ class Runner:
                      % (name, self.restarts[name], delay))
             out.append((name, "restarted" if ok else "dead",
                         "已重启(第 %d 次)" % self.restarts[name] if ok else "重启失败"))
+        # 旁路服务(NapCat 等): 单进程模式下看门狗不是独立线程, 所以这里必须自己查。
+        # 只按进程判会漏掉最要命的情况: QQ 掉线时 NapCat 进程还在, 消息却全断了(真踩过)。
+        try:
+            wd = self.cfg.data.get("watchdog") or {}
+            for ex, state, msg in core.extras_check(self.cfg, self.extra_bad,
+                                                    bool(wd.get("manage_extras", True))):
+                if state in ("ok", "cooling") or (state == "dead" and ex != "napcat"):
+                    continue
+                core.log("runner", "WARN", "旁路服务 %s %s: %s" % (ex, state, msg))
+        except Exception as e:                       # noqa: BLE001
+            core.log("runner", "WARN", "旁路服务体检失败: %s" % e)
         # 调度滴答(与心跳同拍, 省唤醒)
         try:
             if self._tick_due():

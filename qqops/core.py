@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 import secrets
 
-VERSION = "3.4.5"
+VERSION = "3.4.6"
 
 # 路径解析(踩过坑, 别改回 "靠 $HOME 猜"):
 #   曾经用 BASE = ~/qqops —— 但 $HOME 是环境给的, 从别的目录/cron/adb run-as 调用时
@@ -79,7 +79,7 @@ DEFAULT_CONFIG = {
         "min_new_messages": 5,       # 至少多少条新消息才值得跑
     },
     "retention": {"message_days": 0, "log_max_mb": 4, "backup_keep": 7},
-    "watchdog": {"enabled": True, "interval": 60, "manage_extras": False},
+    "watchdog": {"enabled": True, "interval": 60, "manage_extras": True},
     # 运行形态与资源档位(合并进程 / 低功耗)
     "runtime": {
         "mode": "auto",            # auto | single | multi —— single=四服务合并成一个进程
@@ -2613,11 +2613,16 @@ def extra_action(cfg: Config, name: str, action: str) -> str:
     spec = _extra_spec(cfg, name)
     if not spec:
         return "未知旁路服务: %s" % name
-    if action in ("start", "restart") and pgrep(spec["pattern"]):
-        if action == "start":
-            return "%s 已在运行" % name
-        kill_pattern(spec["pattern"])
-        time.sleep(3)
+    if action == "restart":
+        # 重启 = 停掉再启动。老写法只杀了进程就往下走, 而 start 分支要求 action == "start",
+        # 于是既不启动、又落到末尾返回"未知动作: restart" —— 命令说"不认识这个动作",
+        # 但服务其实已经被杀了(真踩过: NapCat 就此躺了半天, 消息全断)。
+        if pgrep(spec["pattern"]):
+            kill_pattern(spec["pattern"])
+            time.sleep(3)
+        action = "start"
+    elif action == "start" and pgrep(spec["pattern"]):
+        return "%s 已在运行" % name
     if action == "start":
         # screen 同名会话若残留(常见为 "Remote or dead"), -dmS 会直接拒绝创建 → 先清理
         scr = spec.get("screen") or name
@@ -2651,6 +2656,47 @@ def extra_action(cfg: Config, name: str, action: str) -> str:
         time.sleep(1)
         return "%s 已停止" % name
     return "未知动作: %s" % action
+
+
+def extras_check(cfg: Config, counters: dict, manage: bool = False) -> list:
+    """旁路服务体检: **进程在 ≠ 能用** —— 返回 [(名称, 状态, 说明)]。
+
+    为什么不能只看 pgrep: NapCat 的 QQ 会话掉线时进程还活着, 但 OneBot 接口不再响应,
+    消息就此断流。真踩过: 账号离线后 NapCat 进程一直在, 消息断了整整一天, 直到用户说
+    "收不到消息"才发现 —— 看门狗只看进程, 所以它一直报"正常"。
+
+    `counters` 由调用方长期持有(跨轮次), 用来做"连续 N 次才动手"的去抖:
+    网络抖动时不会误杀; 刚重启过则进入冷却(计数为负), 给 QQ 足够时间登录。
+    """
+    out = []
+    for ex, spec in EXTRAS.items():
+        if not pgrep(spec["pattern"]):
+            out.append((ex, "dead", "进程不在"))
+            if manage:
+                out.append((ex, "started", extra_action(cfg, ex, "start")))
+            counters[ex] = 0
+            continue
+        if ex != "napcat":
+            out.append((ex, "ok", "进程在"))
+            continue
+        h = napcat_from_config(cfg).health()
+        if h.get("ok"):
+            counters[ex] = 0
+            out.append((ex, "ok", "接口正常(%sms)" % h.get("ms")))
+            continue
+        n = int(counters.get(ex, 0))
+        if n < 0:                                   # 冷却中: 照常体检, 但不动作(等 QQ 登录完)
+            counters[ex] = n + 1
+            out.append((ex, "cooling", "刚重启过, 冷却中(还剩 %d 轮)" % -n))
+            continue
+        n += 1
+        counters[ex] = n
+        why = h.get("error") or h.get("why") or "接口无响应"
+        out.append((ex, "unhealthy", "接口不健康(连续 %d 次): %s" % (n, why)))
+        if manage and n >= 3:
+            out.append((ex, "restarted", extra_action(cfg, ex, "restart")))
+            counters[ex] = -10                      # 冷却 10 轮, 等 QQ 登录
+    return out
 
 
 def qqops_processes() -> list:

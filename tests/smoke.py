@@ -1320,6 +1320,40 @@ class TestConsistency(unittest.TestCase):
         leftover = [f for f in os.listdir(TMP) if ".tmp" in f and "atomic-conc" in f]
         self.assertEqual(leftover, [], "临时文件没有清理干净: %s" % leftover)
 
+    def test_extras_check_looks_at_the_api_not_just_the_process(self):
+        """旁路服务体检必须看**接口**, 不只看进程。
+
+        真踩过: QQ 掉线后 NapCat 进程一直活着, OneBot 接口不再响应 —— 消息断了整整一天,
+        而只看 pgrep 的看门狗一直报"正常"。这里模拟"进程在但接口挂", 断言会告警并在连续 3 次后
+        尝试重启, 之后进入冷却(避免反复杀)。
+        """
+        orig_pgrep = core.pgrep
+        orig_nc = core.napcat_from_config
+        orig_action = core.extra_action
+
+        class _Dead:
+            def health(self):
+                return {"ok": False, "error": "connection refused"}
+
+        calls = []
+        core.pgrep = lambda pat: ["1234"]                     # 假装进程都在
+        core.napcat_from_config = lambda cfg: _Dead()
+        core.extra_action = lambda cfg, name, action: (calls.append(action), "fake")[1]
+        try:
+            counters = {}
+            states = []
+            for _ in range(4):
+                states += [s for _, s, _ in core.extras_check(core.Config(), counters, manage=True)]
+            self.assertIn("unhealthy", states, "接口挂了却没告警")
+            self.assertEqual(calls.count("restart"), 1, "连续 3 次不健康后应当只重启一次: %s" % calls)
+            self.assertLess(counters.get("napcat", 0), 0, "重启后应进入冷却")
+            # 健康时必须复位, 不能一直挂着"不健康"
+            core.napcat_from_config = lambda cfg: type("_OK", (), {"health": lambda self: {"ok": True, "ms": 5}})()
+            core.extras_check(core.Config(), counters, manage=True)
+            self.assertEqual(counters.get("napcat"), 0)
+        finally:
+            core.pgrep, core.napcat_from_config, core.extra_action = orig_pgrep, orig_nc, orig_action
+
     def test_docs_site_anchors_are_valid(self):
         """站内 `#锚点` 必须真的存在 —— 锚点错了构建不报, 用户点进去只是"没跳转"。"""
         dist = os.path.join(ROOT, "docs", ".vitepress", "dist")
