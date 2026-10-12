@@ -354,6 +354,122 @@ class TestSummarizer(unittest.TestCase):
         self.assertAlmostEqual(summarizer.cost_of(usage, {"input_price_per_mtok": 1.0,
                                                           "output_price_per_mtok": 2.0}), 2.0)
 
+    # ---------------------------------------------------------------- 端到端
+    def _fake_model(self, content: str, usage: dict | None = None):
+        """起一个只回固定内容的本地假模型服务, 返回 (端口, 收到的请求列表)。
+
+        为什么要这样做: 原来只有"没配 key 时只出统计"的测试 —— 真正**调用模型**那条路
+        (拼提示词 / HTTP / 解析 JSON / 归一 / 写报告 / 记 token 与费用)在测试里从没走过,
+        出问题只能等用户跑一次才发现。这里用假服务把整条链路跑通, 不花钱也不需要网络。
+        """
+        import http.server
+        import threading
+        payload = json.dumps({
+            "choices": [{"message": {"content": content}}],
+            "usage": usage or {"prompt_tokens": 1000, "completion_tokens": 200},
+        }).encode("utf-8")
+        hits = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                hits.append({"path": self.path,
+                             "body": self.rfile.read(n).decode("utf-8", "replace"),
+                             "auth": self.headers.get("Authorization") or ""})
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1], hits
+
+    def _seed_group(self, gid: int = 777, n: int = 3):
+        st = core.Store()
+        for i in range(n):
+            st.insert_message({"time": core.now() - i, "message_type": "group", "group_id": gid,
+                               "user_id": 100 + i, "raw_message": "第 %d 条: 实验报告什么时候交" % i,
+                               "sender": {"nickname": "同学%d" % i},
+                               "message": [{"type": "text", "data": {"text": "x"}}]})
+
+    def _point_at_fake(self, port: int):
+        cfg = core.Config()
+        cfg.set_values({"summarizer": {"base_url": "http://127.0.0.1:%d/v1" % port,
+                                       "api_key": "test-key", "model": "fake-model",
+                                       "groups": [777], "min_messages": 1, "window_hours": 24,
+                                       "input_price_per_mtok": 1.0, "output_price_per_mtok": 2.0},
+                        "push": {"enable": False}})
+
+    def test_full_run_writes_report_and_accounts_tokens(self):
+        """一次完整总结: 调模型 → 解析 → 写 md/html → 记账(token 与费用)。"""
+        model_json = json.dumps({
+            "overview": "群里在讨论实验报告分工",
+            "topics": [{"title": "实验报告", "summary": "小红负责写报告", "participants": ["小红"]}],
+            "events": [{"kind": "deadline", "title": "交实验报告", "detail": "周五前交",
+                        "who": "小红", "due": "2026-10-20", "confidence": 0.9,
+                        "relevant_to_me": True}],
+            "todos": [{"what": "加一页预算表", "who": "我", "due": "明天"}],
+            "links": [{"url": "https://example.com/x", "title": "文档", "why": "报告模板"}],
+            "facts": ["实验在周五交"],
+            "memory_update": "本群在做实验报告",
+        }, ensure_ascii=False)
+        port, hits = self._fake_model(model_json)
+        self._point_at_fake(port)
+        self._seed_group()
+        res = summarizer.run(hours=24, groups=[777], no_push=True)
+        self.assertEqual(res.get("status"), "ok", res)
+        self.assertTrue(res.get("report"), "没有报告路径: %s" % res)
+        self.assertTrue(os.path.isfile(res["report"]), "报告 md 没落盘")
+        self.assertTrue(os.path.isfile(res["report_html"]), "报告 html 没落盘")
+        with open(res["report"], encoding="utf-8") as f:
+            md = f.read()
+        self.assertIn("交实验报告", md, "事件没进报告")
+        self.assertIn("预算表", md, "待办没进报告")
+        self.assertIn("https://example.com/x", md, "链接没进报告")
+        # 记账: 假模型回的是 1000/200
+        self.assertEqual(res["tokens_in"], 1000, res)
+        self.assertEqual(res["tokens_out"], 200, res)
+        self.assertAlmostEqual(res["cost"], 1000 / 1e6 * 1.0 + 200 / 1e6 * 2.0, places=6)
+        # 请求本身: 打到正确的路径、带上密钥、提示词里有原始记录
+        self.assertTrue(hits, "假模型一次都没被调用")
+        self.assertEqual(hits[0]["path"], "/v1/chat/completions")
+        self.assertIn("Bearer test-key", hits[0]["auth"])
+        sent = json.loads(hits[0]["body"])          # 请求体是 JSON, 中文被转义了, 要解出来看
+        self.assertEqual(sent["model"], "fake-model")
+        prompt = sent["messages"][-1]["content"]
+        self.assertIn("实验报告什么时候交", prompt, "提示词里没有原始消息")
+        self.assertIn("客观统计", prompt, "提示词里没有统计块")
+
+    def test_model_garbage_degrades_without_crash(self):
+        """模型回的不是 JSON 时, 总结要降级(散文回退/空报告), 不能崩。"""
+        port, _ = self._fake_model("抱歉, 我今天不想输出 JSON。")
+        self._point_at_fake(port)
+        self._seed_group(gid=778)
+        res = summarizer.run(hours=24, groups=[778], no_push=True)
+        self.assertIn(res.get("status"), ("ok", "partial", "empty"), res)
+        if res.get("report"):
+            self.assertTrue(os.path.isfile(res["report"]))
+
+    def test_dry_run_never_calls_the_model(self):
+        """试运行只拼提示词、**绝不调模型**(不花钱);它会写一份标注"未调用模型"的预览报告。"""
+        port, hits = self._fake_model("{}")
+        self._point_at_fake(port)
+        self._seed_group(gid=779)
+        res = summarizer.run(hours=24, groups=[779], dry_run=True, no_push=True)
+        self.assertEqual(hits, [], "dry-run 调用了模型(会花钱)")
+        self.assertEqual(res.get("tokens_in"), 0)
+        self.assertEqual(res.get("cost"), 0.0)
+        self.assertTrue(res.get("report"), "dry-run 应当写一份预览报告: %s" % res)
+        with open(res["report"], encoding="utf-8") as f:
+            self.assertIn("dry-run", f.read(), "预览报告里没标注这是试运行")
+
 
 class TestCollectorFilter(unittest.TestCase):
     def _h(self, patch=None):
