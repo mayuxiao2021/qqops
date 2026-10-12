@@ -651,48 +651,57 @@ def schedule_apply(cfg: core.Config, body: dict) -> dict:
     import re as _re
     sch = dict(cfg.data.get("schedule") or {})
     errs = []
+    mode = str(body.get("mode") or sch.get("mode") or "daily").lower()
     if body.get("mode") is not None:
-        mode = str(body["mode"]).lower()
         if mode not in ("daily", "interval", "weekly"):
             errs.append("模式只能是 每天/每隔/每周")
         else:
             sch["mode"] = mode
     if body.get("enabled") is not None:
         sch["enabled"] = bool(body["enabled"])
+    # 只校验**当前模式真正用到**的字段。
+    # 前端会把三套模式的输入一起发过来(隐藏的那两个也在), 以前不看模式就校验, 于是
+    # "每隔一段时间"模式报"至少填一个时间点"、"每天"模式报"每周模式至少要选一天" ——
+    # 用户怎么点保存都失败(真踩过: 手机任务页的「保存定时」一直弹校验错误)。
     if body.get("times") is not None:
         ts = [str(x).strip() for x in (body["times"] if isinstance(body["times"], list)
                                        else str(body["times"]).split(",")) if str(x).strip()]
         bad = [x for x in ts if not _re.match(r"^\d{1,2}:\d{2}$", x)]
         if bad:
             errs.append("时间点格式应为 HH:MM: %s" % ", ".join(bad))
-        elif not ts:
-            errs.append("至少填一个时间点")
-        else:
+        elif ts:
             sch["times"] = ["%02d:%02d" % tuple(int(y) for y in x.split(":")) for x in ts]
+        elif mode == "daily":
+            errs.append("每天模式至少要填一个时间点")
     if body.get("every_minutes") is not None:
         try:
             v = int(body["every_minutes"])
-            if not (1 <= v <= 10080):
-                errs.append("间隔需在 1~10080 分钟之间")
-            else:
-                sch["every_minutes"] = v
         except Exception:
+            v = None
+        if v is None:
             errs.append("间隔必须是整数分钟")
+        elif not (1 <= v <= 10080):
+            if mode == "interval":              # 非"每隔"模式下这个输入框是隐藏的, 不该拦
+                errs.append("间隔需在 1~10080 分钟之间")
+        else:
+            sch["every_minutes"] = v
     if body.get("weekdays") is not None:
         try:
             wd = sorted({int(x) for x in body["weekdays"] if 1 <= int(x) <= 7})
-            if not wd:
-                errs.append("每周模式至少要选一天")
-            else:
-                sch["weekdays"] = wd
         except Exception:
+            wd = None
+        if wd is None:
             errs.append("星期取值应为 1~7")
+        elif wd:
+            sch["weekdays"] = wd
+        elif mode == "weekly":
+            errs.append("每周模式至少要选一天")
     if body.get("weekly_time") is not None:
         t = str(body["weekly_time"]).strip()
-        if not _re.match(r"^\d{1,2}:\d{2}$", t):
-            errs.append("每周时刻格式应为 HH:MM")
-        else:
+        if _re.match(r"^\d{1,2}:\d{2}$", t):
             sch["weekly_time"] = "%02d:%02d" % tuple(int(y) for y in t.split(":"))
+        elif t or mode == "weekly":
+            errs.append("每周时刻格式应为 HH:MM")
     if body.get("skip_if_no_new") is not None:
         sch["skip_if_no_new"] = bool(body["skip_if_no_new"])
     if body.get("min_new_messages") is not None:

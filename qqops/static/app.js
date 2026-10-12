@@ -1095,14 +1095,14 @@ VIEWS.tasks = async (v) => {
         <option value="weekly" ${sc.mode === 'weekly' ? 'selected' : ''}>每周几天</option>
       </select>
       <span id="s-box-daily" class="row ${hide((sc.mode || 'daily') === 'daily')}">时间点
-        <input id="s-times" value="${esc((sc.times || ['22:00']).join(', '))}" placeholder="22:00, 09:30" style="width:170px" title="可填多个, 逗号分隔"></span>
+        <input id="s-times" value="${esc((Array.isArray(sc.times) && sc.times.length ? sc.times : ['22:00']).join(', '))}" placeholder="22:00, 09:30" style="width:170px" title="可填多个, 逗号分隔"></span>
       <span id="s-box-interval" class="row ${hide(sc.mode === 'interval')}">每隔
         <input id="s-every" type="number" min="1" max="10080" value="${sc.every_minutes || 360}" style="width:90px"> 分钟</span>
       <span id="s-box-weekly" class="row ${hide(sc.mode === 'weekly')}">
         ${wdName.map((n, i) => `<label class="toggle"><input type="checkbox" class="s-wd" value="${i + 1}" ${wd.includes(i + 1) ? 'checked' : ''}><span>周${n}</span></label>`).join('')}
         <input id="s-wtime" value="${esc(sc.weekly_time || '22:00')}" style="width:76px"></span>
       <label class="toggle" title="自上次总结以来消息太少就不跑, 避免空报告与浪费"><input type="checkbox" id="s-skip" ${sc.skip_if_no_new !== false ? 'checked' : ''}><span>无新消息就跳过</span></label>
-      <input id="s-min" type="number" min="0" value="${sc.min_new_messages != null ? sc.min_new_messages : 5}" style="width:70px" title="至少多少条新消息才值得跑">
+      <span class="row" title="至少多少条新消息才值得跑">至少 <input id="s-min" type="number" min="0" value="${sc.min_new_messages != null ? sc.min_new_messages : 5}" style="width:70px"> 条新消息</span>
       <button class="primary" id="s-save">保存定时</button>
     </div>
     <div class="muted" style="margin-top:8px">当前: <b>${esc(nx.label || '未启用')}</b>${nx.ts ? ` · 下次 <b>${fmtTs(nx.ts)}</b>（${leftText}）` : ''}${s.last_run ? ` · 上次运行 ${fmtTs(s.last_run)}` : ''}${s.new_since_last != null ? ` · 距上次新增 ${s.new_since_last} 条消息` : ''}</div>
@@ -1129,11 +1129,18 @@ VIEWS.tasks = async (v) => {
   mode.onchange = syncMode;
   syncMode();
   q(v, '#s-save').onclick = async () => {
-    const body = {enabled: q(v, '#s-on').checked, mode: mode.value,
-      times: q(v, '#s-times').value, every_minutes: +q(v, '#s-every').value,
-      weekdays: [...v.querySelectorAll('.s-wd:checked')].map(x => +x.value),
-      weekly_time: q(v, '#s-wtime').value,
-      skip_if_no_new: q(v, '#s-skip').checked, min_new_messages: +q(v, '#s-min').value};
+    const m = mode.value;
+    // 只发当前模式真正用到的那组字段: 另外两套输入是隐藏的, 带着空值一起发会让后端的
+    // 校验误判(以前就报"至少填一个时间点", 用户怎么点保存都失败)。
+    const body = {enabled: q(v, '#s-on').checked, mode: m,
+      skip_if_no_new: q(v, '#s-skip').checked,
+      min_new_messages: Math.max(0, +q(v, '#s-min').value || 0)};
+    if (m === 'daily') body.times = q(v, '#s-times').value;
+    if (m === 'interval') body.every_minutes = +q(v, '#s-every').value;
+    if (m === 'weekly') {
+      body.weekdays = [...v.querySelectorAll('.s-wd:checked')].map(x => +x.value);
+      body.weekly_time = q(v, '#s-wtime').value;
+    }
     const r = await api('/api/schedule', {method: 'POST', body: JSON.stringify(body)});
     if (r && r.ok) { toast('定时已保存: ' + ((r.next || {}).label || ''), 'ok'); render(); }
     else if (r && r.errors && r.errors.length) toast(r.errors.join('; '), 'bad');

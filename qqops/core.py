@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 import secrets
 
-VERSION = "3.4.8"
+VERSION = "3.4.9"
 
 # 路径解析(踩过坑, 别改回 "靠 $HOME 猜"):
 #   曾经用 BASE = ~/qqops —— 但 $HOME 是环境给的, 从别的目录/cron/adb run-as 调用时
@@ -348,6 +348,16 @@ class Config:
             for k, v in kv.items():
                 if isinstance(v, str) and v.startswith("*") and ("*" * 4) in v:
                     continue  # 前端回传的掩码, 不覆盖真实密钥
+                cur = tgt.get(k)
+                if v == "" and cur is not None and not isinstance(cur, str):
+                    # 表单里的空串不该清掉**有类型**的配置项(布尔/数字/列表/字典)。
+                    # 真踩过: 控制台"设置"页把 schedule 那一组字段以空串回传, 于是
+                    # {"mode":"", "times":[], "every_minutes":0} 被写进配置, 定时就此失效。
+                    continue
+                if sec == "schedule" and (v == "" or v == []) and cur not in (None, ""):
+                    # 定时这一组由「任务」页专门编辑; "设置"页的通用表单是空值时别清掉它们
+                    # (mode/skip_if_no_new 是字符串型, 上面那条规则拦不住)。
+                    continue
                 tgt[k] = v
         self.save()
 

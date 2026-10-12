@@ -1833,23 +1833,64 @@ class TestSchedule(unittest.TestCase):
         self.assertNotIn("legacy_junk", core.Config().data["schedule"])
 
     def test_schedule_apply_validates(self):
+        """校验必须**按当前模式**判: 隐藏的那两组输入不该拦人。
+
+        真踩过: 前端会把三套模式的字段一起发(隐藏的也在), 老代码不看模式就校验 ——
+        "每隔一段时间"模式下报"至少填一个时间点", 用户怎么点「保存定时」都失败。
+        """
         cfg = core.Config()
         bad = webapp.schedule_apply(cfg, {"mode": "hourly"})
         self.assertFalse(bad["ok"])
         self.assertTrue(bad["errors"])
-        bad2 = webapp.schedule_apply(cfg, {"times": ["25:99:x"]})
-        self.assertFalse(bad2["ok"])
-        bad3 = webapp.schedule_apply(cfg, {"every_minutes": 0})
-        self.assertFalse(bad3["ok"])
-        bad4 = webapp.schedule_apply(cfg, {"weekdays": []})
-        self.assertFalse(bad4["ok"])
+        bad2 = webapp.schedule_apply(cfg, {"mode": "daily", "times": ["25:99:x"]})
+        self.assertFalse(bad2["ok"], "时间点格式非法必须报错")
+        bad3 = webapp.schedule_apply(cfg, {"mode": "interval", "every_minutes": 0})
+        self.assertFalse(bad3["ok"], "间隔模式下间隔非法必须报错")
+        bad4 = webapp.schedule_apply(cfg, {"mode": "weekly", "weekdays": []})
+        self.assertFalse(bad4["ok"], "每周模式下一天都没选必须报错")
+        bad5 = webapp.schedule_apply(cfg, {"mode": "daily", "times": ""})
+        self.assertFalse(bad5["ok"], "每天模式下时间点为空必须报错")
+        # 前端原样发来的"每隔一段时间"(隐藏的时间点/星期都是空的)—— 这正是用户踩的那次
+        good0 = webapp.schedule_apply(core.Config(), {
+            "enabled": True, "mode": "interval", "times": "", "every_minutes": 360,
+            "weekdays": [], "weekly_time": "", "skip_if_no_new": True, "min_new_messages": 5})
+        self.assertTrue(good0["ok"], "间隔模式下不该因为隐藏字段为空而失败: %s" % good0.get("errors"))
+        self.assertEqual(good0["schedule"]["mode"], "interval")
+        self.assertEqual(good0["schedule"]["every_minutes"], 360)
+        # 每天/每周模式下同理: 只发自己那组字段
+        good1 = webapp.schedule_apply(core.Config(), {"mode": "daily", "times": "22:00, 09:30"})
+        self.assertTrue(good1["ok"], good1.get("errors"))
+        self.assertEqual(core.Config().data["schedule"]["times"], ["22:00", "09:30"])
+        good2 = webapp.schedule_apply(core.Config(), {"mode": "weekly", "weekdays": [1, 5],
+                                                      "weekly_time": "21:30"})
+        self.assertTrue(good2["ok"], good2.get("errors"))
+        self.assertEqual(core.Config().data["schedule"]["weekdays"], [1, 5])
         good = webapp.schedule_apply(cfg, {"mode": "interval", "every_minutes": 180})
         self.assertTrue(good["ok"], good)
-        self.assertEqual(good["schedule"]["mode"], "interval")
         self.assertEqual(good["schedule"]["every_minutes"], 180)
         self.assertIn("每隔", good["next"]["label"])
-        webapp.schedule_apply(core.Config(), {"mode": "daily", "times": "22:00, 09:30"})
-        self.assertEqual(core.Config().data["schedule"]["times"], ["22:00", "09:30"])
+
+    def test_config_save_cannot_wipe_typed_values_with_empty_strings(self):
+        """表单里的空串不该把有类型的配置项清掉(布尔/数字/列表)。
+
+        真踩过: 控制台「设置」页把 schedule 那一组以空串回传, 结果
+        {"mode": "", "times": [], "every_minutes": 0} 被写进配置 —— 定时就此失效,
+        而"任务"页再也存不上(校验永远失败)。
+        """
+        cfg = core.Config()
+        cfg.set_values({"schedule": {"mode": "weekly", "times": ["22:00"], "weekdays": [1],
+                                     "every_minutes": 360, "enabled": True}})
+        cfg.set_values({"schedule": {"mode": "", "times": [], "weekdays": [],
+                                     "every_minutes": "", "enabled": ""}})
+        s = core.Config().data["schedule"]
+        self.assertEqual(s["mode"], "weekly", "空串不该清掉模式")
+        self.assertEqual(s["times"], ["22:00"], "空列表不该清掉时间点")
+        self.assertEqual(s["weekdays"], [1])
+        self.assertEqual(s["every_minutes"], 360)
+        self.assertTrue(s["enabled"])
+        # 字符串字段该能正常改/清
+        cfg.set_values({"summarizer": {"model": "x-test"}})
+        self.assertEqual(core.Config().data["summarizer"]["model"], "x-test")
 
 
 class TestIntegration(unittest.TestCase):
