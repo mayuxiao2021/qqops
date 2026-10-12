@@ -35,6 +35,9 @@ TMP = os.environ.get("QQOPS_TEST_DIR") or os.path.join(ROOT, ".testdata")
 shutil.rmtree(TMP, ignore_errors=True)
 os.makedirs(TMP, exist_ok=True)
 os.environ["QQOPS_DATA"] = TMP
+# 测试绝不去动真实的旁路服务(NapCat/AstrBot): 否则跑一遍测试就会拉起/重启它们,
+# 既慢又会污染时序测试(CI 上真踩过)。看门狗仍会体检、只告警。
+os.environ["QQOPS_NO_EXTRAS"] = "1"
 os.environ["TZ"] = "Asia/Shanghai"
 sys.path.insert(0, ROOT)
 
@@ -1339,6 +1342,7 @@ class TestConsistency(unittest.TestCase):
         core.pgrep = lambda pat: ["1234"]                     # 假装进程都在
         core.napcat_from_config = lambda cfg: _Dead()
         core.extra_action = lambda cfg, name, action: (calls.append(action), "fake")[1]
+        os.environ.pop("QQOPS_NO_EXTRAS", None)               # 这条测试专门验证"动手"的分支
         try:
             counters = {}
             states = []
@@ -1352,6 +1356,7 @@ class TestConsistency(unittest.TestCase):
             core.extras_check(core.Config(), counters, manage=True)
             self.assertEqual(counters.get("napcat"), 0)
         finally:
+            os.environ["QQOPS_NO_EXTRAS"] = "1"               # 恢复: 其余测试不许动真实服务
             core.pgrep, core.napcat_from_config, core.extra_action = orig_pgrep, orig_nc, orig_action
 
     def test_docs_site_anchors_are_valid(self):

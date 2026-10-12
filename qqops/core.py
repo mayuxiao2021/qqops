@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 import secrets
 
-VERSION = "3.4.6"
+VERSION = "3.4.7"
 
 # 路径解析(踩过坑, 别改回 "靠 $HOME 猜"):
 #   曾经用 BASE = ~/qqops —— 但 $HOME 是环境给的, 从别的目录/cron/adb run-as 调用时
@@ -2667,12 +2667,19 @@ def extras_check(cfg: Config, counters: dict, manage: bool = False) -> list:
 
     `counters` 由调用方长期持有(跨轮次), 用来做"连续 N 次才动手"的去抖:
     网络抖动时不会误杀; 刚重启过则进入冷却(计数为负), 给 QQ 足够时间登录。
+
+    `QQOPS_NO_EXTRAS=1` 时**永不动手**(只体检、只告警)。测试与 CI 必须设上, 否则跑一遍测试
+    就会去启动真实的 NapCat/AstrBot: CI 上有 screen, 于是拉起一堆空会话、每轮还等 24 秒,
+    把 runner 的时序测试搞崩(真踩过)。
     """
+    if os.environ.get("QQOPS_NO_EXTRAS"):
+        manage = False
     out = []
     for ex, spec in EXTRAS.items():
         if not pgrep(spec["pattern"]):
             out.append((ex, "dead", "进程不在"))
-            if manage:
+            # 只在"这台机器本来就跑得起来"时才去拉起: 连启动命令都找不到就别折腾
+            if manage and spec.get("start") and shutil.which(spec["start"][0]):
                 out.append((ex, "started", extra_action(cfg, ex, "start")))
             counters[ex] = 0
             continue
