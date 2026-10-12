@@ -54,7 +54,7 @@ QQOps 是一个**跑在自己设备上的 QQ 群消息管家**。它接在 [NapC
 
 ```bash
 pkg update && pkg install -y python curl      # Termux 需要;Linux 一般自带 python3
-curl -L -o ~/qqops.tar.gz https://github.com/mayuxiao2021/qqops/releases/latest/download/qqops-latest.tar.gz
+curl -fL --retry 3 --retry-delay 2 -o ~/qqops.tar.gz https://github.com/mayuxiao2021/qqops/releases/latest/download/qqops-latest.tar.gz
 rm -rf ~/qqops-src && mkdir -p ~/qqops-src && tar xzf ~/qqops.tar.gz -C ~/qqops-src --strip-components=1
 bash ~/qqops-src/install.sh
 ```

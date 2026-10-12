@@ -27,7 +27,7 @@ Android / Termux(推荐, 也是本项目的主要目标平台)。**把下面四�
 
 ```bash
 pkg update && pkg install -y python curl
-curl -L -o ~/qqops.tar.gz https://github.com/mayuxiao2021/qqops/releases/latest/download/qqops-latest.tar.gz
+curl -fL --retry 3 --retry-delay 2 -o ~/qqops.tar.gz https://github.com/mayuxiao2021/qqops/releases/latest/download/qqops-latest.tar.gz
 rm -rf ~/qqops-src && mkdir -p ~/qqops-src && tar xzf ~/qqops.tar.gz -C ~/qqops-src --strip-components=1
 bash ~/qqops-src/install.sh
 ```
@@ -37,7 +37,7 @@ bash ~/qqops-src/install.sh
 | 行 | 作用 |
 |---|---|
 | `pkg install` | 装 Python(程序只用标准库, 不需要 pip)与 curl |
-| `curl -L -o` | 下载**最新**发布包到 `~/qqops.tar.gz`;网址里没有版本号, 以后升级也是同一行 |
+| `curl -fL --retry 3` | 下载**最新**发布包到 `~/qqops.tar.gz`;网址里没有版本号, 以后升级也是同一行。`-f` 让 404 之类直接报错(而不是存下一个错误页), `--retry` 在断流/SSL 中断时自动重试 —— 国内直连 GitHub 偶尔会断 |
 | `rm -rf … tar xzf` | 清掉上次解压的目录, 再解到 `~/qqops-src/`(`--strip-components=1` 去掉包里的版本目录) |
 | `bash …/install.sh` | 安装到 `~/qqops`、生成配置与随机令牌、启动服务、自检, 并**打印控制台地址** |
 

@@ -36,7 +36,7 @@ Android 上不能跑 Docker,标准做法是 **Termux + proot-distro 容器**:
 
 ```bash
 pkg update && pkg install -y python curl
-curl -L -o ~/qqops.tar.gz https://github.com/mayuxiao2021/qqops/releases/latest/download/qqops-latest.tar.gz
+curl -fL --retry 3 --retry-delay 2 -o ~/qqops.tar.gz https://github.com/mayuxiao2021/qqops/releases/latest/download/qqops-latest.tar.gz
 rm -rf ~/qqops-src && mkdir -p ~/qqops-src && tar xzf ~/qqops.tar.gz -C ~/qqops-src --strip-components=1
 bash ~/qqops-src/install.sh
 ```
@@ -131,7 +131,7 @@ qqops doctor        # 采集口、NapCat API、存储、模型、保活逐项体
 
 ```bash
 sudo apt install -y python3 curl
-curl -L -o ~/qqops.tar.gz https://github.com/mayuxiao2021/qqops/releases/latest/download/qqops-latest.tar.gz
+curl -fL --retry 3 --retry-delay 2 -o ~/qqops.tar.gz https://github.com/mayuxiao2021/qqops/releases/latest/download/qqops-latest.tar.gz
 rm -rf ~/qqops-src && mkdir -p ~/qqops-src && tar xzf ~/qqops.tar.gz -C ~/qqops-src --strip-components=1
 bash ~/qqops-src/install.sh
 ```
@@ -228,7 +228,7 @@ qqops napcat restart             # 重启 NapCat
 
 ```bash
 qqops stop
-curl -L -o ~/qqops.tar.gz https://github.com/mayuxiao2021/qqops/releases/latest/download/qqops-latest.tar.gz
+curl -fL --retry 3 --retry-delay 2 -o ~/qqops.tar.gz https://github.com/mayuxiao2021/qqops/releases/latest/download/qqops-latest.tar.gz
 rm -rf ~/qqops-src && mkdir -p ~/qqops-src && tar xzf ~/qqops.tar.gz -C ~/qqops-src --strip-components=1
 bash ~/qqops-src/install.sh        # 幂等: 覆盖程序文件(qqops/ bin/ tools/ …), 绝不碰 data/
 qqops doctor

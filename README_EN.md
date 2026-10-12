@@ -38,7 +38,7 @@ Termux / Linux — copy-paste all four lines (the URL is fixed, no version numbe
 
 ```bash
 pkg update && pkg install -y python curl      # Termux; Linux usually ships python3 already
-curl -L -o ~/qqops.tar.gz https://github.com/mayuxiao2021/qqops/releases/latest/download/qqops-latest.tar.gz
+curl -fL --retry 3 --retry-delay 2 -o ~/qqops.tar.gz https://github.com/mayuxiao2021/qqops/releases/latest/download/qqops-latest.tar.gz
 rm -rf ~/qqops-src && mkdir -p ~/qqops-src && tar xzf ~/qqops.tar.gz -C ~/qqops-src --strip-components=1
 bash ~/qqops-src/install.sh
 ```
